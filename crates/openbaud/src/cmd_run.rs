@@ -60,7 +60,7 @@ pub async fn run(
         Some(spec) => spec.to_framing(&format!("devices/{device_name}/profile.yaml"))?,
         None => Framing::Idle { idle_ms: 30 },
     };
-    let boxed = open_port(port, &device.profile.transport)?;
+    let boxed = open_port(port, &device.profile.transport).await?;
     let session = Session::spawn("cli".to_string(), port.to_string(), framing, boxed);
 
     let outcome: anyhow::Result<Value> = async {

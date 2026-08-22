@@ -79,7 +79,7 @@ pub fn list() -> Vec<Value> {
                 "hex": { "type": "string" },
                 "text": { "type": "string" },
                 "match": { "type": "object" },
-                "timeout_ms": { "type": "integer", "default": 1000 }
+                "timeout_ms": { "type": "integer", "default": 3000 }
             }},
         }),
         json!({
@@ -183,7 +183,7 @@ async fn tool_open(args: Value, ctx: &Arc<Ctx>) -> anyhow::Result<Value> {
     }
     let framing = resolve_framing(args.get("framing"), device.as_ref().map(|d| &d.profile))?;
 
-    let boxed = open_port(port, &cfg)?;
+    let boxed = open_port(port, &cfg).await?;
     let session = ctx.sessions.open(port, framing.clone(), boxed);
     Ok(json!({
         "session_id": session.id,
@@ -266,7 +266,7 @@ async fn tool_request(args: Value, ctx: &Arc<Ctx>) -> anyhow::Result<Value> {
             }
             None => MatchRule::Idle { idle_ms: 50 },
         };
-        let timeout = arg_u64_or(&args, "timeout_ms", 1000)?;
+        let timeout = arg_u64_or(&args, "timeout_ms", 3000)?;
         Ok((session, data, rule, timeout))
     })();
     let (session, data, rule, timeout) = match staged {
@@ -340,7 +340,7 @@ async fn tool_run_command(args: Value, ctx: &Arc<Ctx>) -> anyhow::Result<Value> 
     };
     base.as_object_mut().expect("object").insert("tx_hex".to_string(), json!(hex::to_hex(&tx)));
 
-    let staged = (|| {
+    let staged = async {
         match args.get("session_id").and_then(Value::as_str) {
             Some(id) => Ok((ctx.sessions.get(id)?, false)),
             None => {
@@ -348,11 +348,12 @@ async fn tool_run_command(args: Value, ctx: &Arc<Ctx>) -> anyhow::Result<Value> 
                     anyhow!("provide session_id (open session) or port (ephemeral session)")
                 })?;
                 let framing = resolve_framing(None, Some(&device.profile))?;
-                let boxed = open_port(port, &device.profile.transport)?;
+                let boxed = open_port(port, &device.profile.transport).await?;
                 Ok((ctx.sessions.open(port, framing, boxed), true))
             }
         }
-    })();
+    }
+    .await;
     let (session, ephemeral) = match staged {
         Ok(ok) => ok,
         Err(e) => {

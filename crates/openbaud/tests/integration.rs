@@ -13,8 +13,8 @@ use serde_json::{json, Map};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-fn echo_port() -> BoxedPort {
-    open_port("mock:echo", &Transport::default()).expect("mock:echo always opens")
+async fn echo_port() -> BoxedPort {
+    open_port("mock:echo", &Transport::default()).await.expect("mock:echo always opens")
 }
 
 /// A port that answers one exact request with a canned reply.
@@ -37,7 +37,7 @@ async fn echo_session_idle_framing_round_trip() {
         "t1".into(),
         "mock:echo".into(),
         Framing::Idle { idle_ms: 20 },
-        echo_port(),
+        echo_port().await,
     );
     session.write_raw(b"hello").await.unwrap();
     let result = session.read_frames(1000, 32).await.unwrap();
@@ -53,7 +53,7 @@ async fn request_timeout_is_loud() {
         "t2".into(),
         "mock:echo".into(),
         Framing::Idle { idle_ms: 20 },
-        echo_port(),
+        echo_port().await,
     );
     let err = session
         .request(b"ping", MatchRule::Delimiter(b"\r\n".to_vec()), 100)
@@ -241,11 +241,33 @@ async fn tool_capture_records_both_directions() {
     tools::call("read", json!({ "session_id": sid, "timeout_ms": 1000 }), &ctx).await.unwrap();
     let stats = tools::call("capture_stop", json!({ "session_id": sid }), &ctx).await.unwrap();
     assert!(stats["bytes"].as_u64().unwrap() >= 4, "tx + rx bytes expected");
+    assert!(stats["chunks"].as_u64().unwrap() >= 2, "tx + rx chunk records expected");
+    assert!(stats.get("frames").is_none(), "stats field is named chunks, not frames");
 
     let content = std::fs::read_to_string(started["path"].as_str().unwrap()).unwrap();
     assert!(content.contains("\"tx\""));
     assert!(content.contains("\"rx\""));
     assert!(content.lines().next().unwrap().contains("\"obcap\":1"));
+}
+
+#[tokio::test]
+async fn open_port_missing_device_fails_fast_without_retry() {
+    // The busy-retry loop must only engage for busy-class errors; a missing
+    // device errors immediately, with no retry note in the message.
+    let started = std::time::Instant::now();
+    let err = match open_port("/dev/tty.openbaud-test-does-not-exist", &Transport::default()).await
+    {
+        Ok(_) => panic!("opening a nonexistent port must fail"),
+        Err(e) => e,
+    };
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(500),
+        "non-busy open errors must not be retried (took {:?})",
+        started.elapsed()
+    );
+    let msg = format!("{err:#}");
+    assert!(msg.contains("cannot open serial port"), "got: {msg}");
+    assert!(!msg.contains("retries"), "no retry note expected, got: {msg}");
 }
 
 #[tokio::test]

@@ -60,7 +60,9 @@ provenance:
 ```
 
 Binary field types (hex frames and response fields):
-`u8 i8 u16be u16le i16be i16le u32be u32le i32be i32le f32be f32le`.
+`u8 i8 u16be u16le i16be i16le u32be u32le i32be i32le f32be f32le u32me i32me f32me`.
+The `*me` types are CDAB word-swapped ("mid-endian"): low 16-bit word first on
+the wire, big-endian within each word — common in Modbus meters (e.g. PZEM-004T).
 Text-only param types (for `text:` frame interpolation): `int float string`.
 Checksums: `crc16_modbus xor8 sum8` (computed over all preceding frame bytes).
 

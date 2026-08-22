@@ -13,7 +13,20 @@ pub type BoxedPort = Box<dyn Port>;
 
 pub const MOCK_ECHO: &str = "mock:echo";
 
-pub fn open_port(name: &str, cfg: &TransportCfg) -> anyhow::Result<BoxedPort> {
+/// Interval between retries when the port reports "busy" on open.
+const BUSY_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+/// Total time budget for busy retries. On macOS a closed tty takes ~0.5s to
+/// tear down, so a close-then-reopen sequence transiently fails with EBUSY.
+const BUSY_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// True for open failures that mean "someone (possibly the kernel, mid-teardown)
+/// still holds the device" — the only class of error worth retrying.
+fn is_busy_error(err: &tokio_serial::Error) -> bool {
+    let desc = err.to_string().to_lowercase();
+    desc.contains("busy") || desc.contains("os error 16")
+}
+
+pub async fn open_port(name: &str, cfg: &TransportCfg) -> anyhow::Result<BoxedPort> {
     if name == MOCK_ECHO {
         let (client, server) = tokio::io::duplex(64 * 1024);
         tokio::spawn(async move {
@@ -44,13 +57,34 @@ pub fn open_port(name: &str, cfg: &TransportCfg) -> anyhow::Result<BoxedPort> {
         other => bail!("unsupported stop_bits {other} (expected 1 or 2)"),
     };
 
-    let stream = tokio_serial::new(name, cfg.baud)
+    let builder = tokio_serial::new(name, cfg.baud)
         .data_bits(data_bits)
         .parity(parity)
-        .stop_bits(stop_bits)
-        .open_native_async()
-        .with_context(|| format!("cannot open serial port {name:?} at {} baud", cfg.baud))?;
-    Ok(Box::new(stream))
+        .stop_bits(stop_bits);
+    let deadline = tokio::time::Instant::now() + BUSY_RETRY_BUDGET;
+    let mut retries: u32 = 0;
+    loop {
+        match builder.clone().open_native_async() {
+            Ok(stream) => return Ok(Box::new(stream)),
+            Err(e) if is_busy_error(&e) && tokio::time::Instant::now() < deadline => {
+                retries += 1;
+                tokio::time::sleep(BUSY_RETRY_INTERVAL).await;
+            }
+            Err(e) => {
+                let retried = if retries > 0 {
+                    format!(
+                        " after {retries} retries over {:.1}s — is another process holding the port?",
+                        BUSY_RETRY_BUDGET.as_secs_f64()
+                    )
+                } else {
+                    String::new()
+                };
+                return Err(e).with_context(|| {
+                    format!("cannot open serial port {name:?} at {} baud{retried}", cfg.baud)
+                });
+            }
+        }
+    }
 }
 
 #[derive(Debug, serde::Serialize)]

@@ -12,14 +12,16 @@ use std::path::{Path, PathBuf};
 pub struct CaptureWriter {
     file: File,
     path: PathBuf,
-    frames: u64,
+    chunks: u64,
     bytes: u64,
 }
 
 #[derive(Debug, serde::Serialize)]
 pub struct CaptureStats {
     pub path: String,
-    pub frames: u64,
+    /// Number of rx/tx chunk records written (wire read/write granularity),
+    /// not protocol frames.
+    pub chunks: u64,
     pub bytes: u64,
 }
 
@@ -48,14 +50,14 @@ impl CaptureWriter {
             "started_ms": started_ms,
         });
         writeln!(file, "{header}").context("cannot write capture header")?;
-        Ok(Self { file, path: path.to_path_buf(), frames: 0, bytes: 0 })
+        Ok(Self { file, path: path.to_path_buf(), chunks: 0, bytes: 0 })
     }
 
     pub fn record(&mut self, dir: &str, ts_ms: u64, data: &[u8]) -> anyhow::Result<()> {
         let line = json!({ "ts_ms": ts_ms, "dir": dir, "hex": hex::to_hex(data) });
         writeln!(self.file, "{line}")
             .with_context(|| format!("cannot append to capture file {:?}", self.path))?;
-        self.frames += 1;
+        self.chunks += 1;
         self.bytes += data.len() as u64;
         Ok(())
     }
@@ -64,7 +66,7 @@ impl CaptureWriter {
         self.file.flush().context("cannot flush capture file")?;
         Ok(CaptureStats {
             path: self.path.display().to_string(),
-            frames: self.frames,
+            chunks: self.chunks,
             bytes: self.bytes,
         })
     }

@@ -18,6 +18,11 @@ pub enum FieldType {
     I32Le,
     F32Be,
     F32Le,
+    /// CDAB word-swapped ("mid-endian"): low 16-bit word first on the wire,
+    /// big-endian within each word. Common in Modbus energy meters.
+    U32Me,
+    I32Me,
+    F32Me,
     /// Text-frame only: interpolated as decimal integer, no binary size.
     Int,
     /// Text-frame only: interpolated as decimal float, no binary size.
@@ -41,6 +46,9 @@ impl FieldType {
             "i32le" => Self::I32Le,
             "f32be" => Self::F32Be,
             "f32le" => Self::F32Le,
+            "u32me" => Self::U32Me,
+            "i32me" => Self::I32Me,
+            "f32me" => Self::F32Me,
             "int" => Self::Int,
             "float" => Self::Float,
             "string" => Self::Str,
@@ -53,9 +61,15 @@ impl FieldType {
         match self {
             Self::U8 | Self::I8 => Some(1),
             Self::U16Be | Self::U16Le | Self::I16Be | Self::I16Le => Some(2),
-            Self::U32Be | Self::U32Le | Self::I32Be | Self::I32Le | Self::F32Be | Self::F32Le => {
-                Some(4)
-            }
+            Self::U32Be
+            | Self::U32Le
+            | Self::I32Be
+            | Self::I32Le
+            | Self::F32Be
+            | Self::F32Le
+            | Self::U32Me
+            | Self::I32Me
+            | Self::F32Me => Some(4),
             Self::Int | Self::Float | Self::Str => None,
         }
     }
@@ -98,6 +112,20 @@ impl FieldType {
                 let f = value.as_f64().ok_or_else(|| err(format!("expected a number, got {value}")))? as f32;
                 if matches!(self, Self::F32Be) { f.to_be_bytes().to_vec() } else { f.to_le_bytes().to_vec() }
             }
+            Self::U32Me => {
+                let n = as_i64(value)?;
+                let v = u32::try_from(n).map_err(|_| err(format!("{n} out of range for u32")))?;
+                cdab_swap(v.to_be_bytes()).to_vec()
+            }
+            Self::I32Me => {
+                let n = as_i64(value)?;
+                let v = i32::try_from(n).map_err(|_| err(format!("{n} out of range for i32")))?;
+                cdab_swap(v.to_be_bytes()).to_vec()
+            }
+            Self::F32Me => {
+                let f = value.as_f64().ok_or_else(|| err(format!("expected a number, got {value}")))? as f32;
+                cdab_swap(f.to_be_bytes()).to_vec()
+            }
             Self::Int | Self::Float | Self::Str => {
                 return Err(err("text-only type cannot be encoded into a hex frame".to_string()))
             }
@@ -128,10 +156,21 @@ impl FieldType {
             Self::I32Le => Value::from(i32::from_le_bytes(slice.try_into().unwrap())),
             Self::F32Be => Value::from(f32::from_be_bytes(slice.try_into().unwrap()) as f64),
             Self::F32Le => Value::from(f32::from_le_bytes(slice.try_into().unwrap()) as f64),
+            Self::U32Me => Value::from(u32::from_be_bytes(cdab_swap(slice.try_into().unwrap()))),
+            Self::I32Me => Value::from(i32::from_be_bytes(cdab_swap(slice.try_into().unwrap()))),
+            Self::F32Me => {
+                Value::from(f32::from_be_bytes(cdab_swap(slice.try_into().unwrap())) as f64)
+            }
             Self::Int | Self::Float | Self::Str => unreachable!("guarded by size() above"),
         };
         Ok(val)
     }
+}
+
+/// CDAB word swap: logical big-endian bytes [A,B,C,D] <-> wire order [C,D,A,B].
+/// The swap is its own inverse, so it serves both encode and decode.
+fn cdab_swap(bytes: [u8; 4]) -> [u8; 4] {
+    [bytes[2], bytes[3], bytes[0], bytes[1]]
 }
 
 #[cfg(test)]
@@ -156,6 +195,31 @@ mod tests {
         let data = [0x00, 0xFF, 0xFE];
         assert_eq!(FieldType::I16Be.decode(&data, 1).unwrap(), json!(-2));
         assert!(FieldType::U32Be.decode(&data, 1).is_err());
+    }
+
+    #[test]
+    fn u32me_word_swapped() {
+        // Logical 2000 = 0x000007D0; CDAB wire order is 07 D0 00 00.
+        let wire = [0x07, 0xD0, 0x00, 0x00];
+        assert_eq!(FieldType::U32Me.decode(&wire, 0).unwrap(), json!(2000));
+        assert_eq!(FieldType::U32Me.encode("x", &json!(2000)).unwrap(), wire.to_vec());
+    }
+
+    #[test]
+    fn i32me_negative() {
+        // -2 = 0xFFFFFFFE, big-endian [FF FF FF FE] -> CDAB [FF FE FF FF].
+        let bytes = FieldType::I32Me.encode("x", &json!(-2)).unwrap();
+        assert_eq!(bytes, vec![0xFF, 0xFE, 0xFF, 0xFF]);
+        assert_eq!(FieldType::I32Me.decode(&bytes, 0).unwrap(), json!(-2));
+    }
+
+    #[test]
+    fn f32me_round_trip() {
+        let bytes = FieldType::F32Me.encode("x", &json!(220.5)).unwrap();
+        assert_eq!(bytes.len(), 4);
+        // Word-swapped relative to plain big-endian.
+        assert_ne!(bytes, FieldType::F32Be.encode("x", &json!(220.5)).unwrap());
+        assert_eq!(FieldType::F32Me.decode(&bytes, 0).unwrap(), json!(220.5));
     }
 
     #[test]

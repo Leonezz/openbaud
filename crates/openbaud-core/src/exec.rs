@@ -167,6 +167,21 @@ response:
       voltage: { at: 3, type: u16be, scale: 0.1, unit: "V" }
 "#;
 
+    const MODBUS_U32ME_CMD: &str = r#"
+schema: openbaud/command@v0
+name: read_energy
+params:
+  - { name: addr, type: u8, default: 1, min: 1, max: 247 }
+frame:
+  hex: "{addr} 04 00 05 00 02 {crc16_modbus}"
+response:
+  match: { length: 9 }
+  validate: { checksum: crc16_modbus }
+  parse:
+    fields:
+      energy: { at: 3, type: u32me, scale: 0.001, unit: "kWh" }
+"#;
+
     const AT_CMD: &str = r#"
 schema: openbaud/command@v0
 name: signal_quality
@@ -195,6 +210,22 @@ response:
         let parsed = parse_response(&cmd, &modbus_response(2203)).unwrap();
         assert_eq!(parsed, json!({"voltage": 220.3}));
         assert_eq!(units(&cmd).get("voltage").unwrap(), "V");
+    }
+
+    #[test]
+    fn end_to_end_modbus_u32me() {
+        let cmd = parse_command(MODBUS_U32ME_CMD, "c.yaml").unwrap();
+        let frame = build_frame(&cmd, &Map::new()).unwrap();
+        assert_eq!(frame[0], 0x01); // default addr
+
+        // Logical energy 2000 Wh (0x000007D0) arrives word-swapped: 07 D0 00 00.
+        let mut body = vec![0x01, 0x04, 0x04, 0x07, 0xD0, 0x00, 0x00];
+        let crc = ChecksumKind::Crc16Modbus.compute(&body);
+        body.extend(crc);
+
+        let parsed = parse_response(&cmd, &body).unwrap();
+        assert_eq!(parsed, json!({"energy": 2.0}));
+        assert_eq!(units(&cmd).get("energy").unwrap(), "kWh");
     }
 
     #[test]

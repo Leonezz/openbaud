@@ -246,7 +246,7 @@ pub struct ResponseSpec {
 }
 
 fn default_timeout_ms() -> u64 {
-    1000
+    3000
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -473,7 +473,7 @@ provenance:
 
         let c = parse_command(COMMAND, "read_voltage.yaml").unwrap();
         assert_eq!(c.risk, Risk::Read);
-        assert_eq!(c.response.as_ref().unwrap().timeout_ms, 1000);
+        assert_eq!(c.response.as_ref().unwrap().timeout_ms, 3000);
     }
 
     #[test]
