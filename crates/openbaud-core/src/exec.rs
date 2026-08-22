@@ -3,9 +3,10 @@
 
 use crate::codec::FieldType;
 use crate::checksum::ChecksumKind;
-use crate::format::{Command, ParseSpec};
+use crate::format::{Command, Expect, ExceptionSpec, ParseSpec, ValidateSpec};
 use crate::template::{render_text, HexTemplate};
 use crate::CoreError;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 /// Merge provided values with declared defaults; reject unknown names, missing
@@ -124,6 +125,164 @@ fn parse_with_spec(parse: &ParseSpec, raw: &[u8]) -> crate::Result<Value> {
         }
     }
     Ok(Value::Object(out))
+}
+
+// ---------------------------------------------------------------------------
+// Outcome classification
+// ---------------------------------------------------------------------------
+
+/// What the engine observed on the wire for one request. The engine produces
+/// this; `classify` refines a completed `Frame` into checksum/parse outcomes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RawOutcome {
+    /// Zero bytes received by the deadline (or no first byte within
+    /// `first_byte_ms`).
+    Silence,
+    /// Some bytes arrived but the match rule was never satisfied.
+    Timeout { partial: Vec<u8> },
+    /// A complete frame per the (main or exception) match rule.
+    Frame { bytes: Vec<u8>, is_exception: bool },
+}
+
+/// The six-way classification of a command execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Outcome {
+    Silence,
+    Timeout,
+    ChecksumError,
+    Malformed,
+    Exception,
+    Normal,
+}
+
+/// Classification result: the outcome plus whatever material supports it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClassifiedResponse {
+    pub outcome: Outcome,
+    /// Decoded values of a `normal` frame.
+    pub parsed: Option<Value>,
+    /// Decoded values of an `exception` frame.
+    pub exception: Option<Value>,
+    /// The complete frame, when one was received.
+    pub raw: Option<Vec<u8>>,
+    /// Partial bytes, only on `timeout`.
+    pub partial: Option<Vec<u8>>,
+    /// Human-readable reason for checksum_error / malformed / timeout.
+    pub detail: Option<String>,
+}
+
+impl ClassifiedResponse {
+    fn bare(outcome: Outcome) -> Self {
+        Self { outcome, parsed: None, exception: None, raw: None, partial: None, detail: None }
+    }
+}
+
+/// Classify a raw engine outcome per the command's response declaration.
+/// Commands without a `response` block do not go through this path.
+pub fn classify(cmd: &Command, raw: RawOutcome) -> ClassifiedResponse {
+    match raw {
+        RawOutcome::Silence => ClassifiedResponse::bare(Outcome::Silence),
+        RawOutcome::Timeout { partial } => ClassifiedResponse {
+            detail: Some(format!(
+                "received {} byte(s) but the match rule was not satisfied",
+                partial.len()
+            )),
+            partial: Some(partial),
+            ..ClassifiedResponse::bare(Outcome::Timeout)
+        },
+        RawOutcome::Frame { bytes, is_exception: false } => {
+            let resp = cmd.response.as_ref();
+            classify_frame(
+                resp.and_then(|r| r.validate.as_ref()),
+                resp.and_then(|r| r.parse.as_ref()),
+                bytes,
+                false,
+            )
+        }
+        RawOutcome::Frame { bytes, is_exception: true } => {
+            let Some(exc) = cmd.response.as_ref().and_then(|r| r.exception.as_ref()) else {
+                return ClassifiedResponse {
+                    detail: Some(
+                        "frame flagged as exception but command declares no exception spec"
+                            .to_string(),
+                    ),
+                    raw: Some(bytes),
+                    ..ClassifiedResponse::bare(Outcome::Malformed)
+                };
+            };
+            classify_frame(exc.validate.as_ref(), exc.parse.as_ref(), bytes, true)
+        }
+    }
+}
+
+fn classify_frame(
+    validate: Option<&ValidateSpec>,
+    parse: Option<&ParseSpec>,
+    bytes: Vec<u8>,
+    as_exception: bool,
+) -> ClassifiedResponse {
+    if let Some(v) = validate {
+        let checked = ChecksumKind::from_name(&v.checksum).and_then(|k| k.verify_frame(&bytes));
+        if let Err(e) = checked {
+            return ClassifiedResponse {
+                detail: Some(e.to_string()),
+                raw: Some(bytes),
+                ..ClassifiedResponse::bare(Outcome::ChecksumError)
+            };
+        }
+    }
+    let decoded = match parse {
+        Some(p) => match parse_with_spec(p, &bytes) {
+            Ok(v) => v,
+            Err(e) => {
+                return ClassifiedResponse {
+                    detail: Some(e.to_string()),
+                    raw: Some(bytes),
+                    ..ClassifiedResponse::bare(Outcome::Malformed)
+                }
+            }
+        },
+        None => Value::Object(Map::new()),
+    };
+    if as_exception {
+        ClassifiedResponse {
+            exception: Some(decoded),
+            raw: Some(bytes),
+            ..ClassifiedResponse::bare(Outcome::Exception)
+        }
+    } else {
+        ClassifiedResponse {
+            parsed: Some(decoded),
+            raw: Some(bytes),
+            ..ClassifiedResponse::bare(Outcome::Normal)
+        }
+    }
+}
+
+/// Whether the outcome satisfies the command's declared expectation.
+/// Commands without a `response` block expect `normal`.
+pub fn expect_met(cmd: &Command, outcome: &Outcome) -> bool {
+    let expect = cmd.response.as_ref().map(|r| r.expect).unwrap_or_default();
+    matches!(
+        (expect, outcome),
+        (Expect::Normal, Outcome::Normal)
+            | (Expect::Exception, Outcome::Exception)
+            | (Expect::Silence, Outcome::Silence)
+    )
+}
+
+/// Prefix test for exception recognition: `(byte[at] & mask) == equals`.
+/// Returns `None` while fewer than `at + 1` bytes have arrived (undecided),
+/// `Some(hit)` once the byte is available.
+///
+/// Panics if the spec's mask/equals are not single hex bytes — impossible for
+/// specs that went through `parse_command`.
+pub fn exception_triggered(spec: &ExceptionSpec, bytes: &[u8]) -> Option<bool> {
+    let byte = *bytes.get(spec.when.at)?;
+    let mask = spec.when.mask_byte().expect("mask validated by parse_command");
+    let equals = spec.when.equals_byte().expect("equals validated by parse_command");
+    Some(byte & mask == equals)
 }
 
 /// Units declared by the command's parse fields, for display alongside values.
@@ -260,5 +419,134 @@ response:
         assert_eq!(parsed, json!({"rssi": 24, "ber": 99}));
 
         assert!(parse_response(&cmd, b"ERROR").is_err());
+    }
+
+    // -- outcome classification --
+
+    const EXCEPTION_CMD: &str = r#"
+schema: openbaud/command@v0
+name: illegal_function_test
+params:
+  - { name: addr, type: u8, default: 1 }
+frame:
+  hex: "{addr} 04 00 00 00 01 {crc16_modbus}"
+response:
+  match: { length: 7 }
+  expect: exception
+  validate: { checksum: crc16_modbus }
+  parse:
+    fields:
+      voltage: { at: 3, type: u16be, scale: 0.1 }
+  exception:
+    when: { at: 1, equals: "84" }
+    match: { length: 5 }
+    validate: { checksum: crc16_modbus }
+    parse:
+      fields:
+        function: { at: 1, type: u8 }
+        exception_code: { at: 2, type: u8 }
+"#;
+
+    const SILENCE_CMD: &str = r#"
+schema: openbaud/command@v0
+name: wrong_addr_test
+frame: { hex: "F7 04 00 00 00 01 {crc16_modbus}" }
+response:
+  expect: silence
+  timeout_ms: 500
+"#;
+
+    fn modbus_exception_frame(exception_code: u8) -> Vec<u8> {
+        let mut body = vec![0x01, 0x84, exception_code];
+        let crc = ChecksumKind::Crc16Modbus.compute(&body);
+        body.extend(crc);
+        body
+    }
+
+    #[test]
+    fn classify_modbus_exception_frame() {
+        let cmd = parse_command(EXCEPTION_CMD, "c.yaml").unwrap();
+        let frame = modbus_exception_frame(1);
+        assert_eq!(frame.len(), 5);
+
+        let exc = cmd.response.as_ref().unwrap().exception.as_ref().unwrap();
+        assert_eq!(exception_triggered(exc, &frame[..1]), None); // undecided
+        assert_eq!(exception_triggered(exc, &frame[..2]), Some(true));
+        assert_eq!(exception_triggered(exc, &[0x01, 0x04]), Some(false));
+
+        let r = classify(&cmd, RawOutcome::Frame { bytes: frame.clone(), is_exception: true });
+        assert_eq!(r.outcome, Outcome::Exception);
+        assert_eq!(r.exception, Some(json!({"function": 0x84, "exception_code": 1})));
+        assert_eq!(r.parsed, None);
+        assert_eq!(r.raw, Some(frame));
+        assert!(expect_met(&cmd, &r.outcome));
+    }
+
+    #[test]
+    fn classify_silence_and_timeout() {
+        let cmd = parse_command(MODBUS_CMD, "c.yaml").unwrap();
+
+        let r = classify(&cmd, RawOutcome::Silence);
+        assert_eq!(r.outcome, Outcome::Silence);
+        assert!(r.raw.is_none() && r.partial.is_none());
+
+        let r = classify(&cmd, RawOutcome::Timeout { partial: vec![0x01, 0x04] });
+        assert_eq!(r.outcome, Outcome::Timeout);
+        assert_eq!(r.partial, Some(vec![0x01, 0x04]));
+        assert!(r.detail.is_some());
+    }
+
+    #[test]
+    fn classify_checksum_error_and_malformed() {
+        let cmd = parse_command(MODBUS_CMD, "c.yaml").unwrap();
+        let mut corrupted = modbus_response(2203);
+        corrupted[3] ^= 0xFF;
+        let r = classify(&cmd, RawOutcome::Frame { bytes: corrupted, is_exception: false });
+        assert_eq!(r.outcome, Outcome::ChecksumError);
+        assert!(r.detail.is_some());
+
+        // Passes checksum but the regex does not match -> malformed.
+        let at = parse_command(AT_CMD, "c.yaml").unwrap();
+        let r = classify(&at, RawOutcome::Frame { bytes: b"ERROR".to_vec(), is_exception: false });
+        assert_eq!(r.outcome, Outcome::Malformed);
+        assert!(r.detail.is_some());
+    }
+
+    #[test]
+    fn classify_normal_frame() {
+        let cmd = parse_command(MODBUS_CMD, "c.yaml").unwrap();
+        let frame = modbus_response(2203);
+        let r = classify(&cmd, RawOutcome::Frame { bytes: frame.clone(), is_exception: false });
+        assert_eq!(r.outcome, Outcome::Normal);
+        assert_eq!(r.parsed, Some(json!({"voltage": 220.3})));
+        assert_eq!(r.raw, Some(frame));
+        assert!(expect_met(&cmd, &r.outcome));
+    }
+
+    #[test]
+    fn expect_met_covers_all_declared_expectations() {
+        let normal = parse_command(MODBUS_CMD, "c.yaml").unwrap();
+        assert!(expect_met(&normal, &Outcome::Normal));
+        assert!(!expect_met(&normal, &Outcome::Exception));
+        assert!(!expect_met(&normal, &Outcome::Silence));
+
+        let exception = parse_command(EXCEPTION_CMD, "c.yaml").unwrap();
+        assert!(expect_met(&exception, &Outcome::Exception));
+        assert!(!expect_met(&exception, &Outcome::Normal));
+
+        let silence = parse_command(SILENCE_CMD, "c.yaml").unwrap();
+        assert!(expect_met(&silence, &Outcome::Silence));
+        assert!(!expect_met(&silence, &Outcome::Normal));
+        assert!(!expect_met(&silence, &Outcome::Timeout));
+    }
+
+    #[test]
+    fn outcome_serializes_snake_case() {
+        assert_eq!(serde_json::to_string(&Outcome::ChecksumError).unwrap(), "\"checksum_error\"");
+        assert_eq!(serde_json::to_string(&Outcome::Normal).unwrap(), "\"normal\"");
+        assert_eq!(
+            serde_json::from_str::<Outcome>("\"exception\"").unwrap(),
+            Outcome::Exception
+        );
     }
 }

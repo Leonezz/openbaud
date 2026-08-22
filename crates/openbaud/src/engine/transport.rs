@@ -1,8 +1,10 @@
-//! Port opening: real serial ports via tokio-serial, plus `mock:echo` — an
-//! explicit, always-available loopback for smoke-testing without hardware.
+//! Port opening: real serial ports via tokio-serial, `mock:echo` — an
+//! explicit, always-available loopback for smoke-testing without hardware —
+//! and `replay:<path>` for playing back recorded captures. Also home of the
+//! profile selector → concrete port resolution.
 
 use anyhow::{anyhow, bail, Context};
-use openbaud_core::format::{Parity, Transport as TransportCfg};
+use openbaud_core::format::{Parity, SelectorSpec, Transport as TransportCfg};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_serial::SerialPortBuilderExt;
 
@@ -12,6 +14,8 @@ impl<T: AsyncRead + AsyncWrite + Send + Unpin> Port for T {}
 pub type BoxedPort = Box<dyn Port>;
 
 pub const MOCK_ECHO: &str = "mock:echo";
+/// Port name prefix for capture replay: `replay:<path-to-.obcap>`.
+pub const REPLAY_PREFIX: &str = "replay:";
 
 /// Interval between retries when the port reports "busy" on open.
 const BUSY_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
@@ -27,6 +31,9 @@ fn is_busy_error(err: &tokio_serial::Error) -> bool {
 }
 
 pub async fn open_port(name: &str, cfg: &TransportCfg) -> anyhow::Result<BoxedPort> {
+    if let Some(path) = name.strip_prefix(REPLAY_PREFIX) {
+        return crate::engine::replay::open_replay(std::path::Path::new(path));
+    }
     if name == MOCK_ECHO {
         let (client, server) = tokio::io::duplex(64 * 1024);
         tokio::spawn(async move {
@@ -148,4 +155,121 @@ pub fn list_ports() -> anyhow::Result<Vec<PortInfo>> {
         serial_number: None,
     });
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Device selector → concrete port
+// ---------------------------------------------------------------------------
+
+/// Resolve a profile selector against the live port list. Exactly one match
+/// is required; zero or several is a loud error — never a silent pick.
+pub fn resolve_selector(
+    selector: &SelectorSpec,
+    device_name: &str,
+) -> anyhow::Result<String> {
+    select_port(&list_ports()?, selector, device_name)
+}
+
+/// Pure selector matching over an enumerated port list (the testable core of
+/// `resolve_selector`). All present selector fields must match (AND); mock
+/// entries never match; on macOS a physical port exposed as both `/dev/cu.X`
+/// and `/dev/tty.X` is deduplicated in favor of `cu.`.
+pub fn select_port(
+    ports: &[PortInfo],
+    selector: &SelectorSpec,
+    device_name: &str,
+) -> anyhow::Result<String> {
+    let hits: Vec<&PortInfo> = ports
+        .iter()
+        .filter(|p| p.kind != "mock" && selector_matches(p, selector))
+        .collect();
+
+    let mut paths: Vec<&str> = hits.iter().map(|p| p.path.as_str()).collect();
+    paths.retain(|path| match path.strip_prefix("/dev/tty.") {
+        Some(suffix) => !hits.iter().any(|h| h.path == format!("/dev/cu.{suffix}")),
+        None => true,
+    });
+
+    match paths.as_slice() {
+        [one] => Ok((*one).to_string()),
+        [] => bail!(
+            "no port matches the selector for device {device_name:?} ({}); available ports: {}",
+            describe_selector(selector),
+            describe_candidates(ports),
+        ),
+        many => bail!(
+            "selector for device {device_name:?} matches {} ports: {} — specify the port explicitly",
+            many.len(),
+            many.join(", "),
+        ),
+    }
+}
+
+fn selector_matches(port: &PortInfo, sel: &SelectorSpec) -> bool {
+    // vid/pid: hex value comparison — case-insensitive and padding-agnostic.
+    let hex_matches = |want: &Option<String>, have: &Option<String>| match want {
+        None => true,
+        Some(w) => match (u16::from_str_radix(w, 16), have) {
+            (Ok(w), Some(h)) => u16::from_str_radix(h, 16).is_ok_and(|h| h == w),
+            _ => false,
+        },
+    };
+    let serial_ok = match &sel.serial_number {
+        None => true,
+        Some(s) => port.serial_number.as_deref() == Some(s.as_str()),
+    };
+    let product_ok = match &sel.product {
+        None => true,
+        Some(p) => port.product.as_deref().is_some_and(|prod| prod.contains(p.as_str())),
+    };
+    hex_matches(&sel.vid, &port.vid) && hex_matches(&sel.pid, &port.pid) && serial_ok && product_ok
+}
+
+fn describe_selector(sel: &SelectorSpec) -> String {
+    let mut parts = Vec::new();
+    if let Some(v) = &sel.vid {
+        parts.push(format!("vid={v}"));
+    }
+    if let Some(p) = &sel.pid {
+        parts.push(format!("pid={p}"));
+    }
+    if let Some(s) = &sel.serial_number {
+        parts.push(format!("serial_number={s}"));
+    }
+    if let Some(p) = &sel.product {
+        parts.push(format!("product contains {p:?}"));
+    }
+    parts.join(", ")
+}
+
+fn describe_candidates(ports: &[PortInfo]) -> String {
+    let described: Vec<String> = ports
+        .iter()
+        .filter(|p| p.kind != "mock")
+        .map(|p| {
+            let mut attrs = Vec::new();
+            if let Some(v) = &p.vid {
+                attrs.push(format!("vid={v}"));
+            }
+            if let Some(pid) = &p.pid {
+                attrs.push(format!("pid={pid}"));
+            }
+            if let Some(prod) = &p.product {
+                attrs.push(format!("product={prod:?}"));
+            }
+            if let Some(s) = &p.serial_number {
+                attrs.push(format!("serial_number={s}"));
+            }
+            if attrs.is_empty() {
+                p.path.clone()
+            } else {
+                format!("{} ({})", p.path, attrs.join(", "))
+            }
+        })
+        .collect();
+    if described.is_empty() {
+        "none".to_string()
+    } else {
+        described.join("; ")
+    }
 }

@@ -284,6 +284,110 @@ impl Session {
         }
     }
 
+    /// Classified request/response for declared commands: silence, timeout and
+    /// protocol exception frames are results, not errors. `Err` is reserved
+    /// for infrastructure failure (dead port, capture write failure, invalid
+    /// exception rule).
+    ///
+    /// With `first_byte_ms` set, zero bytes within that window classifies as
+    /// `Silence` early, without waiting out `timeout_ms`. While too few bytes
+    /// have arrived to decide the exception predicate, the main rule stays
+    /// active (a normal frame can be shorter than `when.at + 1` bytes); once
+    /// the predicate hits, the frame is collected per `exception.match`.
+    pub async fn request_classified(
+        &self,
+        tx: &[u8],
+        rule: MatchRule,
+        exception: Option<&openbaud_core::format::ExceptionSpec>,
+        timeout_ms: u64,
+        first_byte_ms: Option<u64>,
+    ) -> anyhow::Result<openbaud_core::exec::RawOutcome> {
+        use openbaud_core::exec::{exception_triggered, RawOutcome};
+
+        // Resolve the exception frame rule up front: a bad spec is a caller
+        // error, not a wire outcome.
+        let exc_rule = match exception {
+            Some(spec) => Some(spec.match_spec.to_rule("exception.match")?),
+            None => None,
+        };
+
+        let _guard = self.request_lock.lock().await;
+        self.shared.check_alive()?;
+
+        let mut cursor = self.shared.buf.lock().unwrap().next_seq();
+        self.write_raw(tx).await?;
+
+        let start = tokio::time::Instant::now();
+        let deadline = start + Duration::from_millis(timeout_ms);
+        let first_byte_deadline = first_byte_ms.map(|ms| start + Duration::from_millis(ms));
+        let mut buf: Vec<u8> = Vec::new();
+
+        loop {
+            {
+                let shared_buf = self.shared.buf.lock().unwrap();
+                let (chunks, new_cursor) = shared_buf.since(cursor);
+                cursor = new_cursor;
+                drop(shared_buf);
+                for (_ts, bytes) in chunks {
+                    buf.extend_from_slice(&bytes);
+                }
+            }
+
+            // Exception predicate: `None` (undecided) keeps the main rule.
+            let is_exception = match exception {
+                Some(spec) => exception_triggered(spec, &buf) == Some(true),
+                None => false,
+            };
+            let active_rule = if is_exception {
+                exc_rule.as_ref().expect("exc_rule is Some whenever exception is")
+            } else {
+                &rule
+            };
+            if let Some(frame) = self.try_complete(active_rule, &buf) {
+                return Ok(RawOutcome::Frame { bytes: frame, is_exception });
+            }
+
+            let now = tokio::time::Instant::now();
+            if buf.is_empty() {
+                if let Some(fb) = first_byte_deadline {
+                    if now >= fb {
+                        self.shared.check_alive()?;
+                        return Ok(RawOutcome::Silence);
+                    }
+                }
+            }
+            if now >= deadline {
+                self.shared.check_alive()?;
+                return Ok(if buf.is_empty() {
+                    RawOutcome::Silence
+                } else {
+                    RawOutcome::Timeout { partial: buf }
+                });
+            }
+            let _ = tokio::time::timeout(POLL, self.shared.notify.notified()).await;
+        }
+    }
+
+    /// Whether the accumulated bytes complete a frame under `rule`. Length and
+    /// delimiter rules rebuild a matcher over the full buffer (cheap at serial
+    /// data rates); idle rules complete once the wire has been quiet.
+    fn try_complete(&self, rule: &MatchRule, buf: &[u8]) -> Option<Vec<u8>> {
+        if buf.is_empty() {
+            return None;
+        }
+        match rule {
+            MatchRule::Idle { idle_ms } => {
+                let last = self.shared.last_rx_ms.load(Ordering::Relaxed);
+                if now_ms().saturating_sub(last) >= *idle_ms {
+                    Some(buf.to_vec())
+                } else {
+                    None
+                }
+            }
+            _ => Matcher::new(rule.clone()).push(buf),
+        }
+    }
+
     pub fn capture_start(&self, path: &Path, note: Option<&str>) -> anyhow::Result<String> {
         let mut slot = self.shared.capture.lock().unwrap();
         if let Some(active) = slot.as_ref() {

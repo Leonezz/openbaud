@@ -17,7 +17,8 @@ async fn echo_port() -> BoxedPort {
     open_port("mock:echo", &Transport::default()).await.expect("mock:echo always opens")
 }
 
-/// A port that answers one exact request with a canned reply.
+/// A port that answers one exact request with a canned reply, then stays
+/// open — so classification is decided by the match rules, not port death.
 fn scripted_port(expect: Vec<u8>, reply: Vec<u8>) -> BoxedPort {
     let (client, server) = tokio::io::duplex(4096);
     tokio::spawn(async move {
@@ -26,6 +27,8 @@ fn scripted_port(expect: Vec<u8>, reply: Vec<u8>) -> BoxedPort {
         if read.read_exact(&mut got).await.is_ok() {
             assert_eq!(got, expect, "device received unexpected request");
             write.write_all(&reply).await.expect("reply write");
+            write.flush().await.ok();
+            std::future::pending::<()>().await;
         }
     });
     Box::new(client)
@@ -328,7 +331,7 @@ async fn broken_command_file_does_not_block_device() {
 #[tokio::test]
 async fn tool_list_includes_mock_and_schemas() {
     let listed = tools::list();
-    assert_eq!(listed.len(), 9);
+    assert_eq!(listed.len(), 10);
     let dir = scaffold_workspace();
     let ctx = ctx_for(&dir);
     let ports = tools::call("list_ports", json!({}), &ctx).await.unwrap();
@@ -338,4 +341,261 @@ async fn tool_list_includes_mock_and_schemas() {
         .iter()
         .any(|p| p["path"] == json!("mock:echo"));
     assert!(has_mock);
+}
+
+// ---------------------------------------------------------------------------
+// v0.1 surface: classified outcomes, workflows, selector and replay wiring
+// ---------------------------------------------------------------------------
+
+const MODBUS_TX: &[u8] = &[0x01, 0x04, 0x00, 0x00, 0x00, 0x01, 0x31, 0xCA];
+
+fn crc_framed(body: &[u8]) -> Vec<u8> {
+    let mut frame = body.to_vec();
+    frame.extend(openbaud_core::checksum::ChecksumKind::Crc16Modbus.compute(body));
+    frame
+}
+
+/// Command with exception recognition; `expect` is spliced in by the caller.
+fn modbus_cmd_yaml(name: &str, expect: &str) -> String {
+    format!(
+        r#"
+schema: openbaud/command@v0
+name: {name}
+frame: {{ hex: "01 04 00 00 00 01 {{crc16_modbus}}" }}
+response:
+  match: {{ length: 7 }}
+  timeout_ms: 1000
+{expect}  validate: {{ checksum: crc16_modbus }}
+  parse:
+    fields:
+      voltage: {{ at: 3, type: u16be, scale: 0.1, unit: "V" }}
+  exception:
+    when: {{ at: 1, equals: "84" }}
+    match: {{ length: 5 }}
+    validate: {{ checksum: crc16_modbus }}
+    parse:
+      fields:
+        function: {{ at: 1, type: u8 }}
+        exception_code: {{ at: 2, type: u8 }}
+"#
+    )
+}
+
+#[tokio::test]
+async fn tool_run_command_classifies_modbus_exception() {
+    let dir = scaffold_workspace();
+    let cmds = dir.path().join("devices/echodev/commands");
+    std::fs::write(cmds.join("read_v.yaml"), modbus_cmd_yaml("read_v", "")).unwrap();
+    std::fs::write(
+        cmds.join("illegal.yaml"),
+        modbus_cmd_yaml("illegal", "  expect: exception\n"),
+    )
+    .unwrap();
+    let ctx = ctx_for(&dir);
+    let exception_reply = crc_framed(&[0x01, 0x84, 0x01]);
+
+    // Default expect (normal) + exception frame on the wire: classified, but
+    // the expectation is unmet — the error embeds the full result JSON.
+    let session = ctx.sessions.open(
+        "scripted",
+        Framing::Idle { idle_ms: 20 },
+        scripted_port(MODBUS_TX.to_vec(), exception_reply.clone()),
+    );
+    let err = tools::call(
+        "run_command",
+        json!({ "device": "echodev", "command": "read_v", "session_id": session.id }),
+        &ctx,
+    )
+    .await
+    .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("expectation not met"), "got: {msg}");
+    assert!(msg.contains("\"outcome\": \"exception\""), "got: {msg}");
+    assert!(msg.contains("\"exception_code\": 1"), "got: {msg}");
+
+    // Same wire response, but the command declares expect: exception.
+    let session = ctx.sessions.open(
+        "scripted",
+        Framing::Idle { idle_ms: 20 },
+        scripted_port(MODBUS_TX.to_vec(), exception_reply),
+    );
+    let result = tools::call(
+        "run_command",
+        json!({ "device": "echodev", "command": "illegal", "session_id": session.id }),
+        &ctx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(result["outcome"], json!("exception"));
+    assert_eq!(result["expect"], json!("exception"));
+    assert_eq!(result["expect_met"], json!(true));
+    assert_eq!(result["exception"]["exception_code"], json!(1));
+    assert_eq!(result["exception"]["function"], json!(0x84));
+
+    let audit = std::fs::read_to_string(dir.path().join(".openbaud/audit.jsonl")).unwrap();
+    assert!(audit.contains("\"outcome\":\"exception\""), "audit: {audit}");
+}
+
+#[tokio::test]
+async fn tool_run_workflow_failure_skips_steps_but_runs_finally() {
+    let dir = scaffold_workspace();
+    let dev = dir.path().join("devices/echodev");
+    // Echo always answers, so expect: silence must fail.
+    std::fs::write(
+        dev.join("commands/must_fail.yaml"),
+        r#"
+schema: openbaud/command@v0
+name: must_fail
+frame: { hex: "AA" }
+response:
+  expect: silence
+  timeout_ms: 200
+"#,
+    )
+    .unwrap();
+    std::fs::create_dir_all(dev.join("workflows")).unwrap();
+    std::fs::write(
+        dev.join("workflows/check.yaml"),
+        r#"
+schema: openbaud/workflow@v0
+name: check
+steps:
+  - command: must_fail
+  - command: ping
+finally:
+  - command: ping
+"#,
+    )
+    .unwrap();
+    let ctx = ctx_for(&dir);
+
+    let err = tools::call(
+        "run_workflow",
+        json!({ "device": "echodev", "workflow": "check", "port": "mock:echo" }),
+        &ctx,
+    )
+    .await
+    .unwrap_err();
+    let msg = format!("{err:#}");
+    let (_, embedded) = msg.split_once("Full result:\n").expect("error embeds the result JSON");
+    let result: serde_json::Value = serde_json::from_str(embedded.trim()).unwrap();
+
+    assert_eq!(result["ok"], json!(false));
+    assert_eq!(result["steps"].as_array().unwrap().len(), 1, "second step must not run");
+    assert_eq!(result["steps"][0]["command"], json!("must_fail"));
+    assert_eq!(result["steps"][0]["outcome"], json!("timeout"));
+    assert_eq!(result["steps"][0]["expect_met"], json!(false));
+    assert_eq!(result["skipped"], json!(["ping"]));
+    // finally still ran, and succeeded.
+    assert_eq!(result["finally"][0]["command"], json!("ping"));
+    assert_eq!(result["finally"][0]["ok"], json!(true));
+
+    let audit = std::fs::read_to_string(dir.path().join(".openbaud/audit.jsonl")).unwrap();
+    let finally_line = audit
+        .lines()
+        .find(|l| l.contains("run_workflow.step") && l.contains("\"finally\""))
+        .expect("finally step must be audited");
+    assert!(finally_line.contains("\"ok\":true"), "got: {finally_line}");
+    let total_line = audit
+        .lines()
+        .find(|l| l.contains("\"tool\":\"run_workflow\""))
+        .expect("workflow-level audit entry");
+    assert!(total_line.contains("\"ok\":false"), "got: {total_line}");
+}
+
+#[tokio::test]
+async fn workflow_referencing_missing_command_is_broken() {
+    let dir = scaffold_workspace();
+    let wf_dir = dir.path().join("devices/echodev/workflows");
+    std::fs::create_dir_all(&wf_dir).unwrap();
+    std::fs::write(
+        wf_dir.join("bad.yaml"),
+        "schema: openbaud/workflow@v0\nname: badwf\nsteps:\n  - command: nope\n",
+    )
+    .unwrap();
+    let ctx = ctx_for(&dir);
+
+    let err = tools::call(
+        "run_workflow",
+        json!({ "device": "echodev", "workflow": "badwf", "port": "mock:echo" }),
+        &ctx,
+    )
+    .await
+    .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("bad.yaml"), "got: {msg}");
+    assert!(msg.contains("nope"), "got: {msg}");
+}
+
+#[tokio::test]
+async fn selector_with_zero_matches_reports_candidates() {
+    let dir = scaffold_workspace();
+    let dev = dir.path().join("devices/seldev");
+    std::fs::create_dir_all(dev.join("commands")).unwrap();
+    std::fs::write(
+        dev.join("profile.yaml"),
+        "schema: openbaud/profile@v0\nname: seldev\nselector: { serial_number: \"OPENBAUD-TEST-NO-SUCH-SERIAL\" }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dev.join("commands/noop.yaml"),
+        "schema: openbaud/command@v0\nname: noop\nframe: { hex: \"00\" }\n",
+    )
+    .unwrap();
+    let ctx = ctx_for(&dir);
+
+    // No port and no session: the selector runs and finds nothing — loud
+    // error describing the criteria, never a silent pick.
+    let err = tools::call(
+        "run_command",
+        json!({ "device": "seldev", "command": "noop" }),
+        &ctx,
+    )
+    .await
+    .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("no port matches"), "got: {msg}");
+    assert!(msg.contains("OPENBAUD-TEST-NO-SUCH-SERIAL"), "got: {msg}");
+}
+
+#[tokio::test]
+async fn replay_relative_path_resolves_against_workspace() {
+    let dir = scaffold_workspace();
+    let ctx = ctx_for(&dir);
+
+    // Record: run ping over mock:echo with a capture active.
+    let opened = tools::call("open", json!({ "port": "mock:echo", "device": "echodev" }), &ctx)
+        .await
+        .unwrap();
+    let sid = opened["session_id"].as_str().unwrap().to_string();
+    let started = tools::call("capture_start", json!({ "session_id": sid }), &ctx).await.unwrap();
+    let live = tools::call(
+        "run_command",
+        json!({ "device": "echodev", "command": "ping", "session_id": sid }),
+        &ctx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(live["outcome"], json!("normal"));
+    tools::call("capture_stop", json!({ "session_id": sid }), &ctx).await.unwrap();
+    tools::call("close", json!({ "session_id": sid }), &ctx).await.unwrap();
+
+    // Replay via a workspace-relative capture path.
+    let abs = std::path::PathBuf::from(started["path"].as_str().unwrap());
+    let rel = abs.strip_prefix(dir.path()).expect("capture lives inside the workspace");
+    let replayed = tools::call(
+        "run_command",
+        json!({
+            "device": "echodev",
+            "command": "ping",
+            "port": format!("replay:{}", rel.display()),
+        }),
+        &ctx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(replayed["outcome"], json!("normal"));
+    assert_eq!(replayed["expect_met"], json!(true));
+    assert_eq!(replayed["parsed"]["y"], json!(66));
+    assert_eq!(replayed["parsed"], live["parsed"], "replay must reproduce the live result");
 }

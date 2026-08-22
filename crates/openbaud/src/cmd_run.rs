@@ -1,18 +1,18 @@
-//! `openbaud run <device>/<command>` — execute a sedimented command without
-//! any agent. This is the standalone proof that workspace knowledge is real,
-//! and the entry point for CI regression against hardware.
+//! `openbaud run <device>/<name>` — execute a sedimented command or workflow
+//! without any agent. This is the standalone proof that workspace knowledge is
+//! real, and the entry point for CI regression against hardware.
 
+use anyhow::{anyhow, bail};
 use openbaud::engine::audit::Audit;
 use openbaud::engine::session::Session;
 use openbaud::engine::transport::open_port;
-use openbaud::workspace::Workspace;
-use anyhow::{anyhow, bail};
-use openbaud_core::exec::{build_frame, parse_response, units};
+use openbaud::run::{execute_command, execute_workflow, resolve_port, workflow_risk};
+use openbaud::workspace::{Device, Workspace};
 use openbaud_core::format::Risk;
 use openbaud_core::framing::Framing;
-use openbaud_core::hex;
 use serde_json::{json, Map, Value};
 use std::path::Path;
+use std::sync::Arc;
 
 pub async fn run(
     spec: &str,
@@ -21,19 +21,71 @@ pub async fn run(
     workspace_dir: &Path,
     acknowledge_risk: bool,
 ) -> anyhow::Result<()> {
-    let (device_name, command_name) = spec
+    let (device_name, name) = spec
         .split_once('/')
-        .ok_or_else(|| anyhow!("expected <device>/<command>, got {spec:?}"))?;
+        .ok_or_else(|| anyhow!("expected <device>/<command-or-workflow>, got {spec:?}"))?;
     let workspace = Workspace::at(workspace_dir);
     let audit = Audit::new(&workspace.root)?;
     let device = workspace.load_device(device_name)?;
-    let cmd = device.command(command_name)?;
+
+    // Commands shadow workflows by construction (name conflicts are rejected
+    // at load time), so command lookup goes first.
+    if device.commands.contains_key(name) {
+        return run_command_cli(spec, &device, name, port, sets, &workspace, &audit, acknowledge_risk)
+            .await;
+    }
+    if device.workflows.contains_key(name) {
+        return run_workflow_cli(spec, &device, name, port, sets, &workspace, &audit, acknowledge_risk)
+            .await;
+    }
+
+    let mut commands: Vec<&str> = device.commands.keys().map(String::as_str).collect();
+    let mut workflows: Vec<&str> = device.workflows.keys().map(String::as_str).collect();
+    commands.sort();
+    workflows.sort();
+    let mut msg = format!(
+        "device {device_name:?} has no command or workflow {name:?} (commands: [{}]; workflows: [{}])",
+        commands.join(", "),
+        workflows.join(", ")
+    );
+    for warning in device.broken_warnings() {
+        msg.push_str(&format!("; {warning}"));
+    }
+    bail!(msg);
+}
+
+async fn open_session(
+    device: &Device,
+    port: Option<&str>,
+    workspace: &Workspace,
+) -> anyhow::Result<Arc<Session>> {
+    let port = resolve_port(port, device, &workspace.root)?;
+    let framing = match &device.profile.framing {
+        Some(spec) => spec.to_framing(&format!("devices/{}/profile.yaml", device.name))?,
+        None => Framing::Idle { idle_ms: 30 },
+    };
+    let boxed = open_port(&port, &device.profile.transport).await?;
+    Ok(Session::spawn("cli".to_string(), port, framing, boxed))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_command_cli(
+    spec: &str,
+    device: &Device,
+    name: &str,
+    port: Option<&str>,
+    sets: &[String],
+    workspace: &Workspace,
+    audit: &Audit,
+    acknowledge_risk: bool,
+) -> anyhow::Result<()> {
+    let cmd = device.command(name)?;
 
     if cmd.risk == Risk::Danger && !acknowledge_risk {
         audit.record(json!({
             "tool": "cli.run",
-            "device": device_name,
-            "command": command_name,
+            "device": device.name,
+            "command": name,
             "risk": "danger",
             "denied": true,
             "ok": false,
@@ -41,7 +93,6 @@ pub async fn run(
         }))?;
         bail!("command {spec} is marked risk=danger; rerun with --acknowledge-risk if you are sure");
     }
-    let port = port.ok_or_else(|| anyhow!("--port is required (see `openbaud ports`)"))?;
     for warning in device.broken_warnings() {
         eprintln!("warning: {warning}");
     }
@@ -55,44 +106,136 @@ pub async fn run(
         params.insert(key.to_string(), value);
     }
 
-    let tx = build_frame(cmd, &params)?;
-    let framing = match &device.profile.framing {
-        Some(spec) => spec.to_framing(&format!("devices/{device_name}/profile.yaml"))?,
-        None => Framing::Idle { idle_ms: 30 },
-    };
-    let boxed = open_port(port, &device.profile.transport).await?;
-    let session = Session::spawn("cli".to_string(), port.to_string(), framing, boxed);
+    let session = open_session(device, port, workspace).await?;
+    let exec = execute_command(&session, device, cmd, &params).await;
 
-    let outcome: anyhow::Result<Value> = async {
-        if let Some(resp) = &cmd.response {
-            let rule = resp.match_spec.to_rule(spec)?;
-            let raw = session.request(&tx, rule, resp.timeout_ms).await?;
-            let parsed = parse_response(cmd, &raw)?;
-            Ok(json!({
-                "parsed": parsed,
-                "units": units(cmd),
-                "tx_hex": hex::to_hex(&tx),
-                "raw_hex": hex::to_hex(&raw),
-            }))
-        } else {
-            session.write_raw(&tx).await?;
-            Ok(json!({ "tx_hex": hex::to_hex(&tx), "note": "no response spec; frame sent" }))
+    let mut entry = json!({
+        "tool": "cli.run",
+        "device": device.name,
+        "command": name,
+        "risk": format!("{:?}", cmd.risk).to_lowercase(),
+        "port": session.port_name,
+    });
+    let obj = entry.as_object_mut().expect("object");
+    match &exec {
+        Ok((result, ok)) => {
+            for key in ["tx_hex", "outcome"] {
+                if let Some(v) = result.get(key) {
+                    obj.insert(key.to_string(), v.clone());
+                }
+            }
+            obj.insert("ok".to_string(), json!(*ok));
+            if !ok {
+                obj.insert("detail".to_string(), json!("expectation not met"));
+            }
+        }
+        Err(e) => {
+            obj.insert("ok".to_string(), json!(false));
+            obj.insert("detail".to_string(), json!(format!("{e:#}")));
         }
     }
-    .await;
+    audit.record(entry)?;
 
+    let (result, ok) = exec?;
+    println!("{}", serde_json::to_string_pretty(&result)?);
+    if !ok {
+        bail!(
+            "command {spec} expectation not met — outcome {}, expected {}",
+            result.get("outcome").cloned().unwrap_or_default(),
+            result.get("expect").cloned().unwrap_or_default(),
+        );
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_workflow_cli(
+    spec: &str,
+    device: &Device,
+    name: &str,
+    port: Option<&str>,
+    sets: &[String],
+    workspace: &Workspace,
+    audit: &Audit,
+    acknowledge_risk: bool,
+) -> anyhow::Result<()> {
+    if !sets.is_empty() {
+        bail!("--set does not apply to workflows — parameters live in the workflow's steps");
+    }
+    let wf = device.workflow(name)?;
+    let (risk, danger_steps) = workflow_risk(device, wf)?;
+
+    if risk == Risk::Danger && !acknowledge_risk {
+        audit.record(json!({
+            "tool": "cli.run",
+            "device": device.name,
+            "workflow": name,
+            "risk": "danger",
+            "denied": true,
+            "ok": false,
+            "detail": "acknowledge_risk not set",
+        }))?;
+        bail!(
+            "workflow {spec} contains risk=danger command(s): [{}]; rerun with --acknowledge-risk if you are sure",
+            danger_steps.join(", ")
+        );
+    }
+    for warning in device.broken_warnings() {
+        eprintln!("warning: {warning}");
+    }
+
+    let session = open_session(device, port, workspace).await?;
+    let exec = execute_workflow(&session, device, wf).await;
+
+    let (result, ok) = match exec {
+        Ok(ok) => ok,
+        Err(e) => {
+            audit.record(json!({
+                "tool": "cli.run",
+                "device": device.name,
+                "workflow": name,
+                "risk": format!("{risk:?}").to_lowercase(),
+                "port": session.port_name,
+                "ok": false,
+                "detail": format!("{e:#}"),
+            }))?;
+            return Err(e);
+        }
+    };
+
+    // One audit entry per executed step, then the workflow-level entry — same
+    // shape as the MCP run_workflow tool.
+    for (phase, key) in [("step", "steps"), ("finally", "finally")] {
+        for step in result[key].as_array().into_iter().flatten() {
+            let mut step_entry = json!({
+                "tool": "cli.run.step",
+                "device": device.name,
+                "workflow": name,
+                "phase": phase,
+                "port": session.port_name,
+            });
+            let obj = step_entry.as_object_mut().expect("object");
+            for field in ["command", "ok", "outcome", "tx_hex", "detail", "error"] {
+                if let Some(v) = step.get(field) {
+                    obj.insert(field.to_string(), v.clone());
+                }
+            }
+            audit.record(step_entry)?;
+        }
+    }
     audit.record(json!({
         "tool": "cli.run",
-        "device": device_name,
-        "command": command_name,
-        "risk": format!("{:?}", cmd.risk).to_lowercase(),
-        "port": port,
-        "tx_hex": hex::to_hex(&tx),
-        "ok": outcome.is_ok(),
-        "detail": outcome.as_ref().err().map(|e| format!("{e:#}")),
+        "device": device.name,
+        "workflow": name,
+        "risk": format!("{risk:?}").to_lowercase(),
+        "port": session.port_name,
+        "ok": ok,
+        "detail": if ok { Value::Null } else { json!("workflow failed (see cli.run.step entries)") },
     }))?;
 
-    let result = outcome?;
     println!("{}", serde_json::to_string_pretty(&result)?);
+    if !ok {
+        bail!("workflow {spec} failed");
+    }
     Ok(())
 }

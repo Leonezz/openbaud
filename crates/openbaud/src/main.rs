@@ -26,11 +26,13 @@ enum Command {
     },
     /// Run the MCP server over stdio (launched by the host agent via .mcp.json)
     Mcp,
-    /// Execute a sedimented command: openbaud run <device>/<command> --port <p>
+    /// Execute a sedimented command or workflow: openbaud run <device>/<name>
     Run {
-        /// Command spec as <device>/<command>
+        /// Spec as <device>/<command-or-workflow>
         spec: String,
-        /// Serial port path (see `openbaud ports`)
+        /// Serial port path (see `openbaud ports`); optional when the device
+        /// profile declares a selector. `replay:<capture>` replays an .obcap
+        /// (relative paths resolve against --workspace)
         #[arg(long)]
         port: Option<String>,
         /// Parameter values as key=value (repeatable); values parsed as JSON, else string

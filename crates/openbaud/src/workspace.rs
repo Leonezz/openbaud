@@ -3,9 +3,9 @@
 //! captures/, the audit log in .openbaud/.
 
 use anyhow::{bail, Context};
-use openbaud_core::format::{parse_command, parse_profile, Command, Profile};
+use openbaud_core::format::{parse_command, parse_profile, parse_workflow, Command, Profile, Workflow};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
 pub struct Workspace {
@@ -17,9 +17,10 @@ pub struct Device {
     pub name: String,
     pub profile: Profile,
     pub commands: HashMap<String, Command>,
-    /// Command files that failed to load. They never block other commands of
-    /// the same device, but they are surfaced in errors and warnings so a
-    /// half-written file can't hide.
+    pub workflows: HashMap<String, Workflow>,
+    /// Command/workflow files that failed to load. They never block other
+    /// files of the same device, but they are surfaced in errors and warnings
+    /// so a half-written file can't hide.
     pub broken: Vec<BrokenFile>,
 }
 
@@ -69,42 +70,85 @@ impl Workspace {
         let mut commands = HashMap::new();
         let mut broken = Vec::new();
         let mut first_file: HashMap<String, String> = HashMap::new();
-        let commands_dir = dir.join("commands");
-        if commands_dir.is_dir() {
-            let mut paths: Vec<PathBuf> = std::fs::read_dir(&commands_dir)
-                .with_context(|| format!("cannot read {commands_dir:?}"))?
-                .flatten()
-                .map(|e| e.path())
-                .filter(|p| {
-                    matches!(p.extension().and_then(|e| e.to_str()), Some("yaml") | Some("yml"))
-                })
-                .collect();
-            paths.sort();
-            for path in paths {
-                let path_str = path.display().to_string();
-                let loaded = std::fs::read_to_string(&path)
-                    .with_context(|| format!("cannot read {path:?}"))
-                    .and_then(|yaml| Ok(parse_command(&yaml, &path_str)?));
-                match loaded {
-                    Ok(cmd) => {
-                        if let Some(first) = first_file.get(&cmd.name) {
-                            broken.push(BrokenFile {
-                                path: path_str,
-                                reason: format!(
-                                    "duplicate command name {:?}, already defined in {first}",
-                                    cmd.name
-                                ),
-                            });
-                        } else {
-                            first_file.insert(cmd.name.clone(), path_str);
-                            commands.insert(cmd.name.clone(), cmd);
-                        }
+        for path in yaml_files(&dir.join("commands"))? {
+            let path_str = path.display().to_string();
+            let loaded = std::fs::read_to_string(&path)
+                .with_context(|| format!("cannot read {path:?}"))
+                .and_then(|yaml| Ok(parse_command(&yaml, &path_str)?));
+            match loaded {
+                Ok(cmd) => {
+                    if let Some(first) = first_file.get(&cmd.name) {
+                        broken.push(BrokenFile {
+                            path: path_str,
+                            reason: format!(
+                                "duplicate command name {:?}, already defined in {first}",
+                                cmd.name
+                            ),
+                        });
+                    } else {
+                        first_file.insert(cmd.name.clone(), path_str);
+                        commands.insert(cmd.name.clone(), cmd);
                     }
-                    Err(e) => broken.push(BrokenFile { path: path_str, reason: format!("{e:#}") }),
                 }
+                Err(e) => broken.push(BrokenFile { path: path_str, reason: format!("{e:#}") }),
             }
         }
-        Ok(Device { name: name.to_string(), profile, commands, broken })
+
+        let mut workflows = HashMap::new();
+        let mut wf_first_file: HashMap<String, String> = HashMap::new();
+        for path in yaml_files(&dir.join("workflows"))? {
+            let path_str = path.display().to_string();
+            let loaded = std::fs::read_to_string(&path)
+                .with_context(|| format!("cannot read {path:?}"))
+                .and_then(|yaml| Ok(parse_workflow(&yaml, &path_str)?));
+            let wf = match loaded {
+                Ok(wf) => wf,
+                Err(e) => {
+                    broken.push(BrokenFile { path: path_str, reason: format!("{e:#}") });
+                    continue;
+                }
+            };
+            if commands.contains_key(&wf.name) {
+                broken.push(BrokenFile {
+                    path: path_str,
+                    reason: format!(
+                        "workflow name {:?} conflicts with a command of the same name",
+                        wf.name
+                    ),
+                });
+                continue;
+            }
+            if let Some(first) = wf_first_file.get(&wf.name) {
+                broken.push(BrokenFile {
+                    path: path_str,
+                    reason: format!(
+                        "duplicate workflow name {:?}, already defined in {first}",
+                        wf.name
+                    ),
+                });
+                continue;
+            }
+            let missing: Vec<String> = wf
+                .referenced_commands()
+                .into_iter()
+                .filter(|c| !commands.contains_key(c))
+                .collect();
+            if !missing.is_empty() {
+                broken.push(BrokenFile {
+                    path: path_str,
+                    reason: format!(
+                        "workflow {:?} references command(s) not defined for this device: [{}]",
+                        wf.name,
+                        missing.join(", ")
+                    ),
+                });
+                continue;
+            }
+            wf_first_file.insert(wf.name.clone(), path_str);
+            workflows.insert(wf.name.clone(), wf);
+        }
+
+        Ok(Device { name: name.to_string(), profile, commands, workflows, broken })
     }
 
     pub fn capture_path(&self, session_id: &str) -> PathBuf {
@@ -112,6 +156,21 @@ impl Workspace {
             .join("captures")
             .join(format!("cap-{}-{}.obcap", crate::engine::now_ms(), session_id))
     }
+}
+
+/// Sorted *.yaml / *.yml paths in `dir`; empty when the directory is absent.
+fn yaml_files(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    if !dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
+        .with_context(|| format!("cannot read {dir:?}"))?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| matches!(p.extension().and_then(|e| e.to_str()), Some("yaml") | Some("yml")))
+        .collect();
+    paths.sort();
+    Ok(paths)
 }
 
 impl Device {
@@ -126,27 +185,49 @@ impl Device {
             self.name,
             available.join(", ")
         );
-        if !self.broken.is_empty() {
-            let details: Vec<String> = self
-                .broken
-                .iter()
-                .map(|b| format!("{}: {}", b.path, b.reason))
-                .collect();
-            msg.push_str(&format!(
-                "; note: {} command file(s) failed to load and were skipped — [{}]",
-                self.broken.len(),
-                details.join("; ")
-            ));
-        }
+        msg.push_str(&self.broken_note());
         Err(anyhow::anyhow!(msg))
     }
 
-    /// Human-readable warnings about skipped command files, for surfacing in
-    /// tool results even when the requested command succeeded.
+    pub fn workflow(&self, name: &str) -> anyhow::Result<&Workflow> {
+        if let Some(wf) = self.workflows.get(name) {
+            return Ok(wf);
+        }
+        let mut available: Vec<&str> = self.workflows.keys().map(String::as_str).collect();
+        available.sort();
+        let mut msg = format!(
+            "device {:?} has no workflow {name:?} (available: [{}])",
+            self.name,
+            available.join(", ")
+        );
+        msg.push_str(&self.broken_note());
+        Err(anyhow::anyhow!(msg))
+    }
+
+    /// Suffix naming the broken files, appended to lookup errors ("" when
+    /// nothing is broken).
+    fn broken_note(&self) -> String {
+        if self.broken.is_empty() {
+            return String::new();
+        }
+        let details: Vec<String> = self
+            .broken
+            .iter()
+            .map(|b| format!("{}: {}", b.path, b.reason))
+            .collect();
+        format!(
+            "; note: {} file(s) failed to load and were skipped — [{}]",
+            self.broken.len(),
+            details.join("; ")
+        )
+    }
+
+    /// Human-readable warnings about skipped command/workflow files, for
+    /// surfacing in tool results even when the requested operation succeeded.
     pub fn broken_warnings(&self) -> Vec<String> {
         self.broken
             .iter()
-            .map(|b| format!("broken command file ignored: {} ({})", b.path, b.reason))
+            .map(|b| format!("broken file ignored: {} ({})", b.path, b.reason))
             .collect()
     }
 }

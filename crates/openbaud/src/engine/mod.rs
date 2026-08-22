@@ -1,5 +1,6 @@
 pub mod audit;
 pub mod capture;
+pub mod replay;
 pub mod session;
 pub mod transport;
 

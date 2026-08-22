@@ -1,9 +1,11 @@
-//! The nine MCP tools: schemas and dispatch.
+//! The ten MCP tools: schemas and dispatch.
 
-use crate::engine::transport::{self, open_port};
+use crate::engine::session::Session;
+use crate::engine::transport::{self, open_port, resolve_selector};
 use crate::mcp::Ctx;
+use crate::run;
+use crate::workspace::Device;
 use anyhow::{anyhow, bail};
-use openbaud_core::exec::{build_frame, parse_response, units};
 use openbaud_core::format::{FramingSpec, MatchSpec, Risk};
 use openbaud_core::framing::{Framing, MatchRule};
 use openbaud_core::hex;
@@ -12,10 +14,11 @@ use std::sync::Arc;
 
 pub const SERVER_INSTRUCTIONS: &str = "openbaud gives you structured, audited access to serial \
 ports plus a workspace knowledge format. Device knowledge lives in devices/<name>/ \
-(profile.yaml, commands/*.yaml, notes.md) in the current workspace — read those files directly, \
-and sediment what you learn about a device into them. Port 'mock:echo' always exists for \
-smoke-testing without hardware. Every write is appended to .openbaud/audit.jsonl. Prefer \
-run_command (typed, parsed, provenance-tracked) over raw send/request once a command exists.";
+(profile.yaml, commands/*.yaml, workflows/*.yaml, notes.md) in the current workspace — read \
+those files directly, and sediment what you learn about a device into them. Port 'mock:echo' \
+always exists for smoke-testing without hardware; 'replay:<capture path>' replays a recorded \
+.obcap. Every write is appended to .openbaud/audit.jsonl. Prefer run_command (typed, parsed, \
+provenance-tracked) over raw send/request once a command exists.";
 
 /// Default framing when neither profile nor caller specifies one: frame on a
 /// 30 ms receive gap, a sane exploration default.
@@ -34,9 +37,9 @@ pub fn list() -> Vec<Value> {
         }),
         json!({
             "name": "open",
-            "description": "Open a serial port session. If `device` names a workspace device, its profile supplies transport defaults and framing; explicit arguments override. Returns a session_id.",
-            "inputSchema": { "type": "object", "required": ["port"], "properties": {
-                "port": { "type": "string", "description": "Port path from list_ports, or mock:echo" },
+            "description": "Open a serial port session. If `device` names a workspace device, its profile supplies transport defaults and framing; explicit arguments override. `port` may be omitted when the device profile declares a `selector` (vid/pid/serial_number/product) — exactly one live match is required. `replay:<capture path>` (relative to the workspace) replays a recorded .obcap. Returns a session_id.",
+            "inputSchema": { "type": "object", "properties": {
+                "port": { "type": "string", "description": "Port path from list_ports, mock:echo, or replay:<capture>. Optional when the device profile has a selector" },
                 "device": { "type": "string", "description": "Workspace device name supplying defaults" },
                 "baud": { "type": "integer" },
                 "data_bits": { "type": "integer", "minimum": 5, "maximum": 8 },
@@ -84,13 +87,24 @@ pub fn list() -> Vec<Value> {
         }),
         json!({
             "name": "run_command",
-            "description": "Execute a named command from devices/<device>/commands/ with typed params: builds the frame, awaits and parses the response per the command spec (audited). Give session_id for an open session, or port to open an ephemeral one with the device's profile transport. Commands with risk=danger additionally require acknowledge_risk=true.",
+            "description": "Execute a named command from devices/<device>/commands/ with typed params: builds the frame, awaits the response and classifies the outcome (normal | exception | silence | timeout | checksum_error | malformed) against the command's declared `expect` (audited; an unmet expectation is an error carrying the full result JSON). Give session_id for an open session, or port to open an ephemeral one with the device's profile transport — port may be omitted when the profile declares a selector, and accepts replay:<capture path>. Commands with risk=danger additionally require acknowledge_risk=true.",
             "inputSchema": { "type": "object", "required": ["device", "command"], "properties": {
                 "device": { "type": "string" },
                 "command": { "type": "string" },
                 "params": { "type": "object" },
                 "session_id": { "type": "string" },
-                "port": { "type": "string" },
+                "port": { "type": "string", "description": "Optional when session_id is given or the device profile has a selector" },
+                "acknowledge_risk": { "type": "boolean" }
+            }},
+        }),
+        json!({
+            "name": "run_workflow",
+            "description": "Execute a workflow from devices/<device>/workflows/: its steps run in order on one session (step params override command defaults); the first failing step skips the rest, then every `finally` step is attempted regardless. Returns {ok, steps, finally, skipped}; ok=false is an error carrying the full result JSON. Workflow risk is the maximum of its commands' risk — danger requires acknowledge_risk=true. Session resolution is the same as run_command (session_id, port, or profile selector).",
+            "inputSchema": { "type": "object", "required": ["device", "workflow"], "properties": {
+                "device": { "type": "string" },
+                "workflow": { "type": "string" },
+                "session_id": { "type": "string" },
+                "port": { "type": "string", "description": "Optional when session_id is given or the device profile has a selector" },
                 "acknowledge_risk": { "type": "boolean" }
             }},
         }),
@@ -133,6 +147,7 @@ pub async fn call(name: &str, args: Value, ctx: &Arc<Ctx>) -> anyhow::Result<Val
         "send" => tool_send(args, ctx).await,
         "request" => tool_request(args, ctx).await,
         "run_command" => tool_run_command(args, ctx).await,
+        "run_workflow" => tool_run_workflow(args, ctx).await,
         "capture_start" => {
             let session = ctx.sessions.get(arg_str(&args, "session_id")?)?;
             let note = args.get("note").and_then(Value::as_str);
@@ -149,11 +164,23 @@ pub async fn call(name: &str, args: Value, ctx: &Arc<Ctx>) -> anyhow::Result<Val
 }
 
 async fn tool_open(args: Value, ctx: &Arc<Ctx>) -> anyhow::Result<Value> {
-    let port = arg_str(&args, "port")?;
     let device = match args.get("device").and_then(Value::as_str) {
         Some(name) => Some(ctx.workspace.load_device(name)?),
         None => None,
     };
+    let port = match args.get("port").and_then(Value::as_str) {
+        Some(p) => run::resolve_port_arg(p, &ctx.workspace.root),
+        None => match device.as_ref().and_then(|d| d.profile.selector.as_ref()) {
+            Some(selector) => {
+                resolve_selector(selector, &device.as_ref().expect("selector implies device").name)?
+            }
+            None => bail!(
+                "no port given — pass a port explicitly (see list_ports), or give a device \
+                 whose profile declares a `selector` for automatic resolution"
+            ),
+        },
+    };
+    let port = port.as_str();
     let mut cfg = device.as_ref().map(|d| d.profile.transport.clone()).unwrap_or_default();
     if let Some(v) = args.get("baud") {
         let b = v
@@ -289,6 +316,39 @@ async fn tool_request(args: Value, ctx: &Arc<Ctx>) -> anyhow::Result<Value> {
     Ok(json!({ "hex": hex::to_hex(&raw), "text": hex::to_text_lossy(&raw) }))
 }
 
+/// Session for run_command/run_workflow: an existing one by id, or an
+/// ephemeral one over `port` — resolved via the device's profile selector
+/// when no port is given. Returns (session, is_ephemeral).
+async fn resolve_session(
+    args: &Value,
+    device: &Device,
+    ctx: &Arc<Ctx>,
+) -> anyhow::Result<(Arc<Session>, bool)> {
+    match args.get("session_id").and_then(Value::as_str) {
+        Some(id) => Ok((ctx.sessions.get(id)?, false)),
+        None => {
+            let port = run::resolve_port(
+                args.get("port").and_then(Value::as_str),
+                device,
+                &ctx.workspace.root,
+            )?;
+            let framing = resolve_framing(None, Some(&device.profile))?;
+            let boxed = open_port(&port, &device.profile.transport).await?;
+            Ok((ctx.sessions.open(&port, framing, boxed), true))
+        }
+    }
+}
+
+/// Attach the device's broken-file warnings to a successful result.
+fn attach_warnings(result: &mut Value, device: &Device) {
+    if !device.broken.is_empty() {
+        result
+            .as_object_mut()
+            .expect("run results are objects")
+            .insert("warnings".to_string(), json!(device.broken_warnings()));
+    }
+}
+
 async fn tool_run_command(args: Value, ctx: &Arc<Ctx>) -> anyhow::Result<Value> {
     let device_name = arg_str(&args, "device")?.to_string();
     let command_name = arg_str(&args, "command")?.to_string();
@@ -323,38 +383,20 @@ async fn tool_run_command(args: Value, ctx: &Arc<Ctx>) -> anyhow::Result<Value> 
         return Err(e);
     }
 
-    let staged = (|| {
-        let params: Map<String, Value> = match args.get("params") {
-            Some(Value::Object(m)) => m.clone(),
-            Some(other) => bail!("params must be an object, got {other}"),
-            None => Map::new(),
-        };
-        Ok(build_frame(&cmd, &params)?)
+    let staged = (|| match args.get("params") {
+        Some(Value::Object(m)) => Ok(m.clone()),
+        Some(other) => bail!("params must be an object, got {other}"),
+        None => Ok(Map::new()),
     })();
-    let tx = match staged {
-        Ok(tx) => tx,
+    let params = match staged {
+        Ok(p) => p,
         Err(e) => {
             audit_fail(ctx, base, &e)?;
             return Err(e);
         }
     };
-    base.as_object_mut().expect("object").insert("tx_hex".to_string(), json!(hex::to_hex(&tx)));
 
-    let staged = async {
-        match args.get("session_id").and_then(Value::as_str) {
-            Some(id) => Ok((ctx.sessions.get(id)?, false)),
-            None => {
-                let port = args.get("port").and_then(Value::as_str).ok_or_else(|| {
-                    anyhow!("provide session_id (open session) or port (ephemeral session)")
-                })?;
-                let framing = resolve_framing(None, Some(&device.profile))?;
-                let boxed = open_port(port, &device.profile.transport).await?;
-                Ok((ctx.sessions.open(port, framing, boxed), true))
-            }
-        }
-    }
-    .await;
-    let (session, ephemeral) = match staged {
+    let (session, ephemeral) = match resolve_session(&args, &device, ctx).await {
         Ok(ok) => ok,
         Err(e) => {
             audit_fail(ctx, base, &e)?;
@@ -362,53 +404,140 @@ async fn tool_run_command(args: Value, ctx: &Arc<Ctx>) -> anyhow::Result<Value> 
         }
     };
 
-    let outcome: anyhow::Result<Value> = async {
-        if let Some(resp) = &cmd.response {
-            let rule = resp.match_spec.to_rule(&format!("{device_name}/{command_name}"))?;
-            let raw = session.request(&tx, rule, resp.timeout_ms).await?;
-            let parsed = parse_response(&cmd, &raw)?;
-            Ok(json!({
-                "device": device_name,
-                "command": command_name,
-                "tx_hex": hex::to_hex(&tx),
-                "raw_hex": hex::to_hex(&raw),
-                "raw_text": hex::to_text_lossy(&raw),
-                "parsed": parsed,
-                "units": units(&cmd),
-            }))
-        } else {
-            session.write_raw(&tx).await?;
-            Ok(json!({
-                "device": device_name,
-                "command": command_name,
-                "tx_hex": hex::to_hex(&tx),
-                "note": "command declares no response spec; frame sent",
-            }))
-        }
-    }
-    .await;
-
+    let exec = run::execute_command(&session, &device, &cmd, &params).await;
     if ephemeral {
         // The id was just created by us; failure here can only mean it is
         // already gone, which is fine.
         let _ = ctx.sessions.close(&session.id);
     }
-    let final_entry = base.as_object_mut().expect("object");
-    final_entry.insert("session".to_string(), json!(session.id));
-    final_entry.insert("port".to_string(), json!(session.port_name));
-    final_entry.insert("ok".to_string(), json!(outcome.is_ok()));
-    final_entry.insert(
-        "detail".to_string(),
-        json!(outcome.as_ref().err().map(|e| format!("{e:#}"))),
-    );
+
+    let entry = base.as_object_mut().expect("object");
+    entry.insert("session".to_string(), json!(session.id));
+    entry.insert("port".to_string(), json!(session.port_name));
+    match &exec {
+        Ok((result, ok)) => {
+            for key in ["tx_hex", "outcome"] {
+                if let Some(v) = result.get(key) {
+                    entry.insert(key.to_string(), v.clone());
+                }
+            }
+            entry.insert("ok".to_string(), json!(*ok));
+            if !ok {
+                entry.insert("detail".to_string(), json!("expectation not met"));
+            }
+        }
+        Err(e) => {
+            entry.insert("ok".to_string(), json!(false));
+            entry.insert("detail".to_string(), json!(format!("{e:#}")));
+        }
+    }
     ctx.audit.record(base)?;
 
-    let mut result = outcome?;
-    if !device.broken.is_empty() {
-        result
-            .as_object_mut()
-            .expect("run_command results are objects")
-            .insert("warnings".to_string(), json!(device.broken_warnings()));
+    let (mut result, ok) = exec?;
+    attach_warnings(&mut result, &device);
+    if !ok {
+        bail!(
+            "command {device_name}/{command_name} expectation not met — outcome {}, expected {}. Full result:\n{}",
+            result.get("outcome").cloned().unwrap_or_default(),
+            result.get("expect").cloned().unwrap_or_default(),
+            serde_json::to_string_pretty(&result).expect("result is valid JSON"),
+        );
+    }
+    Ok(result)
+}
+
+async fn tool_run_workflow(args: Value, ctx: &Arc<Ctx>) -> anyhow::Result<Value> {
+    let device_name = arg_str(&args, "device")?.to_string();
+    let workflow_name = arg_str(&args, "workflow")?.to_string();
+    let base = json!({ "tool": "run_workflow", "device": device_name, "workflow": workflow_name });
+
+    let staged = (|| {
+        let device = ctx.workspace.load_device(&device_name)?;
+        let wf = device.workflow(&workflow_name)?.clone();
+        let (risk, danger_steps) = run::workflow_risk(&device, &wf)?;
+        Ok((device, wf, risk, danger_steps))
+    })();
+    let (device, wf, risk, danger_steps) = match staged {
+        Ok(ok) => ok,
+        Err(e) => {
+            audit_fail(ctx, base, &e)?;
+            return Err(e);
+        }
+    };
+    let mut base = base;
+    base.as_object_mut()
+        .expect("object")
+        .insert("risk".to_string(), json!(format!("{risk:?}").to_lowercase()));
+
+    if risk == Risk::Danger && !args.get("acknowledge_risk").and_then(Value::as_bool).unwrap_or(false) {
+        let e = anyhow!(
+            "workflow {device_name}/{workflow_name} contains risk=danger command(s): [{}]. \
+             Confirm with the user, then retry with acknowledge_risk=true.",
+            danger_steps.join(", ")
+        );
+        let mut denied = base.clone();
+        denied.as_object_mut().expect("object").insert("denied".to_string(), json!(true));
+        audit_fail(ctx, denied, &e)?;
+        return Err(e);
+    }
+
+    let (session, ephemeral) = match resolve_session(&args, &device, ctx).await {
+        Ok(ok) => ok,
+        Err(e) => {
+            audit_fail(ctx, base, &e)?;
+            return Err(e);
+        }
+    };
+
+    let exec = run::execute_workflow(&session, &device, &wf).await;
+    if ephemeral {
+        let _ = ctx.sessions.close(&session.id);
+    }
+
+    let entry = base.as_object_mut().expect("object");
+    entry.insert("session".to_string(), json!(session.id));
+    entry.insert("port".to_string(), json!(session.port_name));
+    let (mut result, ok) = match exec {
+        Ok(ok) => ok,
+        Err(e) => {
+            audit_fail(ctx, base, &e)?;
+            return Err(e);
+        }
+    };
+
+    // One audit entry per executed step (steps and finally), then the
+    // workflow-level entry.
+    for (phase, key) in [("step", "steps"), ("finally", "finally")] {
+        for step in result[key].as_array().into_iter().flatten() {
+            let mut step_entry = json!({
+                "tool": "run_workflow.step",
+                "device": device_name,
+                "workflow": workflow_name,
+                "phase": phase,
+                "session": session.id,
+                "port": session.port_name,
+            });
+            let obj = step_entry.as_object_mut().expect("object");
+            for field in ["command", "ok", "outcome", "tx_hex", "detail", "error"] {
+                if let Some(v) = step.get(field) {
+                    obj.insert(field.to_string(), v.clone());
+                }
+            }
+            ctx.audit.record(step_entry)?;
+        }
+    }
+    entry.insert("ok".to_string(), json!(ok));
+    if !ok {
+        entry.insert("detail".to_string(), json!("workflow failed (see run_workflow.step entries)"));
+    }
+    ctx.audit.record(base)?;
+
+    attach_warnings(&mut result, &device);
+    if !ok {
+        bail!(
+            "workflow {device_name}/{workflow_name} failed. Full result:\n{}",
+            serde_json::to_string_pretty(&result).expect("result is valid JSON"),
+        );
     }
     Ok(result)
 }
