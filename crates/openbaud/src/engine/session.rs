@@ -1,0 +1,394 @@
+//! Port sessions: a background reader task feeds a bounded chunk buffer;
+//! consumers (the `read` tool's deframing cursor, `request`'s matcher) drain
+//! it independently. Buffer overflow is reported, never silent.
+
+use crate::engine::capture::{CaptureStats, CaptureWriter};
+use crate::engine::transport::BoxedPort;
+use crate::engine::now_ms;
+use anyhow::{anyhow, bail, Context};
+use openbaud_core::framing::{Deframer, Framing, MatchRule, Matcher};
+use openbaud_core::hex;
+use std::collections::VecDeque;
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
+use tokio::sync::{Mutex, Notify};
+use tokio::task::JoinHandle;
+
+/// Cap on buffered unread bytes per session; oldest chunks are dropped (and
+/// counted, and reported to the consumer) beyond this.
+const MAX_BUFFERED: usize = 1024 * 1024;
+
+/// Polling granularity for waits; serial timescales make this negligible while
+/// eliminating notify races entirely.
+const POLL: Duration = Duration::from_millis(10);
+
+struct Chunk {
+    ts_ms: u64,
+    bytes: Vec<u8>,
+}
+
+#[derive(Default)]
+struct ChunkBuf {
+    chunks: VecDeque<Chunk>,
+    base_seq: u64,
+    buffered: usize,
+    dropped_bytes: u64,
+}
+
+impl ChunkBuf {
+    fn push(&mut self, chunk: Chunk) {
+        self.buffered += chunk.bytes.len();
+        self.chunks.push_back(chunk);
+        while self.buffered > MAX_BUFFERED {
+            let old = self.chunks.pop_front().expect("buffered > 0 implies chunks");
+            self.buffered -= old.bytes.len();
+            self.dropped_bytes += old.bytes.len() as u64;
+            self.base_seq += 1;
+        }
+    }
+
+    fn next_seq(&self) -> u64 {
+        self.base_seq + self.chunks.len() as u64
+    }
+
+    /// Chunks with seq >= cursor; returns (chunks, new_cursor).
+    fn since(&self, cursor: u64) -> (Vec<(u64, Vec<u8>)>, u64) {
+        let start = cursor.max(self.base_seq);
+        let out = self
+            .chunks
+            .iter()
+            .skip((start - self.base_seq) as usize)
+            .map(|c| (c.ts_ms, c.bytes.clone()))
+            .collect();
+        (out, self.next_seq())
+    }
+}
+
+struct Shared {
+    buf: StdMutex<ChunkBuf>,
+    notify: Notify,
+    last_rx_ms: AtomicU64,
+    error: StdMutex<Option<String>>,
+    capture: StdMutex<Option<CaptureWriter>>,
+}
+
+impl Shared {
+    fn check_alive(&self) -> anyhow::Result<()> {
+        if let Some(e) = self.error.lock().unwrap().as_ref() {
+            bail!("session port failed: {e}");
+        }
+        Ok(())
+    }
+
+    fn capture_record(&self, dir: &str, ts_ms: u64, data: &[u8]) -> anyhow::Result<()> {
+        if let Some(cap) = self.capture.lock().unwrap().as_mut() {
+            cap.record(dir, ts_ms, data)?;
+        }
+        Ok(())
+    }
+}
+
+struct ReadState {
+    cursor: u64,
+    seen_dropped: u64,
+    deframer: Deframer,
+    pending_since_ms: Option<u64>,
+    /// Frames deframed but not yet delivered (overflow of a max_frames read).
+    queued: Vec<Frame>,
+}
+
+pub struct Session {
+    pub id: String,
+    pub port_name: String,
+    writer: Mutex<WriteHalf<BoxedPort>>,
+    shared: Arc<Shared>,
+    read_state: Mutex<ReadState>,
+    request_lock: Mutex<()>,
+    reader: JoinHandle<()>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct Frame {
+    pub ts_ms: u64,
+    pub hex: String,
+    pub text: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct ReadResult {
+    pub frames: Vec<Frame>,
+    /// Bytes lost to buffer overflow since the previous read. Non-zero means
+    /// the reader could not keep up; slow down or start a capture instead.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub dropped_bytes: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+impl Session {
+    pub fn spawn(id: String, port_name: String, framing: Framing, port: BoxedPort) -> Arc<Self> {
+        let (read_half, write_half) = tokio::io::split(port);
+        let shared = Arc::new(Shared {
+            buf: StdMutex::new(ChunkBuf::default()),
+            notify: Notify::new(),
+            last_rx_ms: AtomicU64::new(0),
+            error: StdMutex::new(None),
+            capture: StdMutex::new(None),
+        });
+        let reader = tokio::spawn(reader_loop(read_half, Arc::clone(&shared)));
+        Arc::new(Self {
+            id,
+            port_name,
+            writer: Mutex::new(write_half),
+            shared,
+            read_state: Mutex::new(ReadState {
+                cursor: 0,
+                seen_dropped: 0,
+                deframer: Deframer::new(framing),
+                pending_since_ms: None,
+                queued: Vec::new(),
+            }),
+            request_lock: Mutex::new(()),
+            reader,
+        })
+    }
+
+    pub async fn write_raw(&self, data: &[u8]) -> anyhow::Result<usize> {
+        self.shared.check_alive()?;
+        let mut writer = self.writer.lock().await;
+        writer
+            .write_all(data)
+            .await
+            .with_context(|| format!("write to {} failed", self.port_name))?;
+        writer.flush().await.ok();
+        self.shared.capture_record("tx", now_ms(), data)?;
+        Ok(data.len())
+    }
+
+    /// Cursor-based framed read for the `read` tool: returns as soon as at
+    /// least one frame is available, or empty on timeout.
+    pub async fn read_frames(&self, timeout_ms: u64, max_frames: usize) -> anyhow::Result<ReadResult> {
+        let mut state = self.read_state.lock().await;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+        let mut frames: Vec<Frame> = std::mem::take(&mut state.queued);
+        let mut dropped = 0u64;
+
+        loop {
+            {
+                let buf = self.shared.buf.lock().unwrap();
+                let delta = buf.dropped_bytes - state.seen_dropped;
+                if delta > 0 {
+                    dropped += delta;
+                    state.seen_dropped = buf.dropped_bytes;
+                }
+                let (chunks, new_cursor) = buf.since(state.cursor);
+                state.cursor = new_cursor;
+                drop(buf);
+                for (ts, bytes) in chunks {
+                    if state.pending_since_ms.is_none() {
+                        state.pending_since_ms = Some(ts);
+                    }
+                    for frame in state.deframer.push(&bytes) {
+                        frames.push(make_frame(ts, frame));
+                    }
+                    if state.deframer.pending_len() == 0 {
+                        state.pending_since_ms = None;
+                    }
+                }
+            }
+
+            // Idle-gap framing: flush pending once the wire has been quiet.
+            if let Framing::Idle { idle_ms } = state.deframer.framing() {
+                let idle_ms = *idle_ms;
+                if state.deframer.pending_len() > 0 {
+                    let last = self.shared.last_rx_ms.load(Ordering::Relaxed);
+                    if now_ms().saturating_sub(last) >= idle_ms {
+                        if let Some(pending) = state.deframer.flush_pending() {
+                            let ts = state.pending_since_ms.take().unwrap_or_else(now_ms);
+                            frames.push(make_frame(ts, pending));
+                        }
+                    }
+                }
+            }
+
+            if !frames.is_empty() || tokio::time::Instant::now() >= deadline {
+                if frames.len() > max_frames {
+                    state.queued = frames.split_off(max_frames);
+                }
+                // Surface a dead port only when there is nothing buffered left to deliver.
+                if frames.is_empty() && dropped == 0 {
+                    self.shared.check_alive()?;
+                }
+                return Ok(ReadResult { frames, dropped_bytes: dropped });
+            }
+            let _ = tokio::time::timeout(POLL, self.shared.notify.notified()).await;
+        }
+    }
+
+    /// Write a frame and await its response per the match rule. Requests are
+    /// serialized per session; response bytes are consumed from the point of
+    /// transmission onward.
+    pub async fn request(
+        &self,
+        tx: &[u8],
+        rule: MatchRule,
+        timeout_ms: u64,
+    ) -> anyhow::Result<Vec<u8>> {
+        let _guard = self.request_lock.lock().await;
+        self.shared.check_alive()?;
+
+        let mut cursor = self.shared.buf.lock().unwrap().next_seq();
+        self.write_raw(tx).await?;
+
+        let mut matcher = Matcher::new(rule.clone());
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+        loop {
+            {
+                let buf = self.shared.buf.lock().unwrap();
+                let (chunks, new_cursor) = buf.since(cursor);
+                cursor = new_cursor;
+                drop(buf);
+                for (_ts, bytes) in chunks {
+                    if let Some(frame) = matcher.push(&bytes) {
+                        return Ok(frame);
+                    }
+                }
+            }
+            if let MatchRule::Idle { idle_ms } = &rule {
+                let pending = matcher.take_pending();
+                if !pending.is_empty() {
+                    let last = self.shared.last_rx_ms.load(Ordering::Relaxed);
+                    if now_ms().saturating_sub(last) >= *idle_ms {
+                        return Ok(pending);
+                    }
+                    matcher.push(&pending);
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                self.shared.check_alive()?;
+                let partial = matcher.take_pending();
+                if partial.is_empty() {
+                    bail!("no response within {timeout_ms} ms (sent {})", hex::to_hex(tx));
+                }
+                bail!(
+                    "response incomplete after {timeout_ms} ms: got {} which does not satisfy the match rule",
+                    hex::to_hex(&partial)
+                );
+            }
+            let _ = tokio::time::timeout(POLL, self.shared.notify.notified()).await;
+        }
+    }
+
+    pub fn capture_start(&self, path: &Path, note: Option<&str>) -> anyhow::Result<String> {
+        let mut slot = self.shared.capture.lock().unwrap();
+        if let Some(active) = slot.as_ref() {
+            bail!("capture already active on this session: {:?}", active.path());
+        }
+        let writer = CaptureWriter::create(path, &self.id, &self.port_name, note, now_ms())?;
+        let path = writer.path().display().to_string();
+        *slot = Some(writer);
+        Ok(path)
+    }
+
+    pub fn capture_stop(&self) -> anyhow::Result<CaptureStats> {
+        let writer = self
+            .shared
+            .capture
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or_else(|| anyhow!("no capture active on this session"))?;
+        writer.finish()
+    }
+
+    fn shutdown(&self) {
+        self.reader.abort();
+        if let Some(writer) = self.shared.capture.lock().unwrap().take() {
+            // Best effort: flush stats to disk; the file itself is already on disk.
+            let _ = writer.finish();
+        }
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.reader.abort();
+    }
+}
+
+fn make_frame(ts_ms: u64, bytes: Vec<u8>) -> Frame {
+    Frame { ts_ms, hex: hex::to_hex(&bytes), text: hex::to_text_lossy(&bytes) }
+}
+
+async fn reader_loop(mut read_half: ReadHalf<BoxedPort>, shared: Arc<Shared>) {
+    let mut buf = [0u8; 4096];
+    loop {
+        match read_half.read(&mut buf).await {
+            Ok(0) => {
+                *shared.error.lock().unwrap() = Some("port closed (EOF)".to_string());
+                shared.notify.notify_waiters();
+                break;
+            }
+            Ok(n) => {
+                let ts = now_ms();
+                shared.last_rx_ms.store(ts, Ordering::Relaxed);
+                if let Err(e) = shared.capture_record("rx", ts, &buf[..n]) {
+                    *shared.error.lock().unwrap() = Some(format!("capture write failed: {e}"));
+                    shared.notify.notify_waiters();
+                    break;
+                }
+                shared.buf.lock().unwrap().push(Chunk { ts_ms: ts, bytes: buf[..n].to_vec() });
+                shared.notify.notify_waiters();
+            }
+            Err(e) => {
+                *shared.error.lock().unwrap() = Some(e.to_string());
+                shared.notify.notify_waiters();
+                break;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Session manager
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+pub struct SessionManager {
+    sessions: StdMutex<std::collections::HashMap<String, Arc<Session>>>,
+    next_id: AtomicU64,
+}
+
+impl SessionManager {
+    pub fn open(&self, port_name: &str, framing: Framing, port: BoxedPort) -> Arc<Session> {
+        let id = format!("s{}", self.next_id.fetch_add(1, Ordering::Relaxed) + 1);
+        let session = Session::spawn(id.clone(), port_name.to_string(), framing, port);
+        self.sessions.lock().unwrap().insert(id, Arc::clone(&session));
+        session
+    }
+
+    pub fn get(&self, id: &str) -> anyhow::Result<Arc<Session>> {
+        let sessions = self.sessions.lock().unwrap();
+        sessions.get(id).cloned().ok_or_else(|| {
+            let mut open: Vec<String> = sessions.keys().cloned().collect();
+            open.sort();
+            anyhow!("no session {id:?}; open sessions: [{}]", open.join(", "))
+        })
+    }
+
+    pub fn close(&self, id: &str) -> anyhow::Result<()> {
+        let session = self
+            .sessions
+            .lock()
+            .unwrap()
+            .remove(id)
+            .ok_or_else(|| anyhow!("no session {id:?} to close"))?;
+        session.shutdown();
+        Ok(())
+    }
+}
