@@ -2,7 +2,7 @@
 
 use crate::engine::transport::{self, open_port};
 use crate::mcp::Ctx;
-use anyhow::{anyhow, bail, Context as _};
+use anyhow::{anyhow, bail};
 use openbaud_core::exec::{build_frame, parse_response, units};
 use openbaud_core::format::{FramingSpec, MatchSpec, Risk};
 use openbaud_core::framing::{Framing, MatchRule};
@@ -155,16 +155,29 @@ async fn tool_open(args: Value, ctx: &Arc<Ctx>) -> anyhow::Result<Value> {
         None => None,
     };
     let mut cfg = device.as_ref().map(|d| d.profile.transport.clone()).unwrap_or_default();
-    if let Some(b) = args.get("baud").and_then(Value::as_u64) {
-        cfg.baud = u32::try_from(b).context("baud out of range")?;
+    if let Some(v) = args.get("baud") {
+        let b = v
+            .as_u64()
+            .filter(|b| *b > 0)
+            .ok_or_else(|| anyhow!("baud must be a positive integer, got {v}"))?;
+        cfg.baud = u32::try_from(b).map_err(|_| anyhow!("baud {b} out of range"))?;
     }
-    if let Some(b) = args.get("data_bits").and_then(Value::as_u64) {
+    if let Some(v) = args.get("data_bits") {
+        let b = v
+            .as_u64()
+            .filter(|b| (5..=8).contains(b))
+            .ok_or_else(|| anyhow!("data_bits must be an integer in 5..=8, got {v}"))?;
         cfg.data_bits = b as u8;
     }
-    if let Some(b) = args.get("stop_bits").and_then(Value::as_u64) {
+    if let Some(v) = args.get("stop_bits") {
+        let b = v
+            .as_u64()
+            .filter(|b| (1..=2).contains(b))
+            .ok_or_else(|| anyhow!("stop_bits must be 1 or 2, got {v}"))?;
         cfg.stop_bits = b as u8;
     }
-    if let Some(p) = args.get("parity").and_then(Value::as_str) {
+    if let Some(v) = args.get("parity") {
+        let p = v.as_str().ok_or_else(|| anyhow!("parity must be a string, got {v}"))?;
         cfg.parity = serde_yaml::from_str(p)
             .map_err(|_| anyhow!("parity must be none, even or odd, got {p:?}"))?;
     }
@@ -205,9 +218,28 @@ fn payload_bytes(args: &Value) -> anyhow::Result<Vec<u8>> {
     }
 }
 
+/// Append a failed-attempt entry to the audit log. Write-capable operations
+/// leave a trace on every path, including failures before any byte is sent.
+fn audit_fail(ctx: &Ctx, mut base: Value, err: &anyhow::Error) -> anyhow::Result<()> {
+    let obj = base.as_object_mut().expect("audit base is always a JSON object");
+    obj.insert("ok".to_string(), json!(false));
+    obj.insert("detail".to_string(), json!(format!("{err:#}")));
+    ctx.audit.record(base)
+}
+
 async fn tool_send(args: Value, ctx: &Arc<Ctx>) -> anyhow::Result<Value> {
-    let session = ctx.sessions.get(arg_str(&args, "session_id")?)?;
-    let data = payload_bytes(&args)?;
+    let sid = arg_str(&args, "session_id")?.to_string();
+    let staged = ctx
+        .sessions
+        .get(&sid)
+        .and_then(|session| Ok((session, payload_bytes(&args)?)));
+    let (session, data) = match staged {
+        Ok(ok) => ok,
+        Err(e) => {
+            audit_fail(ctx, json!({ "tool": "send", "session": sid }), &e)?;
+            return Err(e);
+        }
+    };
     let outcome = session.write_raw(&data).await;
     ctx.audit.record(json!({
         "tool": "send",
@@ -222,17 +254,28 @@ async fn tool_send(args: Value, ctx: &Arc<Ctx>) -> anyhow::Result<Value> {
 }
 
 async fn tool_request(args: Value, ctx: &Arc<Ctx>) -> anyhow::Result<Value> {
-    let session = ctx.sessions.get(arg_str(&args, "session_id")?)?;
-    let data = payload_bytes(&args)?;
-    let rule = match args.get("match") {
-        Some(m) => {
-            let spec: MatchSpec = serde_json::from_value(m.clone())
-                .map_err(|e| anyhow!("invalid match spec: {e}"))?;
-            spec.to_rule("request.match")?
+    let sid = arg_str(&args, "session_id")?.to_string();
+    let staged = (|| {
+        let session = ctx.sessions.get(&sid)?;
+        let data = payload_bytes(&args)?;
+        let rule = match args.get("match") {
+            Some(m) => {
+                let spec: MatchSpec = serde_json::from_value(m.clone())
+                    .map_err(|e| anyhow!("invalid match spec: {e}"))?;
+                spec.to_rule("request.match")?
+            }
+            None => MatchRule::Idle { idle_ms: 50 },
+        };
+        let timeout = arg_u64_or(&args, "timeout_ms", 1000)?;
+        Ok((session, data, rule, timeout))
+    })();
+    let (session, data, rule, timeout) = match staged {
+        Ok(ok) => ok,
+        Err(e) => {
+            audit_fail(ctx, json!({ "tool": "request", "session": sid }), &e)?;
+            return Err(e);
         }
-        None => MatchRule::Idle { idle_ms: 50 },
     };
-    let timeout = arg_u64_or(&args, "timeout_ms", 1000)?;
     let outcome = session.request(&data, rule, timeout).await;
     ctx.audit.record(json!({
         "tool": "request",
@@ -247,34 +290,74 @@ async fn tool_request(args: Value, ctx: &Arc<Ctx>) -> anyhow::Result<Value> {
 }
 
 async fn tool_run_command(args: Value, ctx: &Arc<Ctx>) -> anyhow::Result<Value> {
-    let device_name = arg_str(&args, "device")?;
-    let command_name = arg_str(&args, "command")?;
-    let device = ctx.workspace.load_device(device_name)?;
-    let cmd = device.command(command_name)?;
+    let device_name = arg_str(&args, "device")?.to_string();
+    let command_name = arg_str(&args, "command")?.to_string();
+    let base = json!({ "tool": "run_command", "device": device_name, "command": command_name });
+
+    let device = match ctx.workspace.load_device(&device_name) {
+        Ok(d) => d,
+        Err(e) => {
+            audit_fail(ctx, base, &e)?;
+            return Err(e);
+        }
+    };
+    let cmd = match device.command(&command_name) {
+        Ok(c) => c.clone(),
+        Err(e) => {
+            audit_fail(ctx, base, &e)?;
+            return Err(e);
+        }
+    };
+    let risk = format!("{:?}", cmd.risk).to_lowercase();
+    let mut base = base;
+    base.as_object_mut().expect("object").insert("risk".to_string(), json!(risk));
 
     if cmd.risk == Risk::Danger && !args.get("acknowledge_risk").and_then(Value::as_bool).unwrap_or(false) {
-        bail!(
+        let e = anyhow!(
             "command {device_name}/{command_name} is marked risk=danger{}. Confirm with the user, then retry with acknowledge_risk=true.",
             cmd.description.as_deref().map(|d| format!(" ({d})")).unwrap_or_default()
         );
+        let mut denied = base.clone();
+        denied.as_object_mut().expect("object").insert("denied".to_string(), json!(true));
+        audit_fail(ctx, denied, &e)?;
+        return Err(e);
     }
 
-    let params: Map<String, Value> = match args.get("params") {
-        Some(Value::Object(m)) => m.clone(),
-        Some(other) => bail!("params must be an object, got {other}"),
-        None => Map::new(),
+    let staged = (|| {
+        let params: Map<String, Value> = match args.get("params") {
+            Some(Value::Object(m)) => m.clone(),
+            Some(other) => bail!("params must be an object, got {other}"),
+            None => Map::new(),
+        };
+        Ok(build_frame(&cmd, &params)?)
+    })();
+    let tx = match staged {
+        Ok(tx) => tx,
+        Err(e) => {
+            audit_fail(ctx, base, &e)?;
+            return Err(e);
+        }
     };
-    let tx = build_frame(cmd, &params)?;
+    base.as_object_mut().expect("object").insert("tx_hex".to_string(), json!(hex::to_hex(&tx)));
 
-    let (session, ephemeral) = match args.get("session_id").and_then(Value::as_str) {
-        Some(id) => (ctx.sessions.get(id)?, false),
-        None => {
-            let port = args.get("port").and_then(Value::as_str).ok_or_else(|| {
-                anyhow!("provide session_id (open session) or port (ephemeral session)")
-            })?;
-            let framing = resolve_framing(None, Some(&device.profile))?;
-            let boxed = open_port(port, &device.profile.transport)?;
-            (ctx.sessions.open(port, framing, boxed), true)
+    let staged = (|| {
+        match args.get("session_id").and_then(Value::as_str) {
+            Some(id) => Ok((ctx.sessions.get(id)?, false)),
+            None => {
+                let port = args.get("port").and_then(Value::as_str).ok_or_else(|| {
+                    anyhow!("provide session_id (open session) or port (ephemeral session)")
+                })?;
+                let framing = resolve_framing(None, Some(&device.profile))?;
+                let boxed = open_port(port, &device.profile.transport)?;
+                Ok((ctx.sessions.open(port, framing, boxed), true))
+            }
+        }
+    })();
+    let (session, ephemeral) = match staged {
+        Ok(ok) => ok,
+        Err(e) => {
+            audit_fail(ctx, base, &e)?;
+            return Err(e);
         }
     };
 
@@ -282,7 +365,7 @@ async fn tool_run_command(args: Value, ctx: &Arc<Ctx>) -> anyhow::Result<Value> 
         if let Some(resp) = &cmd.response {
             let rule = resp.match_spec.to_rule(&format!("{device_name}/{command_name}"))?;
             let raw = session.request(&tx, rule, resp.timeout_ms).await?;
-            let parsed = parse_response(cmd, &raw)?;
+            let parsed = parse_response(&cmd, &raw)?;
             Ok(json!({
                 "device": device_name,
                 "command": command_name,
@@ -290,7 +373,7 @@ async fn tool_run_command(args: Value, ctx: &Arc<Ctx>) -> anyhow::Result<Value> 
                 "raw_hex": hex::to_hex(&raw),
                 "raw_text": hex::to_text_lossy(&raw),
                 "parsed": parsed,
-                "units": units(cmd),
+                "units": units(&cmd),
             }))
         } else {
             session.write_raw(&tx).await?;
@@ -309,18 +392,24 @@ async fn tool_run_command(args: Value, ctx: &Arc<Ctx>) -> anyhow::Result<Value> 
         // already gone, which is fine.
         let _ = ctx.sessions.close(&session.id);
     }
-    ctx.audit.record(json!({
-        "tool": "run_command",
-        "device": device_name,
-        "command": command_name,
-        "risk": format!("{:?}", cmd.risk).to_lowercase(),
-        "session": session.id,
-        "port": session.port_name,
-        "tx_hex": hex::to_hex(&tx),
-        "ok": outcome.is_ok(),
-        "detail": outcome.as_ref().err().map(|e| format!("{e:#}")),
-    }))?;
-    outcome
+    let final_entry = base.as_object_mut().expect("object");
+    final_entry.insert("session".to_string(), json!(session.id));
+    final_entry.insert("port".to_string(), json!(session.port_name));
+    final_entry.insert("ok".to_string(), json!(outcome.is_ok()));
+    final_entry.insert(
+        "detail".to_string(),
+        json!(outcome.as_ref().err().map(|e| format!("{e:#}"))),
+    );
+    ctx.audit.record(base)?;
+
+    let mut result = outcome?;
+    if !device.broken.is_empty() {
+        result
+            .as_object_mut()
+            .expect("run_command results are objects")
+            .insert("warnings".to_string(), json!(device.broken_warnings()));
+    }
+    Ok(result)
 }
 
 fn arg_str<'a>(args: &'a Value, key: &str) -> anyhow::Result<&'a str> {

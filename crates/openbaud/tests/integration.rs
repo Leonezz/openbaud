@@ -176,6 +176,11 @@ async fn tool_run_command_danger_requires_acknowledgement() {
     .unwrap_err();
     assert!(err.to_string().contains("danger"), "got: {err:#}");
 
+    // The denied attempt must leave an audit trace.
+    let audit = std::fs::read_to_string(dir.path().join(".openbaud/audit.jsonl")).unwrap();
+    assert!(audit.contains("\"denied\":true"), "audit: {audit}");
+    assert!(audit.contains("\"ok\":false"), "audit: {audit}");
+
     // Acknowledged, it goes through (echo just swallows it; no response spec).
     let result = tools::call(
         "run_command",
@@ -241,6 +246,61 @@ async fn tool_capture_records_both_directions() {
     assert!(content.contains("\"tx\""));
     assert!(content.contains("\"rx\""));
     assert!(content.lines().next().unwrap().contains("\"obcap\":1"));
+}
+
+#[tokio::test]
+async fn tool_open_rejects_invalid_numeric_params() {
+    let dir = scaffold_workspace();
+    let ctx = ctx_for(&dir);
+
+    for (args, needle) in [
+        (json!({ "port": "mock:echo", "baud": -9600 }), "baud"),
+        (json!({ "port": "mock:echo", "baud": "fast" }), "baud"),
+        (json!({ "port": "mock:echo", "baud": 0 }), "baud"),
+        (json!({ "port": "mock:echo", "data_bits": 9 }), "data_bits"),
+        (json!({ "port": "mock:echo", "stop_bits": 3 }), "stop_bits"),
+        (json!({ "port": "mock:echo", "parity": 7 }), "parity"),
+    ] {
+        let err = tools::call("open", args.clone(), &ctx).await.unwrap_err();
+        assert!(
+            err.to_string().contains(needle),
+            "args {args} should fail mentioning {needle}, got: {err:#}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn broken_command_file_does_not_block_device() {
+    let dir = scaffold_workspace();
+    std::fs::write(
+        dir.path().join("devices/echodev/commands/broken.yaml"),
+        "schema: openbaud/command@v0\nname: broken\nframe: { hex: \"01\" }\nbogus_field: 1\n",
+    )
+    .unwrap();
+    let ctx = ctx_for(&dir);
+
+    // Other commands of the same device still execute, with a loud warning.
+    let result = tools::call(
+        "run_command",
+        json!({ "device": "echodev", "command": "ping", "port": "mock:echo" }),
+        &ctx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(result["parsed"]["y"], json!(66));
+    let warnings = result["warnings"].as_array().unwrap();
+    assert!(warnings[0].as_str().unwrap().contains("broken.yaml"), "warnings: {warnings:?}");
+
+    // A missing command names the broken file in its error.
+    let err = tools::call(
+        "run_command",
+        json!({ "device": "echodev", "command": "nope", "port": "mock:echo" }),
+        &ctx,
+    )
+    .await
+    .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("broken.yaml") && msg.contains("bogus_field"), "got: {msg}");
 }
 
 #[tokio::test]

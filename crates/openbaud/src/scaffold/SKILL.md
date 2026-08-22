@@ -59,8 +59,10 @@ provenance:
   verified: { capture: "captures/cap-....obcap", note: "matches multimeter", date: 2026-08-22 }
 ```
 
-Field types: `u8 i8 u16be u16le i16be i16le u32be u32le i32be i32le f32be f32le`;
-checksums: `crc16_modbus xor8 sum8` (computed over all preceding frame bytes).
+Binary field types (hex frames and response fields):
+`u8 i8 u16be u16le i16be i16le u32be u32le i32be i32le f32be f32le`.
+Text-only param types (for `text:` frame interpolation): `int float string`.
+Checksums: `crc16_modbus xor8 sum8` (computed over all preceding frame bytes).
 
 ## Safety rules
 

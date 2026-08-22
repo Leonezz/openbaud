@@ -30,9 +30,21 @@ pub async fn run(
     let cmd = device.command(command_name)?;
 
     if cmd.risk == Risk::Danger && !acknowledge_risk {
+        audit.record(json!({
+            "tool": "cli.run",
+            "device": device_name,
+            "command": command_name,
+            "risk": "danger",
+            "denied": true,
+            "ok": false,
+            "detail": "acknowledge_risk not set",
+        }))?;
         bail!("command {spec} is marked risk=danger; rerun with --acknowledge-risk if you are sure");
     }
     let port = port.ok_or_else(|| anyhow!("--port is required (see `openbaud ports`)"))?;
+    for warning in device.broken_warnings() {
+        eprintln!("warning: {warning}");
+    }
 
     let mut params: Map<String, Value> = Map::new();
     for set in sets {
