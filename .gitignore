@@ -1,3 +1,9 @@
 /target
 Cargo.lock.orig
 .DS_Store
+
+# Repo root used as an ad-hoc openbaud workspace during testing — runtime
+# artifacts stay out of the repo (the curated workspace lives in testbench/).
+/.openbaud/
+/captures/
+/devices/
