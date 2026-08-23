@@ -79,10 +79,13 @@ Repository-level agent instructions live at
 Agent Skills path into new workspaces; the Codex plugin keeps its packaged copy
 under `plugins/openbaud/skills/` as required by the plugin format.
 
-GitHub Actions runs Clippy, tests, package validation, and a real macOS ARM64
-MCP smoke test for pushes and pull requests. Pushing a stable
-`vMAJOR.MINOR.PATCH` tag repeats those gates, builds the bundled runtime, and
-creates or updates the GitHub Release with a plugin archive and SHA-256 file.
+GitHub Actions runs Clippy, package validation, and native build/test jobs for
+macOS ARM64, macOS Intel, Linux x64, Linux ARM64, and Windows x64. The macOS
+ARM64 job additionally performs a real MCP plugin smoke test. Pushing a stable
+`vMAJOR.MINOR.PATCH` tag repeats the release gates, builds the bundled runtime,
+and creates or updates the GitHub Release with a plugin archive and SHA-256
+file. The distributed Codex plugin currently remains macOS ARM64-only; the
+other matrix entries are compile-and-test coverage, not published plugin packs.
 
 See [the plugin README](plugins/openbaud/README.md) for packaging details and
 platform paths.

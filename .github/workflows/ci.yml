@@ -25,6 +25,38 @@ jobs:
       - name: Validate Skill and plugin package
         run: python3 scripts/validate-package.py
 
+  platform-build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS Intel
+            os: macos-15-intel
+            binary: target/release/openbaud
+          - name: Linux x64
+            os: ubuntu-latest
+            binary: target/release/openbaud
+          - name: Linux ARM64
+            os: ubuntu-24.04-arm
+            binary: target/release/openbaud
+          - name: Windows x64
+            os: windows-latest
+            binary: target/release/openbaud.exe
+    steps:
+      - uses: actions/checkout@v7
+      - name: Compile and test workspace
+        shell: bash
+        run: cargo test --workspace --locked
+      - name: Build release binary
+        shell: bash
+        run: cargo build --release --locked --package openbaud
+      - name: Verify release binary
+        shell: bash
+        run: '"${{ matrix.binary }}" --version'
+
   plugin-smoke:
     name: macOS ARM64 plugin smoke test
     runs-on: macos-14
