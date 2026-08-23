@@ -25,13 +25,18 @@ case "$kernel:$machine" in
     rust_target=aarch64-unknown-linux-gnu
     bundle_target=linux-arm64
     ;;
+  MINGW*:x86_64|MSYS*:x86_64|CYGWIN*:x86_64)
+    rust_target=x86_64-pc-windows-msvc
+    bundle_target=windows-x64
+    executable_suffix=.exe
+    ;;
   *)
     printf 'Unsupported build host: %s/%s\n' "$kernel" "$machine" >&2
     exit 64
     ;;
 esac
 
-destination="$plugin_root/bin/$bundle_target/openbaud"
+destination="$plugin_root/bin/$bundle_target/openbaud${executable_suffix:-}"
 cargo_home=${CARGO_HOME:-$(CDPATH= cd -- "$(dirname -- "$(command -v cargo)")/.." && pwd)}
 rust_sysroot=$(rustc --print sysroot)
 remap_flags="--remap-path-prefix=$repo_root=/workspace/openbaud --remap-path-prefix=$cargo_home=/cargo-home --remap-path-prefix=$rust_sysroot=/rust-toolchain"
@@ -58,8 +63,15 @@ if [ "$kernel" = Darwin ]; then
 fi
 
 "$destination" --version
-(
-  cd "$(dirname -- "$destination")"
-  shasum -a 256 openbaud > openbaud.sha256
+python3 - "$destination" <<'PY'
+import hashlib
+import pathlib
+import sys
+
+binary = pathlib.Path(sys.argv[1])
+checksum = hashlib.sha256(binary.read_bytes()).hexdigest()
+binary.with_name(binary.name + ".sha256").write_text(
+    f"{checksum}  {binary.name}\n"
 )
+PY
 printf 'Bundled runtime: %s\n' "$destination"

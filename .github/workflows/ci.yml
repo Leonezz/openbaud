@@ -33,50 +33,46 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - name: macOS ARM64
+            platform: darwin-arm64
+            os: macos-14
           - name: macOS Intel
+            platform: darwin-x64
             os: macos-15-intel
-            binary: target/release/openbaud
           - name: Linux x64
+            platform: linux-x64
             os: ubuntu-latest
-            binary: target/release/openbaud
           - name: Linux ARM64
+            platform: linux-arm64
             os: ubuntu-24.04-arm
-            binary: target/release/openbaud
           - name: Windows x64
+            platform: windows-x64
             os: windows-latest
-            binary: target/release/openbaud.exe
     steps:
       - uses: actions/checkout@v7
       - name: Compile and test workspace
         shell: bash
         run: cargo test --workspace --locked
-      - name: Build release binary
-        shell: bash
-        run: cargo build --release --locked --package openbaud
-      - name: Verify release binary
-        shell: bash
-        run: '"${{ matrix.binary }}" --version'
-
-  plugin-smoke:
-    name: macOS ARM64 plugin smoke test
-    runs-on: macos-14
-    steps:
-      - uses: actions/checkout@v7
-      - name: Confirm runner architecture
-        run: test "$(uname -m)" = arm64
-      - name: Verify committed plugin
-        run: |
-          python3 scripts/validate-package.py
-          plugins/openbaud/scripts/smoke-test
-          cd plugins/openbaud/bin/darwin-arm64
-          shasum -a 256 -c openbaud.sha256
-          codesign --verify --strict --verbose=2 openbaud
       - name: Build bundled runtime
+        shell: bash
         run: plugins/openbaud/scripts/build-runtime
-      - name: Verify rebuilt plugin
+      - name: Package and smoke test platform plugin
+        shell: bash
         run: |
-          python3 scripts/validate-package.py
-          plugins/openbaud/scripts/smoke-test
-          cd plugins/openbaud/bin/darwin-arm64
-          shasum -a 256 -c openbaud.sha256
-          codesign --verify --strict --verbose=2 openbaud
+          version=$(python3 - <<'PY'
+          import pathlib
+          import tomllib
+
+          cargo = tomllib.loads(pathlib.Path("Cargo.toml").read_text())
+          print(cargo["workspace"]["package"]["version"])
+          PY
+          )
+          tag="v$version"
+          python3 scripts/package-plugin.py \
+            --platform "${{ matrix.platform }}" \
+            --tag "$tag" \
+            --output-dir dist-assets
+          mkdir -p dist-verify
+          archive="dist-assets/openbaud-codex-plugin-${tag}-${{ matrix.platform }}.tar.gz"
+          tar -xzf "$archive" -C dist-verify
+          dist-verify/openbaud-${tag}-${{ matrix.platform }}/plugins/openbaud/scripts/smoke-test

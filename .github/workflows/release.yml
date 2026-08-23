@@ -13,40 +13,116 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  release:
-    name: Build and publish Codex plugin
-    runs-on: macos-14
+  verify:
+    name: Verify source and tag
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - name: Confirm runner architecture
-        run: test "$(uname -m)" = arm64
       - name: Verify source and tag
         run: |
           cargo clippy --workspace --all-targets --locked -- -D warnings
           cargo test --workspace --locked
           python3 scripts/validate-package.py --tag "$GITHUB_REF_NAME"
-          plugins/openbaud/scripts/smoke-test
-          cd plugins/openbaud/bin/darwin-arm64
-          shasum -a 256 -c openbaud.sha256
-          codesign --verify --strict --verbose=2 openbaud
+
+  build-plugin:
+    name: Build ${{ matrix.platform }} plugin
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: darwin-arm64
+            os: macos-14
+          - platform: darwin-x64
+            os: macos-15-intel
+          - platform: linux-x64
+            os: ubuntu-latest
+          - platform: linux-arm64
+            os: ubuntu-24.04-arm
+          - platform: windows-x64
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v7
       - name: Build bundled runtime
+        shell: bash
         run: plugins/openbaud/scripts/build-runtime
-      - name: Verify plugin runtime
+      - name: Package platform plugin
+        shell: bash
         run: |
-          python3 scripts/validate-package.py --tag "$GITHUB_REF_NAME"
-          plugins/openbaud/scripts/smoke-test
-          cd plugins/openbaud/bin/darwin-arm64
-          shasum -a 256 -c openbaud.sha256
-          codesign --verify --strict --verbose=2 openbaud
-      - name: Package plugin
+          python3 scripts/package-plugin.py \
+            --platform "${{ matrix.platform }}" \
+            --tag "$GITHUB_REF_NAME" \
+            --output-dir dist-assets
+      - name: Verify packaged plugin
+        shell: bash
         run: |
-          mkdir -p dist
-          archive="openbaud-codex-plugin-${GITHUB_REF_NAME}-darwin-arm64.tar.gz"
-          COPYFILE_DISABLE=1 tar -czf "dist/$archive" -C plugins openbaud
-          cd dist
-          shasum -a 256 "$archive" > "$archive.sha256"
+          mkdir -p dist-verify
+          archive="dist-assets/openbaud-codex-plugin-${GITHUB_REF_NAME}-${{ matrix.platform }}.tar.gz"
+          tar -xzf "$archive" -C dist-verify
+          dist-verify/openbaud-${GITHUB_REF_NAME}-${{ matrix.platform }}/plugins/openbaud/scripts/smoke-test
+          python3 - "$archive" <<'PY'
+          import hashlib
+          import pathlib
+          import sys
+
+          archive = pathlib.Path(sys.argv[1])
+          expected, filename = archive.with_name(archive.name + ".sha256").read_text().split()
+          actual = hashlib.sha256(archive.read_bytes()).hexdigest()
+          if filename != archive.name or actual != expected:
+              raise SystemExit("release archive checksum mismatch")
+          PY
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.platform }}
+          path: dist-assets/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: build-plugin
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          pattern: release-*
+          merge-multiple: true
+      - name: Verify release assets
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import pathlib
+
+          root = pathlib.Path("dist")
+          platforms = (
+              "darwin-arm64",
+              "darwin-x64",
+              "linux-x64",
+              "linux-arm64",
+              "windows-x64",
+          )
+          expected_names = set()
+          for platform in platforms:
+              name = f"openbaud-codex-plugin-${{ github.ref_name }}-{platform}.tar.gz"
+              expected_names.update((name, name + ".sha256"))
+              archive = root / name
+              checksum = root / (name + ".sha256")
+              expected, recorded_name = checksum.read_text().split()
+              if recorded_name != name:
+                  raise SystemExit(f"unexpected checksum filename: {recorded_name}")
+              if hashlib.sha256(archive.read_bytes()).hexdigest() != expected:
+                  raise SystemExit(f"checksum mismatch: {name}")
+          actual_names = {path.name for path in root.iterdir() if path.is_file()}
+          if actual_names != expected_names:
+              raise SystemExit(f"unexpected release assets: {sorted(actual_names ^ expected_names)}")
+          PY
       - name: Create release and upload assets
         env:
           GH_TOKEN: ${{ github.token }}

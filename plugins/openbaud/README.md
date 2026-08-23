@@ -19,8 +19,9 @@ writes a SHA-256 sidecar. Set `OPENBAUD_CODESIGN_IDENTITY` to a Developer ID
 Application identity for a distribution build. Notarization is a release step
 and intentionally requires credentials outside this repository.
 
-The current release target is macOS Apple Silicon. The launcher already has
-stable paths reserved for macOS Intel, Linux x64/ARM64, and Windows x64.
+Release archives are built natively for macOS Apple Silicon, macOS Intel, Linux
+x64/ARM64, and Windows x64. Each archive contains only its matching runtime and
+rewrites `.mcp.json` to launch that native executable directly.
 
 ## Install from Git
 
@@ -33,7 +34,7 @@ codex plugin add openbaud@openbaud-marketplace
 
 An HTTPS or SSH Git URL works as well. Private repositories require the user to
 already have Git access. To pin a reproducible release rather than track the
-default branch, add `--ref v0.1.3` to the marketplace command.
+default branch, add `--ref v0.1.4` to the marketplace command.
 
 To refresh a marketplace that tracks a branch and reinstall its latest plugin:
 
@@ -41,6 +42,20 @@ To refresh a marketplace that tracks a branch and reinstall its latest plugin:
 codex plugin marketplace upgrade openbaud-marketplace
 codex plugin add openbaud@openbaud-marketplace
 ```
+
+## Install a platform release archive
+
+Download the archive matching the host from the GitHub Release and extract it.
+The extracted directory is a complete local marketplace, so it can be installed
+without Rust, Cargo, or another binary download:
+
+```sh
+codex plugin marketplace add /absolute/path/to/openbaud-v0.1.4-<platform>
+codex plugin add openbaud@openbaud-marketplace
+```
+
+Available platform names are `darwin-arm64`, `darwin-x64`, `linux-x64`,
+`linux-arm64`, and `windows-x64`.
 
 ## Install from a checkout
 
@@ -62,6 +77,7 @@ Codex starts it from the plugin root; OpenBaud recovers the original task
 workspace from the inherited process environment. Installing the plugin never
 runs Homebrew, Cargo, npm lifecycle scripts, or an unreviewed download hook.
 
-The tag-triggered GitHub Actions release workflow rebuilds this runtime on a
-macOS ARM64 runner, reruns the package and MCP smoke checks, and uploads the
-plugin archive plus its SHA-256 file to the matching GitHub Release.
+The tag-triggered GitHub Actions release workflow builds five platform-specific
+runtimes on native runners. It packages each one as a self-contained local
+marketplace, extracts it, runs the MCP smoke test, verifies its SHA-256 file,
+and only then uploads all ten assets to the matching GitHub Release.
