@@ -9,11 +9,28 @@ trap 'rm -rf "$test_root"' EXIT HUP INT TERM
 request_file="$test_root/requests.jsonl"
 response_file="$test_root/responses.jsonl"
 
-printf '%s\n' \
-  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"openbaud-plugin-smoke","version":"0.1.2"}}}' \
-  '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}' \
-  '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
-  > "$request_file"
+python3 - "$request_file" "$plugin_root/.codex-plugin/plugin.json" <<'PY'
+import json
+import pathlib
+import sys
+
+version = json.loads(pathlib.Path(sys.argv[2]).read_text())["version"]
+requests = [
+    {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "openbaud-plugin-smoke", "version": version},
+        },
+    },
+    {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}},
+    {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+]
+pathlib.Path(sys.argv[1]).write_text("\n".join(json.dumps(item) for item in requests) + "\n")
+PY
 
 (
   cd "$plugin_root"

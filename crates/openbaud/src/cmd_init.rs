@@ -37,11 +37,12 @@ pub fn run(dir: &Path) -> anyhow::Result<()> {
             );
         }
     } else {
-        std::fs::write(&mcp_path, MCP_JSON).with_context(|| format!("cannot write {mcp_path:?}"))?;
+        std::fs::write(&mcp_path, MCP_JSON)
+            .with_context(|| format!("cannot write {mcp_path:?}"))?;
         println!("file  {}", mcp_path.display());
     }
 
-    let skill_dir = dir.join(".claude/skills/openbaud");
+    let skill_dir = dir.join(".agents/skills/openbaud");
     std::fs::create_dir_all(&skill_dir).with_context(|| format!("cannot create {skill_dir:?}"))?;
     let skill_path = skill_dir.join("SKILL.md");
     if skill_path.exists() {
@@ -54,4 +55,22 @@ pub fn run(dir: &Path) -> anyhow::Result<()> {
 
     println!("\nworkspace ready. Open this directory in your agent (Claude Code / Cursor / Codex);\nthe openbaud MCP server starts automatically via .mcp.json.");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::run;
+
+    #[test]
+    fn init_writes_the_skill_to_the_general_agent_path() {
+        let dir = tempfile::tempdir().unwrap();
+
+        run(dir.path()).unwrap();
+
+        assert!(dir
+            .path()
+            .join(".agents/skills/openbaud/SKILL.md")
+            .is_file());
+        assert!(!dir.path().join(".claude/skills/openbaud").exists());
+    }
 }

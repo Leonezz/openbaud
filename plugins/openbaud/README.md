@@ -33,7 +33,7 @@ codex plugin add openbaud@openbaud-marketplace
 
 An HTTPS or SSH Git URL works as well. Private repositories require the user to
 already have Git access. To pin a reproducible release rather than track the
-default branch, add `--ref v0.1.2` to the marketplace command.
+default branch, add `--ref v0.1.3` to the marketplace command.
 
 To refresh a marketplace that tracks a branch and reinstall its latest plugin:
 
@@ -61,3 +61,7 @@ A published plugin must contain the executable runtime named by `.mcp.json`.
 Codex starts it from the plugin root; OpenBaud recovers the original task
 workspace from the inherited process environment. Installing the plugin never
 runs Homebrew, Cargo, npm lifecycle scripts, or an unreviewed download hook.
+
+The tag-triggered GitHub Actions release workflow rebuilds this runtime on a
+macOS ARM64 runner, reruns the package and MCP smoke checks, and uploads the
+plugin archive plus its SHA-256 file to the matching GitHub Release.

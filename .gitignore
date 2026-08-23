@@ -1,6 +1,8 @@
 /target
 Cargo.lock.orig
 .DS_Store
+__pycache__/
+*.py[cod]
 
 # Local working material, not part of the shipped repo:
 # - root-level workspace artifacts from ad-hoc exploration sessions

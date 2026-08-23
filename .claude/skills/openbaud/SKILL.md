@@ -1,1 +1,0 @@
-../../../crates/openbaud/src/scaffold/SKILL.md

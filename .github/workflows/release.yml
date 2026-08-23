@@ -1,0 +1,59 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and publish Codex plugin
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Confirm runner architecture
+        run: test "$(uname -m)" = arm64
+      - name: Verify source and tag
+        run: |
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo test --workspace --locked
+          python3 scripts/validate-package.py --tag "$GITHUB_REF_NAME"
+          plugins/openbaud/scripts/smoke-test
+          cd plugins/openbaud/bin/darwin-arm64
+          shasum -a 256 -c openbaud.sha256
+          codesign --verify --strict --verbose=2 openbaud
+      - name: Build bundled runtime
+        run: plugins/openbaud/scripts/build-runtime
+      - name: Verify plugin runtime
+        run: |
+          python3 scripts/validate-package.py --tag "$GITHUB_REF_NAME"
+          plugins/openbaud/scripts/smoke-test
+          cd plugins/openbaud/bin/darwin-arm64
+          shasum -a 256 -c openbaud.sha256
+          codesign --verify --strict --verbose=2 openbaud
+          cd ../../../..
+          git diff --exit-code -- plugins/openbaud/bin/darwin-arm64
+      - name: Package plugin
+        run: |
+          mkdir -p dist
+          archive="openbaud-codex-plugin-${GITHUB_REF_NAME}-darwin-arm64.tar.gz"
+          COPYFILE_DISABLE=1 tar -czf "dist/$archive" -C plugins openbaud
+          cd dist
+          shasum -a 256 "$archive" > "$archive.sha256"
+      - name: Create release and upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes --title "OpenBaud ${GITHUB_REF_NAME}"
+          fi
+          gh release upload "$GITHUB_REF_NAME" dist/* --clobber
