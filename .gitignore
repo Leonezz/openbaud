@@ -2,8 +2,12 @@
 Cargo.lock.orig
 .DS_Store
 
-# Repo root used as an ad-hoc openbaud workspace during testing — runtime
-# artifacts stay out of the repo (the curated workspace lives in testbench/).
+# Local working material, not part of the shipped repo:
+# - root-level workspace artifacts from ad-hoc exploration sessions
+# - testbench/ (local hardware acceptance rig and its device knowledge)
+# - docs/ (internal working notes and design drafts)
 /.openbaud/
 /captures/
 /devices/
+/testbench/
+/docs/
