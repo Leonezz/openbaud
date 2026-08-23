@@ -7,7 +7,7 @@
     "studio": "remotion studio src/index.ts",
     "render": "remotion render src/index.ts OpenBaudPV ../../dist/openbaud-pv-silent.mp4 --codec h264 --crf 18",
     "final": "bash scripts/render-final.sh",
-    "still": "remotion still src/index.ts OpenBaudPV ../../docs/assets/openbaud-pv-poster.png --frame 780"
+    "still": "remotion still src/index.ts OpenBaudPV ../../docs/assets/openbaud-pv-poster.png --frame 600"
   },
   "dependencies": {
     "@remotion/cli": "4.0.515",

@@ -14,21 +14,26 @@ import scans from './radar-scans.json';
 const C = {
   ink: '#07110f',
   panel: '#0d1a17',
+  panel2: '#12231f',
   line: '#23473f',
   green: '#61f2b0',
   lime: '#c7ff6b',
   paper: '#f3f7ee',
   muted: '#8da69e',
   amber: '#ffbd65',
+  blue: '#8ae6ff',
+  violet: '#b89aff',
 };
 
 const font = 'Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
 const mono = '"SFMono-Regular", "Cascadia Code", "Roboto Mono", monospace';
-
 const clamp = {extrapolateLeft: 'clamp' as const, extrapolateRight: 'clamp' as const};
 
 const fadeFor = (frame: number, duration: number) =>
-  interpolate(frame, [0, 18, duration - 20, duration], [0, 1, 1, 0], clamp);
+  interpolate(frame, [0, 14, duration - 16, duration], [0, 1, 1, 0], clamp);
+
+const appear = (frame: number, start: number, length = 14) =>
+  interpolate(frame, [start, start + length], [0, 1], clamp);
 
 const Grid: React.FC = () => (
   <AbsoluteFill
@@ -62,7 +67,7 @@ const Brand: React.FC<{small?: boolean}> = ({small = false}) => (
         borderRadius: '50%',
         display: 'grid',
         placeItems: 'center',
-        boxShadow: `0 0 28px rgba(97,242,176,.22)`,
+        boxShadow: '0 0 28px rgba(97,242,176,.22)',
       }}
     >
       <div style={{width: '34%', height: '34%', borderRadius: '50%', background: C.lime}} />
@@ -73,24 +78,27 @@ const Brand: React.FC<{small?: boolean}> = ({small = false}) => (
   </div>
 );
 
-const Pill: React.FC<{children: React.ReactNode; tone?: 'green' | 'amber'}> = ({children, tone = 'green'}) => (
-  <div
-    style={{
-      display: 'inline-flex',
-      alignItems: 'center',
-      border: `1px solid ${tone === 'green' ? C.line : '#694e2d'}`,
-      color: tone === 'green' ? C.green : C.amber,
-      padding: '10px 16px',
-      borderRadius: 999,
-      fontFamily: mono,
-      fontSize: 20,
-      letterSpacing: 0.3,
-      background: tone === 'green' ? 'rgba(97,242,176,.06)' : 'rgba(255,189,101,.07)',
-    }}
-  >
-    {children}
-  </div>
-);
+const Pill: React.FC<{children: React.ReactNode; tone?: 'green' | 'amber' | 'blue'}> = ({children, tone = 'green'}) => {
+  const color = tone === 'amber' ? C.amber : tone === 'blue' ? C.blue : C.green;
+  return (
+    <div
+      style={{
+        display: 'inline-flex',
+        alignItems: 'center',
+        border: `1px solid ${color}55`,
+        color,
+        padding: '9px 15px',
+        borderRadius: 999,
+        fontFamily: mono,
+        fontSize: 18,
+        letterSpacing: 0.3,
+        background: `${color}0d`,
+      }}
+    >
+      {children}
+    </div>
+  );
+};
 
 const Scene: React.FC<{duration: number; children: React.ReactNode}> = ({duration, children}) => {
   const frame = useCurrentFrame();
@@ -103,139 +111,282 @@ const Scene: React.FC<{duration: number; children: React.ReactNode}> = ({duratio
   );
 };
 
+const ChatShell: React.FC<{children: React.ReactNode; title?: string}> = ({children, title = 'Codex · OpenBaud connected'}) => (
+  <div
+    style={{
+      background: 'rgba(10,22,19,.96)',
+      border: `1px solid ${C.line}`,
+      borderRadius: 25,
+      boxShadow: '0 34px 100px rgba(0,0,0,.42)',
+      overflow: 'hidden',
+    }}
+  >
+    <div style={{height: 58, borderBottom: `1px solid ${C.line}`, display: 'flex', alignItems: 'center', padding: '0 24px', gap: 12}}>
+      <div style={{display: 'flex', gap: 7}}>
+        {['#ff6b6b', '#ffd166', '#61f2b0'].map((color) => <div key={color} style={{width: 10, height: 10, borderRadius: '50%', background: color, opacity: 0.82}} />)}
+      </div>
+      <div style={{fontFamily: mono, color: C.muted, fontSize: 15, marginLeft: 8}}>{title}</div>
+      <div style={{marginLeft: 'auto', fontFamily: mono, color: C.green, fontSize: 14}}>● MCP READY</div>
+    </div>
+    {children}
+  </div>
+);
+
+const Message: React.FC<{
+  role: 'user' | 'agent';
+  children: React.ReactNode;
+  opacity?: number;
+  compact?: boolean;
+}> = ({role, children, opacity = 1, compact = false}) => (
+  <div style={{display: 'grid', gridTemplateColumns: compact ? '74px 1fr' : '90px 1fr', gap: 18, opacity}}>
+    <div style={{fontFamily: mono, color: role === 'agent' ? C.green : C.blue, fontSize: compact ? 15 : 17, paddingTop: 4}}>
+      {role === 'agent' ? 'AGENT' : 'YOU'}
+    </div>
+    <div style={{color: C.paper, fontSize: compact ? 20 : 25, lineHeight: 1.48}}>{children}</div>
+  </div>
+);
+
+const ToolCall: React.FC<{
+  name: string;
+  detail: string;
+  result: string;
+  tone?: 'green' | 'amber';
+  opacity?: number;
+}> = ({name, detail, result, tone = 'green', opacity = 1}) => {
+  const color = tone === 'amber' ? C.amber : C.green;
+  return (
+    <div
+      style={{
+        border: `1px solid ${color}44`,
+        background: `${color}0a`,
+        borderRadius: 14,
+        padding: '15px 18px',
+        opacity,
+      }}
+    >
+      <div style={{display: 'flex', alignItems: 'center', gap: 14}}>
+        <div style={{fontFamily: mono, color, fontSize: 17}}>{name}</div>
+        <div style={{fontFamily: mono, color: C.muted, fontSize: 14}}>{detail}</div>
+        <div style={{marginLeft: 'auto', fontFamily: mono, color, fontSize: 14}}>✓ {result}</div>
+      </div>
+    </div>
+  );
+};
+
 const Hook: React.FC = () => {
   const frame = useCurrentFrame();
   const {fps} = useVideoConfig();
   const enter = spring({frame, fps, config: {damping: 16, stiffness: 110}});
-  const hex = scans[0].rxHex.split(' ').slice(0, Math.floor(interpolate(frame, [12, 120], [4, 78], clamp)));
   return (
-    <Scene duration={150}>
+    <Scene duration={120}>
       <Img
         src={staticFile('esp32-workbench-aigc.png')}
-        style={{position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'cover', opacity: 0.56}}
+        style={{position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'cover', opacity: 0.52}}
       />
-      <AbsoluteFill style={{background: 'linear-gradient(90deg, rgba(7,17,15,.98) 0%, rgba(7,17,15,.82) 43%, rgba(7,17,15,.16) 100%)'}} />
+      <AbsoluteFill style={{background: 'linear-gradient(90deg, rgba(7,17,15,.99) 0%, rgba(7,17,15,.85) 48%, rgba(7,17,15,.18) 100%)'}} />
       <div style={{position: 'absolute', left: 112, top: 78}}><Brand small /></div>
-      <div style={{position: 'absolute', left: 112, top: 260, width: 860, transform: `translateY(${(1 - enter) * 36}px)`}}>
+      <div style={{position: 'absolute', left: 112, top: 258, width: 1040, transform: `translateY(${(1 - enter) * 36}px)`}}>
         <div style={{color: C.paper, fontSize: 82, fontWeight: 760, lineHeight: 1.02, letterSpacing: -4}}>
-          Your agent can<br />write code.
+          Give your agent<br />a serial device.
         </div>
-        <div style={{color: C.green, fontSize: 54, marginTop: 26, fontWeight: 650}}>Can it understand this?</div>
-        <div style={{fontFamily: mono, color: '#9bc8bb', fontSize: 19, lineHeight: 1.7, marginTop: 42, width: 720}}>
-          {hex.join(' ')}<span style={{color: C.lime}}> ▌</span>
+        <div style={{color: C.green, fontSize: 43, marginTop: 28, fontWeight: 640}}>
+          It should gain a capability—not just dump bytes.
         </div>
       </div>
-      <div style={{position: 'absolute', right: 92, bottom: 58, color: C.muted, fontSize: 17}}>AIGC atmosphere plate · protocol evidence shown next</div>
+      <div style={{position: 'absolute', left: 112, bottom: 74, display: 'flex', gap: 14}}>
+        <Pill>DISCOVER</Pill><Pill>VERIFY</Pill><Pill>SEDIMENT</Pill><Pill>REPLAY</Pill>
+      </div>
+      <div style={{position: 'absolute', right: 90, bottom: 44, color: C.muted, fontSize: 15}}>AIGC atmosphere · real device evidence follows</div>
     </Scene>
   );
 };
 
-const PortCard: React.FC = () => {
+const AgentBrief: React.FC = () => {
   const frame = useCurrentFrame();
-  const rows = [
-    ['path', '/dev/cu.usbmodem213101'],
-    ['manufacturer', 'Espressif'],
-    ['USB', '303A:1001'],
-    ['product', 'USB JTAG/serial debug unit'],
-    ['status', 'available'],
-  ];
+  const userIn = appear(frame, 18, 15);
+  const agentIn = appear(frame, 62, 16);
+  const planIn = appear(frame, 98, 20);
   return (
-    <div style={{background: 'rgba(13,26,23,.92)', border: `1px solid ${C.line}`, borderRadius: 24, padding: 32, boxShadow: '0 30px 90px rgba(0,0,0,.38)'}}>
-      <div style={{display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 24}}>
-        <div style={{fontFamily: mono, color: C.paper, fontSize: 20}}>openbaud.list_ports</div>
-        <Pill>REAL USB DEVICE</Pill>
-      </div>
-      {rows.map(([key, value], i) => {
-        const show = interpolate(frame, [34 + i * 10, 44 + i * 10], [0, 1], clamp);
-        return (
-          <div key={key} style={{display: 'grid', gridTemplateColumns: '190px 1fr', gap: 24, borderTop: `1px solid ${C.line}`, padding: '17px 0', opacity: show, transform: `translateX(${(1 - show) * 20}px)`}}>
-            <div style={{fontFamily: mono, color: C.muted, fontSize: 18}}>{key}</div>
-            <div style={{fontFamily: mono, color: key === 'status' ? C.green : C.paper, fontSize: 19}}>{value}</div>
+    <Scene duration={210}>
+      <div style={{position: 'absolute', inset: '66px 92px'}}>
+        <div style={{display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 26}}>
+          <div>
+            <Pill>01 · NATURAL-LANGUAGE INTENT</Pill>
+            <h1 style={{color: C.paper, fontSize: 54, letterSpacing: -2.5, margin: '20px 0 0'}}>The agent starts with your goal—and a safety boundary.</h1>
           </div>
-        );
-      })}
-    </div>
-  );
-};
-
-const Identify: React.FC = () => (
-  <Scene duration={210}>
-    <div style={{position: 'absolute', inset: '86px 104px', display: 'grid', gridTemplateColumns: '0.86fr 1.14fr', gap: 92, alignItems: 'center'}}>
-      <div>
-        <Pill>01 · IDENTIFY</Pill>
-        <h1 style={{color: C.paper, fontSize: 72, lineHeight: 1.04, letterSpacing: -3, margin: '34px 0 26px'}}>Start with the wire.<br />Not a guess.</h1>
-        <p style={{color: C.muted, fontSize: 28, lineHeight: 1.45, margin: 0}}>OpenBaud discovers the port, records USB identity, and keeps every write auditable.</p>
-      </div>
-      <PortCard />
-    </div>
-  </Scene>
-);
-
-const FrameMap: React.FC = () => {
-  const frame = useCurrentFrame();
-  const fields = [
-    {name: 'OB', bytes: 2, color: C.green},
-    {name: 'v1', bytes: 1, color: '#8ae6ff'},
-    {name: 'kind', bytes: 1, color: '#8ae6ff'},
-    {name: 'seq', bytes: 2, color: C.lime},
-    {name: 'len', bytes: 2, color: C.lime},
-    {name: 'uptime', bytes: 4, color: C.amber},
-    {name: '36 × point', bytes: 180, color: '#b89aff'},
-    {name: 'CRC16', bytes: 2, color: '#ff7f91'},
-  ];
-  return (
-    <div>
-      <div style={{display: 'flex', gap: 8, height: 122}}>
-        {fields.map((field, i) => {
-          const grow = interpolate(frame, [22 + i * 7, 38 + i * 7], [0, 1], clamp);
-          const basis = field.bytes === 180 ? 42 : Math.max(7, field.bytes * 3.4);
-          return (
-            <div key={field.name} style={{flexBasis: `${basis}%`, flexGrow: field.bytes === 180 ? 2 : 0.65, border: `1px solid ${field.color}88`, background: `${field.color}14`, borderRadius: 12, padding: 14, opacity: grow, transform: `scaleY(${0.55 + 0.45 * grow})`, transformOrigin: 'bottom'}}>
-              <div style={{fontFamily: mono, color: field.color, fontSize: 18, fontWeight: 700}}>{field.name}</div>
-              <div style={{fontFamily: mono, color: C.muted, fontSize: 15, marginTop: 8}}>{field.bytes} B</div>
-            </div>
-          );
-        })}
-      </div>
-      <div style={{marginTop: 30, fontFamily: mono, color: '#a9c9bf', fontSize: 19, lineHeight: 1.65}}>
-        4F 42 · 01 · 81 · 2A 00 · C4 00 · D0 7E 01 00 · … · C5 9A
-      </div>
-    </div>
-  );
-};
-
-const Protocol: React.FC = () => (
-  <Scene duration={240}>
-    <div style={{position: 'absolute', inset: '86px 104px'}}>
-      <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center'}}>
-        <div>
-          <Pill>02 · SEDIMENT</Pill>
-          <h1 style={{color: C.paper, fontSize: 66, letterSpacing: -3, margin: '28px 0 8px'}}>A new protocol becomes a command.</h1>
+          <Pill tone="blue">OPENBAUD MCP</Pill>
         </div>
-        <Pill tone="amber">OBP/1 · TEST FIRMWARE</Pill>
-      </div>
-      <div style={{marginTop: 74}}><FrameMap /></div>
-      <div style={{display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 24, marginTop: 62}}>
-        {[
-          ['frame', '10-byte request built from typed params'],
-          ['validate', 'CRC-16/Modbus checked before parsing'],
-          ['parse', '36 records → angle, distance, intensity'],
-        ].map(([title, text]) => (
-          <div key={title} style={{borderTop: `2px solid ${C.green}`, paddingTop: 20}}>
-            <div style={{fontFamily: mono, color: C.green, fontSize: 22}}>{title}</div>
-            <div style={{color: C.muted, fontSize: 22, marginTop: 11, lineHeight: 1.4}}>{text}</div>
+        <ChatShell>
+          <div style={{padding: '34px 40px', display: 'flex', flexDirection: 'column', gap: 30}}>
+            <Message role="user" opacity={userIn}>
+              Explore this ESP32. Start read-only, preserve the evidence, and turn verified behavior into a reusable command.
+            </Message>
+            <Message role="agent" opacity={agentIn}>
+              I’ll identify it by USB metadata, open it at the known transport settings, capture before sending, then validate every response before I save anything.
+            </Message>
+            <div style={{opacity: planIn, display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 13, marginLeft: 108}}>
+              {[
+                ['1', 'Identify', 'read-only'],
+                ['2', 'Capture', 'lossless'],
+                ['3', 'Verify', 'CRC first'],
+                ['4', 'Save', 'typed command'],
+              ].map(([n, title, note]) => (
+                <div key={n} style={{border: `1px solid ${C.line}`, background: C.panel, borderRadius: 13, padding: '15px 16px'}}>
+                  <div style={{fontFamily: mono, color: C.green, fontSize: 14}}>0{n}</div>
+                  <div style={{color: C.paper, fontSize: 19, marginTop: 7}}>{title}</div>
+                  <div style={{fontFamily: mono, color: C.muted, fontSize: 13, marginTop: 4}}>{note}</div>
+                </div>
+              ))}
+            </div>
           </div>
-        ))}
+        </ChatShell>
+        <div style={{position: 'absolute', bottom: 2, left: 0, right: 0, display: 'flex', justifyContent: 'center', gap: 22, color: C.muted, fontFamily: mono, fontSize: 15}}>
+          <span style={{color: C.green}}>AGENT</span><span>owns intent + reasoning</span><span>·</span><span style={{color: C.blue}}>OPENBAUD</span><span>owns transport + audit + evidence</span>
+        </div>
       </div>
-      <div style={{position: 'absolute', bottom: 0, color: C.muted, fontSize: 18}}>USB + frame are real · response flag bit 0 marks the generated radar scene</div>
+    </Scene>
+  );
+};
+
+const ToolLoop: React.FC = () => {
+  const frame = useCurrentFrame();
+  const tools = [
+    ['openbaud.list_ports', '{}', 'Espressif · available'],
+    ['openbaud.open', '115200 · 8N1', 'session s2'],
+    ['openbaud.capture_start', 'lossless RX/TX', 'recording'],
+    ['openbaud.request', '10 B → match 196 B', 'CRC valid'],
+  ];
+  const active = Math.min(tools.length - 1, Math.floor(Math.max(0, frame - 42) / 48));
+  return (
+    <Scene duration={330}>
+      <div style={{position: 'absolute', inset: '58px 82px'}}>
+        <div style={{display: 'flex', alignItems: 'end', justifyContent: 'space-between', marginBottom: 28}}>
+          <div>
+            <Pill>02 · AGENT TOOL LOOP</Pill>
+            <h1 style={{color: C.paper, fontSize: 62, letterSpacing: -3, margin: '22px 0 0'}}>Every hardware action is visible, typed, and auditable.</h1>
+          </div>
+          <div style={{fontFamily: mono, color: C.muted, fontSize: 16}}>LIVE · /dev/cu.usbmodem213101</div>
+        </div>
+        <div style={{display: 'grid', gridTemplateColumns: '0.9fr 1.1fr', gap: 34}}>
+          <ChatShell title="Codex · task transcript">
+            <div style={{padding: '29px 32px', display: 'flex', flexDirection: 'column', gap: 26}}>
+              <Message role="agent" compact opacity={appear(frame, 18)}>
+                I found one matching Espressif device. I’m opening it read-only and starting a capture before the first request.
+              </Message>
+              <div style={{height: 1, background: C.line}} />
+              <Message role="agent" compact opacity={appear(frame, 226)}>
+                The frame is complete and its checksum passes. I’ll repeat the probe, compare the records, then encode the verified behavior as a command.
+              </Message>
+              <div style={{opacity: appear(frame, 272), borderLeft: `3px solid ${C.green}`, padding: '13px 17px', background: 'rgba(97,242,176,.05)'}}>
+                <div style={{fontFamily: mono, color: C.green, fontSize: 15}}>DECISION</div>
+                <div style={{color: C.paper, fontSize: 19, marginTop: 6}}>Safe to sediment: 8/8 responses valid</div>
+              </div>
+            </div>
+          </ChatShell>
+          <div style={{background: 'rgba(13,26,23,.9)', border: `1px solid ${C.line}`, borderRadius: 25, padding: '25px 27px'}}>
+            <div style={{fontFamily: mono, color: C.muted, fontSize: 15, marginBottom: 18}}>TOOL CALLS · APPEND-ONLY AUDIT</div>
+            <div style={{display: 'flex', flexDirection: 'column', gap: 12}}>
+              {tools.map(([name, detail, result], i) => (
+                <ToolCall
+                  key={name}
+                  name={name}
+                  detail={detail}
+                  result={result}
+                  tone={i === 3 ? 'amber' : 'green'}
+                  opacity={appear(frame, 40 + i * 48)}
+                />
+              ))}
+            </div>
+            <div style={{marginTop: 20, display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10, opacity: appear(frame, 236)}}>
+              {[
+                ['8', 'requests'],
+                ['0', 'CRC errors'],
+                ['36', 'records / frame'],
+              ].map(([value, label]) => (
+                <div key={label} style={{background: C.panel2, borderRadius: 12, padding: 13, textAlign: 'center', border: `1px solid ${C.line}`}}>
+                  <div style={{fontFamily: mono, color: C.paper, fontSize: 23}}>{value}</div>
+                  <div style={{fontFamily: mono, color: C.muted, fontSize: 12, marginTop: 3}}>{label}</div>
+                </div>
+              ))}
+            </div>
+            <div style={{height: 5, borderRadius: 99, background: '#172a25', marginTop: 20, overflow: 'hidden'}}>
+              <div style={{height: '100%', width: `${((active + 1) / tools.length) * 100}%`, background: `linear-gradient(90deg, ${C.green}, ${C.lime})`}} />
+            </div>
+          </div>
+        </div>
+      </div>
+    </Scene>
+  );
+};
+
+const CommandCard: React.FC<{frame: number}> = ({frame}) => {
+  const lines = [
+    ['schema:', ' openbaud/command@v0'],
+    ['name:', ' obp1_radar_scan'],
+    ['risk:', ' read'],
+    ['frame.hex:', ' "4F 42 01 01 {seq} 00 00 {crc16_modbus}"'],
+    ['response.match:', ' { length: 196 }'],
+    ['validate:', ' { checksum: crc16_modbus }'],
+    ['parse:', ' 36 × { angle_deg, distance_mm, intensity }'],
+    ['verified:', ' captures/obp1-radar-seq42.obcap'],
+  ];
+  return (
+    <div style={{background: '#091411', border: `1px solid ${C.line}`, borderRadius: 20, padding: '24px 28px'}}>
+      <div style={{display: 'flex', justifyContent: 'space-between', marginBottom: 18}}>
+        <div style={{fontFamily: mono, color: C.paper, fontSize: 16}}>commands/obp1_radar_scan.yaml</div>
+        <div style={{fontFamily: mono, color: C.green, fontSize: 14}}>GENERATED · REVIEWABLE</div>
+      </div>
+      {lines.map(([key, value], i) => (
+        <div key={key} style={{fontFamily: mono, fontSize: 16, lineHeight: 1.73, opacity: appear(frame, 28 + i * 12)}}>
+          <span style={{color: C.violet}}>{key}</span><span style={{color: i === 2 ? C.green : C.paper}}>{value}</span>
+        </div>
+      ))}
     </div>
-  </Scene>
-);
+  );
+};
+
+const Sediment: React.FC = () => {
+  const frame = useCurrentFrame();
+  return (
+    <Scene duration={270}>
+      <div style={{position: 'absolute', inset: '62px 86px'}}>
+        <div style={{display: 'flex', alignItems: 'end', justifyContent: 'space-between', marginBottom: 30}}>
+          <div>
+            <Pill>03 · SEDIMENT KNOWLEDGE</Pill>
+            <h1 style={{color: C.paper, fontSize: 62, letterSpacing: -3, margin: '20px 0 0'}}>The agent turns one exploration into a reusable tool.</h1>
+          </div>
+          <Pill tone="amber">OBP/1 · REAL ESP32</Pill>
+        </div>
+        <div style={{display: 'grid', gridTemplateColumns: '1.18fr .82fr', gap: 32}}>
+          <CommandCard frame={frame} />
+          <div style={{display: 'flex', flexDirection: 'column', gap: 14}}>
+            <div style={{background: C.panel, border: `1px solid ${C.line}`, borderRadius: 20, padding: 24, opacity: appear(frame, 126)}}>
+              <div style={{fontFamily: mono, color: C.green, fontSize: 16}}>openbaud.run_command</div>
+              <div style={{fontFamily: mono, color: C.muted, fontSize: 14, marginTop: 9}}>openbaud-pv-board/obp1_radar_scan</div>
+              <div style={{display: 'flex', alignItems: 'center', gap: 14, marginTop: 22}}>
+                <div style={{fontFamily: mono, color: C.lime, fontSize: 28}}>✓ normal</div>
+                <div style={{fontFamily: mono, color: C.muted, fontSize: 14}}>CRC valid · 36 records</div>
+              </div>
+            </div>
+            <div style={{background: 'rgba(97,242,176,.07)', border: `1px solid ${C.green}55`, borderRadius: 20, padding: 24, opacity: appear(frame, 174)}}>
+              <div style={{fontFamily: mono, color: C.green, fontSize: 15}}>NEW AGENT CAPABILITY</div>
+              <div style={{color: C.paper, fontSize: 26, lineHeight: 1.25, marginTop: 12}}>“Scan the test scene” is now a named, typed tool.</div>
+              <div style={{color: C.muted, fontSize: 18, lineHeight: 1.4, marginTop: 12}}>Review it in Git. Call it from Codex. Run it from CI.</div>
+            </div>
+            <div style={{fontFamily: mono, color: C.muted, fontSize: 14, lineHeight: 1.55, padding: '4px 8px', opacity: appear(frame, 216)}}>
+              provenance → real capture<br />risk → read<br />parser → deterministic
+            </div>
+          </div>
+        </div>
+      </div>
+    </Scene>
+  );
+};
 
 type Point = {angleDeg: number; distanceMm: number; intensity: number};
 
 const Radar: React.FC<{points: Point[]; sweep: number}> = ({points, sweep}) => {
-  const size = 620;
+  const size = 520;
   const centre = size / 2;
   const max = 3000;
   const coords = points.map((point) => {
@@ -260,84 +411,75 @@ const Radar: React.FC<{points: Point[]; sweep: number}> = ({points, sweep}) => {
       <path d={path} fill="url(#radar-fill)" stroke={C.green} strokeWidth="3" strokeLinejoin="round" />
       {coords.map((p, i) => <circle key={i} cx={p.x} cy={p.y} r={3 + (p.intensity - 130) / 50} fill={p.distanceMm < 1200 ? C.amber : C.lime} opacity=".9" />)}
       <g transform={`rotate(${sweep} ${centre} ${centre})`}>
-        <path d={`M ${centre} ${centre} L ${centre} 54 L ${centre + 120} ${centre + 30} Z`} fill="url(#sweep)" opacity=".42" />
-        <line x1={centre} y1={centre} x2={centre} y2="54" stroke={C.green} strokeWidth="2" />
+        <path d={`M ${centre} ${centre} L ${centre} 44 L ${centre + 100} ${centre + 26} Z`} fill="url(#sweep)" opacity=".42" />
+        <line x1={centre} y1={centre} x2={centre} y2="44" stroke={C.green} strokeWidth="2" />
       </g>
-      <circle cx={centre} cy={centre} r="8" fill={C.lime} />
+      <circle cx={centre} cy={centre} r="7" fill={C.lime} />
     </svg>
   );
 };
 
-const Timeline: React.FC = () => {
-  const w = 480;
-  const h = 145;
-  const values = scans.map((scan) => Math.min(...scan.points.map((point) => point.distanceMm)));
-  const min = Math.min(...values) - 80;
-  const max = Math.max(...values) + 80;
-  const xy = values.map((value, i) => ({x: (i / (values.length - 1)) * w, y: h - ((value - min) / (max - min)) * h}));
-  const d = xy.map((p, i) => `${i ? 'L' : 'M'} ${p.x} ${p.y}`).join(' ');
-  return (
-    <div>
-      <div style={{fontFamily: mono, color: C.muted, fontSize: 16, marginBottom: 12}}>nearest return · eight real exchanges</div>
-      <svg width={w} height={h + 22} viewBox={`0 0 ${w} ${h + 22}`}>
-        <path d={d} fill="none" stroke={C.amber} strokeWidth="3" />
-        {xy.map((p, i) => <g key={i}><circle cx={p.x} cy={p.y} r="5" fill={C.amber}/><text x={p.x} y={h + 20} textAnchor="middle" fill={C.muted} fontSize="12">{i + 1}</text></g>)}
-      </svg>
-    </div>
-  );
-};
-
-const Decode: React.FC = () => {
+const Evidence: React.FC = () => {
   const frame = useCurrentFrame();
-  const index = Math.min(scans.length - 1, Math.floor(frame / 42));
+  const index = Math.min(scans.length - 1, Math.floor(frame / 30));
   const scan = scans[index];
-  const sweep = (frame * 4.2) % 360;
   return (
-    <Scene duration={390}>
-      <div style={{position: 'absolute', inset: '58px 86px', display: 'grid', gridTemplateColumns: '720px 1fr', gap: 68, alignItems: 'center'}}>
-        <div style={{position: 'relative'}}>
-          <Radar points={scan.points} sweep={sweep} />
-          <div style={{position: 'absolute', left: 30, top: 20}}><Pill>CRC VERIFIED</Pill></div>
-        </div>
-        <div>
-          <Pill>03 · UNDERSTAND</Pill>
-          <h1 style={{fontSize: 68, color: C.paper, letterSpacing: -3, lineHeight: 1.04, margin: '28px 0 20px'}}>Bytes become<br />structured evidence.</h1>
-          <div style={{display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14, marginBottom: 30}}>
-            {[
-              ['sequence', String(scan.seq)],
-              ['frame', `${scan.totalLen} bytes`],
-              ['records', `${scan.points.length} points`],
-              ['provenance', 'simulated scene'],
-            ].map(([k, v]) => <div key={k} style={{background: C.panel, border: `1px solid ${C.line}`, borderRadius: 12, padding: 16}}><div style={{fontFamily: mono, color: C.muted, fontSize: 14}}>{k}</div><div style={{fontFamily: mono, color: k === 'provenance' ? C.amber : C.paper, fontSize: 21, marginTop: 7}}>{v}</div></div>)}
+    <Scene duration={240}>
+      <div style={{position: 'absolute', inset: '58px 82px'}}>
+        <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'end'}}>
+          <div>
+            <Pill>04 · STRUCTURED RESULT</Pill>
+            <h1 style={{color: C.paper, fontSize: 61, letterSpacing: -3, margin: '20px 0 0'}}>The agent receives meaning—not a byte dump.</h1>
           </div>
-          <Timeline />
+          <Pill tone="amber">simulated_scene = 1</Pill>
+        </div>
+        <div style={{display: 'grid', gridTemplateColumns: '590px 1fr', gap: 60, alignItems: 'center', marginTop: 18}}>
+          <div style={{position: 'relative'}}>
+            <Radar points={scan.points} sweep={(frame * 4.4) % 360} />
+            <div style={{position: 'absolute', left: 8, top: 10}}><Pill>CRC VERIFIED</Pill></div>
+          </div>
+          <div>
+            <div style={{background: C.panel, border: `1px solid ${C.line}`, borderRadius: 18, padding: '20px 23px', fontFamily: mono, fontSize: 16, lineHeight: 1.7}}>
+              <div><span style={{color: C.violet}}>outcome:</span> <span style={{color: C.green}}>normal</span></div>
+              <div><span style={{color: C.violet}}>sequence:</span> <span style={{color: C.paper}}>{scan.seq}</span></div>
+              <div><span style={{color: C.violet}}>point_count:</span> <span style={{color: C.paper}}>36</span></div>
+              <div><span style={{color: C.violet}}>points:</span> <span style={{color: C.paper}}>[angle_deg, distance_mm, intensity] × 36</span></div>
+              <div><span style={{color: C.violet}}>provenance:</span> <span style={{color: C.amber}}>firmware-generated test scene</span></div>
+            </div>
+            <div style={{marginTop: 18, borderLeft: `3px solid ${C.green}`, background: 'rgba(97,242,176,.06)', padding: '18px 21px', opacity: appear(frame, 62)}}>
+              <div style={{fontFamily: mono, color: C.green, fontSize: 15}}>AGENT SUMMARY</div>
+              <div style={{color: C.paper, fontSize: 23, lineHeight: 1.4, marginTop: 8}}>
+                36 points decoded. Eight responses agree. No checksum errors. The visualization is safe to generate from the parsed records.
+              </div>
+            </div>
+            <div style={{marginTop: 17, display: 'flex', gap: 12}}>
+              <Pill>JSON</Pill><Pill>CHART</Pill><Pill>HEATMAP</Pill><Pill>TIMELINE</Pill>
+            </div>
+          </div>
         </div>
       </div>
-      <div style={{position: 'absolute', left: 86, bottom: 34, fontFamily: mono, color: C.muted, fontSize: 16}}>capture: 8 requests · 8 responses · 0 checksum errors · device restored to ECHO</div>
     </Scene>
   );
 };
 
 const Replay: React.FC = () => {
   const frame = useCurrentFrame();
-  const progress = interpolate(frame, [56, 146], [0, 1], clamp);
+  const progress = interpolate(frame, [34, 82], [0, 1], clamp);
   return (
-    <Scene duration={210}>
-      <div style={{position: 'absolute', inset: '100px 112px', display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 86, alignItems: 'center'}}>
+    <Scene duration={120}>
+      <div style={{position: 'absolute', inset: '88px 100px', display: 'grid', gridTemplateColumns: '.82fr 1.18fr', gap: 76, alignItems: 'center'}}>
         <div>
-          <Pill>04 · REPLAY</Pill>
-          <h1 style={{fontSize: 72, color: C.paper, lineHeight: 1.04, letterSpacing: -3, margin: '30px 0 24px'}}>Verified once.<br />Replayed anywhere.</h1>
-          <p style={{fontSize: 27, color: C.muted, lineHeight: 1.45}}>The capture verifies every transmitted byte, returns the recorded response, and runs the same parser without hardware.</p>
+          <Pill>05 · NEXT AGENT, NO BOARD</Pill>
+          <h1 style={{fontSize: 65, color: C.paper, lineHeight: 1.04, letterSpacing: -3, margin: '28px 0 20px'}}>Capabilities survive the conversation.</h1>
+          <p style={{fontSize: 24, color: C.muted, lineHeight: 1.45}}>A future task—or CI—can invoke the same named command against the lossless capture.</p>
         </div>
-        <div style={{background: C.panel, border: `1px solid ${C.line}`, borderRadius: 24, padding: 34}}>
-          <div style={{fontFamily: mono, color: C.paper, fontSize: 18, lineHeight: 1.7}}>
-            <span style={{color: C.green}}>$</span> openbaud run<br />
-            &nbsp;&nbsp;openbaud-pv-board/obp1_radar_scan<br />
-            &nbsp;&nbsp;--port replay:captures/obp1-radar-seq42.obcap
+        <ChatShell title="Codex · new task">
+          <div style={{padding: '27px 31px', display: 'flex', flexDirection: 'column', gap: 20}}>
+            <Message role="user" compact>Re-run the ESP32 parser without the board.</Message>
+            <ToolCall name="openbaud.run_command" detail="port = replay:obp1-radar-seq42.obcap" result={progress > .92 ? 'normal · 36 records' : 'replaying'} opacity={appear(frame, 20)} />
+            <div style={{height: 6, borderRadius: 99, background: '#172a25', overflow: 'hidden'}}><div style={{height: '100%', width: `${progress * 100}%`, background: `linear-gradient(90deg, ${C.green}, ${C.lime})`}} /></div>
           </div>
-          <div style={{height: 8, borderRadius: 99, background: '#172a25', margin: '34px 0 24px', overflow: 'hidden'}}><div style={{height: '100%', width: `${progress * 100}%`, background: `linear-gradient(90deg, ${C.green}, ${C.lime})`}} /></div>
-          <div style={{fontFamily: mono, fontSize: 20, color: progress > .9 ? C.green : C.muted}}>{progress > .9 ? '✓ outcome: normal · 36 records · CRC valid' : 'replaying lossless capture…'}</div>
-        </div>
+        </ChatShell>
       </div>
     </Scene>
   );
@@ -348,27 +490,27 @@ const CTA: React.FC = () => {
   const {fps} = useVideoConfig();
   const enter = spring({frame, fps, config: {damping: 14, stiffness: 90}});
   return (
-    <Scene duration={180}>
+    <Scene duration={90}>
       <div style={{position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', textAlign: 'center'}}>
-        <div style={{transform: `scale(${0.88 + enter * 0.12})`}}>
+        <div style={{transform: `scale(${0.9 + enter * 0.1})`}}>
           <div style={{display: 'flex', justifyContent: 'center'}}><Brand /></div>
-          <h1 style={{fontSize: 82, color: C.paper, lineHeight: 1.04, letterSpacing: -4, margin: '48px 0 22px'}}>Turn serial hardware into<br /><span style={{color: C.green}}>reusable agent commands.</span></h1>
-          <p style={{color: C.muted, fontSize: 29, margin: '0 0 46px'}}>Local-first · audited writes · lossless capture · typed parsing · replay</p>
-          <div style={{display: 'inline-block', fontFamily: mono, color: C.ink, background: C.lime, borderRadius: 14, padding: '18px 30px', fontSize: 24, fontWeight: 800}}>github.com/Leonezz/openbaud</div>
+          <h1 style={{fontSize: 72, color: C.paper, lineHeight: 1.04, letterSpacing: -4, margin: '36px 0 18px'}}>Turn hardware into a<br /><span style={{color: C.green}}>reusable capability for every agent.</span></h1>
+          <p style={{color: C.muted, fontSize: 24, margin: '0 0 30px'}}>Discover · reason · act safely · sediment · replay</p>
+          <div style={{display: 'inline-block', fontFamily: mono, color: C.ink, background: C.lime, borderRadius: 14, padding: '15px 27px', fontSize: 22, fontWeight: 800}}>github.com/Leonezz/openbaud</div>
         </div>
       </div>
-      <div style={{position: 'absolute', bottom: 34, left: 0, right: 0, textAlign: 'center', color: C.muted, fontSize: 16}}>Real ESP32-S3 transport · generated test scene disclosed on wire · open-source MIT</div>
     </Scene>
   );
 };
 
 export const OpenBaudPV: React.FC = () => (
   <AbsoluteFill style={{background: C.ink}}>
-    <Sequence from={0} durationInFrames={150}><Hook /></Sequence>
-    <Sequence from={150} durationInFrames={210}><Identify /></Sequence>
-    <Sequence from={360} durationInFrames={240}><Protocol /></Sequence>
-    <Sequence from={600} durationInFrames={390}><Decode /></Sequence>
-    <Sequence from={990} durationInFrames={210}><Replay /></Sequence>
-    <Sequence from={1200} durationInFrames={180}><CTA /></Sequence>
+    <Sequence from={0} durationInFrames={120}><Hook /></Sequence>
+    <Sequence from={120} durationInFrames={210}><AgentBrief /></Sequence>
+    <Sequence from={330} durationInFrames={330}><ToolLoop /></Sequence>
+    <Sequence from={660} durationInFrames={270}><Sediment /></Sequence>
+    <Sequence from={930} durationInFrames={240}><Evidence /></Sequence>
+    <Sequence from={1170} durationInFrames={120}><Replay /></Sequence>
+    <Sequence from={1290} durationInFrames={90}><CTA /></Sequence>
   </AbsoluteFill>
 );

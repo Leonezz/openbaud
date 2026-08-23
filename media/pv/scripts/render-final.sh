@@ -17,14 +17,14 @@ ffmpeg -y -loglevel error \
   -f lavfi -t 0.5 -i "sine=frequency=660:sample_rate=48000" \
   -f lavfi -t 0.5 -i "sine=frequency=880:sample_rate=48000" \
   -filter_complex \
-  "[0:a]volume=0.10,lowpass=f=180[a0];[1:a]volume=0.055,lowpass=f=260[a1];[2:a]volume=0.025,lowpass=f=360[a2];[3:a]lowpass=f=900,highpass=f=90,volume=0.18[a3];[4:a]volume=0.10,afade=t=out:st=0.06:d=0.42,adelay=5000|5000[p1];[5:a]volume=0.09,afade=t=out:st=0.06:d=0.42,adelay=12000|12000[p2];[4:a]volume=0.10,afade=t=out:st=0.06:d=0.42,adelay=20000|20000[p3];[5:a]volume=0.09,afade=t=out:st=0.06:d=0.42,adelay=33000|33000[p4];[4:a]volume=0.12,afade=t=out:st=0.06:d=0.42,adelay=40000|40000[p5];[a0][a1][a2][a3][p1][p2][p3][p4][p5]amix=inputs=9:normalize=0,afade=t=in:st=0:d=1.5,afade=t=out:st=43:d=3,loudnorm=I=-20:LRA=7:TP=-2[a]" \
+  "[0:a]volume=0.10,lowpass=f=180[a0];[1:a]volume=0.055,lowpass=f=260[a1];[2:a]volume=0.025,lowpass=f=360[a2];[3:a]lowpass=f=900,highpass=f=90,volume=0.18[a3];[4:a]volume=0.10,afade=t=out:st=0.06:d=0.42,adelay=4000|4000[p1];[5:a]volume=0.09,afade=t=out:st=0.06:d=0.42,adelay=11000|11000[p2];[4:a]volume=0.10,afade=t=out:st=0.06:d=0.42,adelay=22000|22000[p3];[5:a]volume=0.09,afade=t=out:st=0.06:d=0.42,adelay=31000|31000[p4];[4:a]volume=0.12,afade=t=out:st=0.06:d=0.42,adelay=39000|39000[p5];[5:a]volume=0.11,afade=t=out:st=0.06:d=0.42,adelay=43000|43000[p6];[a0][a1][a2][a3][p1][p2][p3][p4][p5][p6]amix=inputs=10:normalize=0,afade=t=in:st=0:d=1.5,afade=t=out:st=43:d=3,loudnorm=I=-20:LRA=7:TP=-2[a]" \
   -map "[a]" -c:a pcm_s16le "$AUDIO"
 
 ffmpeg -y -loglevel error -i "$SILENT" -i "$AUDIO" \
   -map 0:v:0 -map 1:a:0 -c:v copy -c:a aac -b:a 192k -shortest \
   -movflags +faststart "$FINAL"
 
-ffmpeg -y -loglevel error -ss 18 -t 10 -i "$FINAL" \
+ffmpeg -y -loglevel error -ss 11 -t 10 -i "$FINAL" \
   -filter_complex \
   "fps=10,scale=960:-1:flags=lanczos,split[s0][s1];[s0]palettegen=max_colors=128:stats_mode=diff[p];[s1][p]paletteuse=dither=bayer:bayer_scale=4" \
   -loop 0 "$GIF"

@@ -6,11 +6,14 @@
 
 **Turn serial hardware into reusable, auditable tools for coding agents.**
 
-OpenBaud gives Codex structured access to local serial devices. It combines an
-MCP server with durable device profiles, typed commands, workflows, lossless
-captures, byte-exact replay, and a hardware-exploration skill.
+OpenBaud gives Codex structured access to local serial devices. Inside an agent
+task, it makes hardware actions visible and auditable, returns structured
+results instead of byte dumps, and turns verified exploration into durable
+tools. It combines an MCP server with device profiles, typed commands,
+workflows, lossless captures, byte-exact replay, and a hardware-exploration
+skill.
 
-![OpenBaud turns a real ESP32 serial exchange into a CRC-checked radar visualization](docs/assets/openbaud-pv-demo.gif)
+![A coding agent uses OpenBaud to identify a real ESP32, capture and validate its protocol, create a reusable command, and replay it without hardware](docs/assets/openbaud-pv-demo.gif)
 
 [Watch the 46-second PV](docs/assets/openbaud-pv.mp4) ·
 [Try without hardware](examples/pv-demo/README.md) ·

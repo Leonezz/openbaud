@@ -8,8 +8,8 @@ generated radar scene came from a physical radar sensor.
 
 - Project: OpenBaud
 - Repository: <https://github.com/Leonezz/openbaud>
-- One-line value: Turn serial hardware into reusable, auditable tools for
-  coding agents.
+- One-line value: Give coding agents a safe, auditable way to discover serial
+  hardware, act on it, and retain the result as a reusable capability.
 - Demo hardware: real ESP32-S3 development board over Espressif USB Serial/JTAG
 - Demo protocol: OBP/1, a new CRC-protected binary protocol
 - Evidence: eight real exchanges, 196 bytes each, 36 parsed records, zero CRC

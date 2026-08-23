@@ -1,7 +1,11 @@
 # OpenBaud product video
 
 This directory is the reproducible Remotion source for the 46-second OpenBaud
-PV. The radar animation is generated from
+PV. The story is agent-first: a user states a hardware goal in natural
+language, the agent declares its safety strategy, calls OpenBaud tools, turns
+verified behavior into a reviewable command, and reuses that capability in a
+future task without the board. The radar animation is supporting evidence,
+generated from
 `public/obp1-radar-8-scans.obcap`, a real OpenBaud capture recorded from the
 ESP32-S3 test board. `pnpm extract` validates each CRC and materializes the eight
 36-point frames in `src/radar-scans.json`.
