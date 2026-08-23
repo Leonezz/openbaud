@@ -10,6 +10,15 @@ import {
   useVideoConfig,
 } from 'remotion';
 import scans from './radar-scans.json';
+import {
+  AgentText,
+  CodexScreen,
+  EditSummary,
+  StatusLine,
+  ToolResult,
+  UserPrompt,
+  uiAppear,
+} from './CodexScreen';
 
 const C = {
   ink: '#07110f',
@@ -111,68 +120,6 @@ const Scene: React.FC<{duration: number; children: React.ReactNode}> = ({duratio
   );
 };
 
-const ChatShell: React.FC<{children: React.ReactNode; title?: string}> = ({children, title = 'Codex · OpenBaud connected'}) => (
-  <div
-    style={{
-      background: 'rgba(10,22,19,.96)',
-      border: `1px solid ${C.line}`,
-      borderRadius: 25,
-      boxShadow: '0 34px 100px rgba(0,0,0,.42)',
-      overflow: 'hidden',
-    }}
-  >
-    <div style={{height: 58, borderBottom: `1px solid ${C.line}`, display: 'flex', alignItems: 'center', padding: '0 24px', gap: 12}}>
-      <div style={{display: 'flex', gap: 7}}>
-        {['#ff6b6b', '#ffd166', '#61f2b0'].map((color) => <div key={color} style={{width: 10, height: 10, borderRadius: '50%', background: color, opacity: 0.82}} />)}
-      </div>
-      <div style={{fontFamily: mono, color: C.muted, fontSize: 15, marginLeft: 8}}>{title}</div>
-      <div style={{marginLeft: 'auto', fontFamily: mono, color: C.green, fontSize: 14}}>● MCP READY</div>
-    </div>
-    {children}
-  </div>
-);
-
-const Message: React.FC<{
-  role: 'user' | 'agent';
-  children: React.ReactNode;
-  opacity?: number;
-  compact?: boolean;
-}> = ({role, children, opacity = 1, compact = false}) => (
-  <div style={{display: 'grid', gridTemplateColumns: compact ? '74px 1fr' : '90px 1fr', gap: 18, opacity}}>
-    <div style={{fontFamily: mono, color: role === 'agent' ? C.green : C.blue, fontSize: compact ? 15 : 17, paddingTop: 4}}>
-      {role === 'agent' ? 'AGENT' : 'YOU'}
-    </div>
-    <div style={{color: C.paper, fontSize: compact ? 20 : 25, lineHeight: 1.48}}>{children}</div>
-  </div>
-);
-
-const ToolCall: React.FC<{
-  name: string;
-  detail: string;
-  result: string;
-  tone?: 'green' | 'amber';
-  opacity?: number;
-}> = ({name, detail, result, tone = 'green', opacity = 1}) => {
-  const color = tone === 'amber' ? C.amber : C.green;
-  return (
-    <div
-      style={{
-        border: `1px solid ${color}44`,
-        background: `${color}0a`,
-        borderRadius: 14,
-        padding: '15px 18px',
-        opacity,
-      }}
-    >
-      <div style={{display: 'flex', alignItems: 'center', gap: 14}}>
-        <div style={{fontFamily: mono, color, fontSize: 17}}>{name}</div>
-        <div style={{fontFamily: mono, color: C.muted, fontSize: 14}}>{detail}</div>
-        <div style={{marginLeft: 'auto', fontFamily: mono, color, fontSize: 14}}>✓ {result}</div>
-      </div>
-    </div>
-  );
-};
-
 const Hook: React.FC = () => {
   const frame = useCurrentFrame();
   const {fps} = useVideoConfig();
@@ -203,119 +150,41 @@ const Hook: React.FC = () => {
 
 const AgentBrief: React.FC = () => {
   const frame = useCurrentFrame();
-  const userIn = appear(frame, 18, 15);
-  const agentIn = appear(frame, 62, 16);
-  const planIn = appear(frame, 98, 20);
+  const typed = Math.floor(interpolate(frame, [22, 72], [0, 122], clamp));
+  const prompt = 'Explore this ESP32. Start read-only, preserve the evidence, and turn verified behavior into a reusable command.';
   return (
     <Scene duration={210}>
-      <div style={{position: 'absolute', inset: '66px 92px'}}>
-        <div style={{display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 26}}>
-          <div>
-            <Pill>01 · NATURAL-LANGUAGE INTENT</Pill>
-            <h1 style={{color: C.paper, fontSize: 54, letterSpacing: -2.5, margin: '20px 0 0'}}>The agent starts with your goal—and a safety boundary.</h1>
-          </div>
-          <Pill tone="blue">OPENBAUD MCP</Pill>
-        </div>
-        <ChatShell>
-          <div style={{padding: '34px 40px', display: 'flex', flexDirection: 'column', gap: 30}}>
-            <Message role="user" opacity={userIn}>
-              Explore this ESP32. Start read-only, preserve the evidence, and turn verified behavior into a reusable command.
-            </Message>
-            <Message role="agent" opacity={agentIn}>
-              I’ll identify it by USB metadata, open it at the known transport settings, capture before sending, then validate every response before I save anything.
-            </Message>
-            <div style={{opacity: planIn, display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 13, marginLeft: 108}}>
-              {[
-                ['1', 'Identify', 'read-only'],
-                ['2', 'Capture', 'lossless'],
-                ['3', 'Verify', 'CRC first'],
-                ['4', 'Save', 'typed command'],
-              ].map(([n, title, note]) => (
-                <div key={n} style={{border: `1px solid ${C.line}`, background: C.panel, borderRadius: 13, padding: '15px 16px'}}>
-                  <div style={{fontFamily: mono, color: C.green, fontSize: 14}}>0{n}</div>
-                  <div style={{color: C.paper, fontSize: 19, marginTop: 7}}>{title}</div>
-                  <div style={{fontFamily: mono, color: C.muted, fontSize: 13, marginTop: 4}}>{note}</div>
-                </div>
-              ))}
-            </div>
-          </div>
-        </ChatShell>
-        <div style={{position: 'absolute', bottom: 2, left: 0, right: 0, display: 'flex', justifyContent: 'center', gap: 22, color: C.muted, fontFamily: mono, fontSize: 15}}>
-          <span style={{color: C.green}}>AGENT</span><span>owns intent + reasoning</span><span>·</span><span style={{color: C.blue}}>OPENBAUD</span><span>owns transport + audit + evidence</span>
-        </div>
-      </div>
+      <CodexScreen title="Explore the ESP32 with OpenBaud" activeTask="Explore the ESP32" step={1} composerLabel={frame < 76 ? `${prompt.slice(0, typed)}${frame % 18 < 9 ? '|' : ''}` : 'Ask for follow-up changes'} composerState={frame < 76 ? 'typing' : frame < 190 ? 'running' : 'idle'} cursorMode="send">
+        <UserPrompt opacity={uiAppear(frame, 77, 7)}>{prompt}</UserPrompt>
+        <div style={{height: 1, background: '#e7e6e2', opacity: uiAppear(frame, 92)}} />
+        <AgentText opacity={uiAppear(frame, 103)}>
+          I’ll start by checking the OpenBaud device workflow, then identify the board by USB metadata. I’ll capture before sending a bounded probe, validate every response, and avoid persistent state changes.
+        </AgentText>
+        <StatusLine opacity={uiAppear(frame, 132)} active={frame < 174}>Reading the OpenBaud skill and planning a safe probe</StatusLine>
+        <div style={{opacity: uiAppear(frame, 164), color: '#777671', fontSize: 13}}>Starting with read-only discovery. No port has been opened yet.</div>
+      </CodexScreen>
     </Scene>
   );
 };
 
 const ToolLoop: React.FC = () => {
   const frame = useCurrentFrame();
-  const tools = [
-    ['openbaud.list_ports', '{}', 'Espressif · available'],
-    ['openbaud.open', '115200 · 8N1', 'session s2'],
-    ['openbaud.capture_start', 'lossless RX/TX', 'recording'],
-    ['openbaud.request', '10 B bounded probe', '196 B · CRC valid'],
-    ['openbaud.capture_stop', 'persist evidence', 'obp1-radar-seq42.obcap'],
-  ];
-  const active = Math.min(tools.length - 1, Math.floor(Math.max(0, frame - 42) / 48));
+  const scrollY = interpolate(frame, [190, 310], [0, 190], clamp);
   return (
     <Scene duration={330}>
-      <div style={{position: 'absolute', inset: '58px 82px'}}>
-        <div style={{display: 'flex', alignItems: 'end', justifyContent: 'space-between', marginBottom: 28}}>
-          <div>
-            <Pill>02 · AGENT TOOL LOOP</Pill>
-            <h1 style={{color: C.paper, fontSize: 62, letterSpacing: -3, margin: '22px 0 0'}}>Every action is visible. Every write is audited.</h1>
-          </div>
-          <div style={{fontFamily: mono, color: C.muted, fontSize: 16}}>LIVE · /dev/cu.usbmodem213101</div>
-        </div>
-        <div style={{display: 'grid', gridTemplateColumns: '0.9fr 1.1fr', gap: 34}}>
-          <ChatShell title="Codex · task transcript">
-            <div style={{padding: '29px 32px', display: 'flex', flexDirection: 'column', gap: 26}}>
-              <Message role="agent" compact opacity={appear(frame, 18)}>
-                The USB identity matches the test board. I’ll capture first, then send one bounded probe; no persistent state change is expected.
-              </Message>
-              <div style={{height: 1, background: C.line}} />
-              <Message role="agent" compact opacity={appear(frame, 250)}>
-                The frame is complete and its checksum passes. I’ll repeat the probe, compare the records, then encode the verified behavior as a command.
-              </Message>
-              <div style={{opacity: appear(frame, 292), borderLeft: `3px solid ${C.green}`, padding: '13px 17px', background: 'rgba(97,242,176,.05)'}}>
-                <div style={{fontFamily: mono, color: C.green, fontSize: 15}}>DECISION</div>
-                <div style={{color: C.paper, fontSize: 19, marginTop: 6}}>Safe to sediment: 8/8 bounded probes valid</div>
-              </div>
-            </div>
-          </ChatShell>
-          <div style={{background: 'rgba(13,26,23,.9)', border: `1px solid ${C.line}`, borderRadius: 25, padding: '25px 27px'}}>
-            <div style={{fontFamily: mono, color: C.muted, fontSize: 15, marginBottom: 18}}>TOOL CALLS · WRITE AUDIT IS APPEND-ONLY</div>
-            <div style={{display: 'flex', flexDirection: 'column', gap: 12}}>
-              {tools.map(([name, detail, result], i) => (
-                <ToolCall
-                  key={name}
-                  name={name}
-                  detail={detail}
-                  result={result}
-                  tone={i === 3 ? 'amber' : 'green'}
-                  opacity={appear(frame, 40 + i * 48)}
-                />
-              ))}
-            </div>
-            <div style={{marginTop: 16, display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10, opacity: appear(frame, 278)}}>
-              {[
-                ['8', 'requests'],
-                ['0', 'CRC errors'],
-                ['36', 'records / frame'],
-              ].map(([value, label]) => (
-                <div key={label} style={{background: C.panel2, borderRadius: 12, padding: 13, textAlign: 'center', border: `1px solid ${C.line}`}}>
-                  <div style={{fontFamily: mono, color: C.paper, fontSize: 23}}>{value}</div>
-                  <div style={{fontFamily: mono, color: C.muted, fontSize: 12, marginTop: 3}}>{label}</div>
-                </div>
-              ))}
-            </div>
-            <div style={{height: 5, borderRadius: 99, background: '#172a25', marginTop: 16, overflow: 'hidden'}}>
-              <div style={{height: '100%', width: `${((active + 1) / tools.length) * 100}%`, background: `linear-gradient(90deg, ${C.green}, ${C.lime})`}} />
-            </div>
-          </div>
-        </div>
-      </div>
+      <CodexScreen title="Explore the ESP32 with OpenBaud" activeTask="Explore the ESP32" step={frame > 274 ? 4 : frame > 165 ? 3 : 2} changed={frame > 285} scrollY={scrollY} composerState={frame < 318 ? 'running' : 'idle'} cursorMode={frame > 275 ? 'review' : 'tools'}>
+        <AgentText opacity={uiAppear(frame, 8)}>The device path can change, so I’m resolving the board by its Espressif USB identity before opening it.</AgentText>
+        <ToolResult title="openbaud.list_ports" opacity={uiAppear(frame, 24)} result={<><span style={{color: '#30a46c'}}>available</span>  /dev/cu.usbmodem213101<br />Espressif · USB JTAG/serial debug unit</>} />
+        <AgentText opacity={uiAppear(frame, 70)}>The USB identity matches the test ESP32-S3. I’ll use 115200 8N1 and start a lossless capture before the first write.</AgentText>
+        <ToolResult title="openbaud.open" detail="115200 · 8N1" opacity={uiAppear(frame, 92)} result={<>session_id: s2<br />port: /dev/cu.usbmodem213101</>} />
+        <ToolResult title="openbaud.capture_start" detail="RX + TX" opacity={uiAppear(frame, 128)} result={<>path: captures/cap-1787501849676-s4.obcap</>} />
+        <ToolResult title="openbaud.request" detail="10-byte bounded probe" active={frame >= 164 && frame < 193} opacity={uiAppear(frame, 164)} result={frame >= 193 ? <>response: 196 bytes · <span style={{color: '#30a46c'}}>CRC-16 valid</span><br />sequence: 42 · records: 36</> : undefined} />
+        <AgentText opacity={uiAppear(frame, 216)}>The response is complete, sequence 42 is echoed, and CRC-16 passes. The 196-byte frame deterministically decodes to the 36-record schema.</AgentText>
+        <ToolResult title="openbaud.capture_stop" opacity={uiAppear(frame, 244)} result={<>path: captures/cap-1787501849676-s4.obcap<br />chunks: 3 · bytes: 206</>} />
+        <StatusLine opacity={uiAppear(frame, 268)}>Preserved as captures/obp1-radar-seq42.obcap</StatusLine>
+        <StatusLine opacity={uiAppear(frame, 282)}>Verified from capture; safe to save as a read-only command</StatusLine>
+        <EditSummary opacity={uiAppear(frame, 294)} />
+      </CodexScreen>
     </Scene>
   );
 };
@@ -465,23 +334,14 @@ const Evidence: React.FC = () => {
 
 const Replay: React.FC = () => {
   const frame = useCurrentFrame();
-  const progress = interpolate(frame, [34, 82], [0, 1], clamp);
   return (
     <Scene duration={120}>
-      <div style={{position: 'absolute', inset: '88px 100px', display: 'grid', gridTemplateColumns: '.82fr 1.18fr', gap: 76, alignItems: 'center'}}>
-        <div>
-          <Pill>05 · NEXT AGENT, NO BOARD</Pill>
-          <h1 style={{fontSize: 65, color: C.paper, lineHeight: 1.04, letterSpacing: -3, margin: '28px 0 20px'}}>Capabilities survive the conversation.</h1>
-          <p style={{fontSize: 24, color: C.muted, lineHeight: 1.45}}>A future task—or CI—can invoke the same named command against the lossless capture.</p>
-        </div>
-        <ChatShell title="Codex · new task">
-          <div style={{padding: '27px 31px', display: 'flex', flexDirection: 'column', gap: 20}}>
-            <Message role="user" compact>Re-run the ESP32 parser without the board.</Message>
-            <ToolCall name="openbaud.run_command" detail="port = replay:obp1-radar-seq42.obcap" result={progress > .92 ? 'normal · 36 records' : 'replaying'} opacity={appear(frame, 20)} />
-            <div style={{height: 6, borderRadius: 99, background: '#172a25', overflow: 'hidden'}}><div style={{height: '100%', width: `${progress * 100}%`, background: `linear-gradient(90deg, ${C.green}, ${C.lime})`}} /></div>
-          </div>
-        </ChatShell>
-      </div>
+      <CodexScreen title="Replay the ESP32 capture" activeTask="Replay without hardware" step={frame > 84 ? 4 : 3} composerState={frame < 103 ? 'running' : 'idle'} cursorMode="replay">
+        <UserPrompt>Re-run the ESP32 parser without the board and confirm the saved command still produces structured data.</UserPrompt>
+        <AgentText opacity={uiAppear(frame, 15)}>I’ll invoke the saved command against the lossless capture, so this run is deterministic and does not require the serial device.</AgentText>
+        <ToolResult title="openbaud.run_command" detail="replay:obp1-radar-seq42.obcap" active={frame >= 42 && frame < 76} opacity={uiAppear(frame, 40)} result={frame >= 76 ? <><span style={{color: '#30a46c'}}>normal</span> · CRC valid · 36 records<br />source: capture replay · hardware: not required</> : undefined} />
+        <AgentText opacity={uiAppear(frame, 91)}>Replay passed. The parser produced the same typed radar frame, so the capability can now be reused by another task or CI.</AgentText>
+      </CodexScreen>
     </Scene>
   );
 };

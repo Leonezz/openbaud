@@ -10,6 +10,13 @@ generated from
 ESP32-S3 test board. `pnpm extract` validates each CRC and materializes the eight
 36-point frames in `src/radar-scans.json`.
 
+The agent sequences use a purpose-built Codex screen reconstruction based on a
+current macOS Codex window reference. It reproduces the real app's workspace
+layout, transcript density, inline tool states, output blocks, edit summary,
+composer, cursor movement, and task progress. No private task screenshot is
+embedded in the public video; all on-screen task names and transcript content
+are staged for this demonstration.
+
 ## Build
 
 ```sh
