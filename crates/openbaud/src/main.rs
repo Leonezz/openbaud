@@ -68,7 +68,8 @@ async fn main() {
         Command::Ports => cmd_ports::run(),
         Command::Init { dir } => cmd_init::run(&dir),
         Command::Mcp => {
-            let root = std::env::current_dir().expect("cannot determine current directory");
+            let root = workspace::resolve_mcp_workspace_root()
+                .expect("cannot determine MCP workspace directory");
             let ctx = || -> anyhow::Result<Arc<mcp::Ctx>> {
                 Ok(Arc::new(mcp::Ctx {
                     sessions: engine::session::SessionManager::default(),

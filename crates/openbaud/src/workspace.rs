@@ -7,6 +7,32 @@ use openbaud_core::format::{parse_command, parse_profile, parse_workflow, Comman
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+/// Resolve the task workspace when an installed Codex plugin starts OpenBaud.
+///
+/// Codex resolves a plugin MCP's relative command by starting it in the plugin
+/// root. For a native executable, the inherited `PWD` still carries the task's
+/// original working directory. Only trust that value when the actual cwd is
+/// recognizably a plugin root; ordinary CLI launches continue to use cwd.
+pub fn resolve_mcp_workspace_root() -> anyhow::Result<PathBuf> {
+    let cwd = std::env::current_dir().context("cannot determine current directory")?;
+    Ok(resolve_mcp_workspace_root_from(
+        &cwd,
+        std::env::var_os("PWD").map(PathBuf::from).as_deref(),
+    ))
+}
+
+fn resolve_mcp_workspace_root_from(cwd: &Path, inherited_pwd: Option<&Path>) -> PathBuf {
+    let plugin_manifest = cwd.join(".codex-plugin").join("plugin.json");
+    if plugin_manifest.is_file() {
+        if let Some(task_root) = inherited_pwd {
+            if task_root.is_absolute() && task_root.is_dir() && task_root != cwd {
+                return task_root.to_path_buf();
+            }
+        }
+    }
+    cwd.to_path_buf()
+}
+
 #[derive(Debug, Clone)]
 pub struct Workspace {
     pub root: PathBuf,
@@ -229,5 +255,44 @@ impl Device {
             .iter()
             .map(|b| format!("broken file ignored: {} ({})", b.path, b.reason))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_mcp_workspace_root_from;
+    use std::path::Path;
+
+    #[test]
+    fn ordinary_mcp_launch_uses_actual_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        assert_eq!(
+            resolve_mcp_workspace_root_from(dir.path(), Some(other.path())),
+            dir.path()
+        );
+    }
+
+    #[test]
+    fn plugin_mcp_launch_recovers_inherited_task_cwd() {
+        let plugin = tempfile::tempdir().unwrap();
+        let task = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(plugin.path().join(".codex-plugin")).unwrap();
+        std::fs::write(plugin.path().join(".codex-plugin/plugin.json"), "{}").unwrap();
+        assert_eq!(
+            resolve_mcp_workspace_root_from(plugin.path(), Some(task.path())),
+            task.path()
+        );
+    }
+
+    #[test]
+    fn plugin_mcp_launch_ignores_invalid_inherited_pwd() {
+        let plugin = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(plugin.path().join(".codex-plugin")).unwrap();
+        std::fs::write(plugin.path().join(".codex-plugin/plugin.json"), "{}").unwrap();
+        assert_eq!(
+            resolve_mcp_workspace_root_from(plugin.path(), Some(Path::new("relative"))),
+            plugin.path()
+        );
     }
 }

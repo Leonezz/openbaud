@@ -6,8 +6,8 @@ lossless captures, replay, and a hardware-exploration skill.
 
 ## Install the Codex plugin
 
-Register this Git repository as the `openbaud` marketplace and install its
-plugin:
+Register this Git repository as the `openbaud-marketplace` marketplace and
+install its plugin:
 
 ```sh
 codex plugin marketplace add Leonezz/openbaud
@@ -21,14 +21,14 @@ Use OpenBaud to list the serial devices connected to this computer.
 ```
 
 The plugin bundles its native MCP runtime; users do not need Rust, Cargo,
-Homebrew, or an install hook. The v0.1.1 bundle currently supports macOS Apple
+Homebrew, or an install hook. The v0.1.2 bundle currently supports macOS Apple
 Silicon. The binary is ad-hoc signed for Git-based preview distribution but is
 not yet Apple-notarized.
 
 To pin the current release rather than follow the default branch:
 
 ```sh
-codex plugin marketplace add Leonezz/openbaud --ref v0.1.1
+codex plugin marketplace add Leonezz/openbaud --ref v0.1.2
 codex plugin add openbaud@openbaud-marketplace
 ```
 
@@ -42,14 +42,25 @@ codex plugin add openbaud@openbaud-marketplace
 
 ### Upgrade from v0.1.0
 
-v0.1.1 gives the Marketplace and Plugin distinct identifiers. This avoids an
-ambiguous repeated cache path in Codex while keeping the user-facing name
-OpenBaud:
+The marketplace and plugin now use distinct identifiers. Remove the original
+ambiguous installation before installing v0.1.2:
 
 ```sh
 codex plugin remove openbaud@openbaud
 codex plugin marketplace remove openbaud
-codex plugin marketplace add Leonezz/openbaud --ref v0.1.1
+codex plugin marketplace add Leonezz/openbaud --ref v0.1.2
+codex plugin add openbaud@openbaud-marketplace
+```
+
+### Upgrade from v0.1.1
+
+v0.1.2 fixes installed MCP startup while preserving the task workspace for
+device profiles and captures:
+
+```sh
+codex plugin remove openbaud@openbaud-marketplace
+codex plugin marketplace remove openbaud-marketplace
+codex plugin marketplace add Leonezz/openbaud --ref v0.1.2
 codex plugin add openbaud@openbaud-marketplace
 ```
 

@@ -3,8 +3,6 @@ set -eu
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 plugin_root=$(CDPATH= cd -- "$script_dir/.." && pwd)
-launcher="$plugin_root/scripts/launch-openbaud"
-
 test_root=$(mktemp -d "${TMPDIR:-/tmp}/openbaud-plugin-smoke.XXXXXX")
 trap 'rm -rf "$test_root"' EXIT HUP INT TERM
 
@@ -12,14 +10,14 @@ request_file="$test_root/requests.jsonl"
 response_file="$test_root/responses.jsonl"
 
 printf '%s\n' \
-  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"openbaud-plugin-smoke","version":"0.1.1"}}}' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"openbaud-plugin-smoke","version":"0.1.2"}}}' \
   '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}' \
   '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
   > "$request_file"
 
 (
-  cd "$test_root"
-  "$launcher" mcp < "$request_file" > "$response_file"
+  cd "$plugin_root"
+  env PWD="$test_root" ./bin/darwin-arm64/openbaud mcp < "$request_file" > "$response_file"
 )
 
 python3 - "$response_file" "$test_root" "$plugin_root/.codex-plugin/plugin.json" <<'PY'
@@ -33,6 +31,7 @@ by_id = {item.get("id"): item for item in responses}
 server = by_id[1]["result"]["serverInfo"]
 tools = by_id[2]["result"]["tools"]
 manifest = json.loads(pathlib.Path(sys.argv[3]).read_text())
+mcp_config = json.loads(pathlib.Path(sys.argv[3]).parents[1].joinpath(".mcp.json").read_text())
 names = {tool["name"] for tool in tools}
 required = {
     "list_ports",
@@ -54,6 +53,11 @@ if server["version"] != manifest["version"]:
     raise SystemExit(
         f"runtime version {server['version']} does not match plugin {manifest['version']}"
     )
+server_config = mcp_config["mcpServers"]["openbaud"]
+if server_config.get("cwd") != ".":
+    raise SystemExit("plugin MCP cwd must resolve relative to the plugin root")
+if server_config.get("command") != "./bin/darwin-arm64/openbaud":
+    raise SystemExit("plugin MCP must launch the native runtime directly")
 if names != required:
     raise SystemExit(f"unexpected tools: {sorted(names)}")
 
