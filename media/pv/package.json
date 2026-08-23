@@ -1,0 +1,23 @@
+{
+  "name": "openbaud-pv",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "extract": "node scripts/extract-capture.mjs",
+    "studio": "remotion studio src/index.ts",
+    "render": "remotion render src/index.ts OpenBaudPV ../../dist/openbaud-pv-silent.mp4 --codec h264 --crf 18",
+    "final": "bash scripts/render-final.sh",
+    "still": "remotion still src/index.ts OpenBaudPV ../../docs/assets/openbaud-pv-poster.png --frame 780"
+  },
+  "dependencies": {
+    "@remotion/cli": "4.0.515",
+    "react": "19.1.1",
+    "react-dom": "19.1.1",
+    "remotion": "4.0.515"
+  },
+  "devDependencies": {
+    "@types/react": "19.1.12",
+    "@types/react-dom": "19.1.9",
+    "typescript": "5.9.2"
+  }
+}

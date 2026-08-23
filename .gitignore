@@ -3,13 +3,19 @@ Cargo.lock.orig
 .DS_Store
 __pycache__/
 *.py[cod]
+node_modules/
+/dist/
 
 # Local working material, not part of the shipped repo:
 # - root-level workspace artifacts from ad-hoc exploration sessions
 # - testbench/ (local hardware acceptance rig and its device knowledge)
-# - docs/ (internal working notes and design drafts)
-/.openbaud/
+# - most of docs/ (internal working notes and design drafts)
+**/.openbaud/
 /captures/
 /devices/
 /testbench/
-/docs/
+/docs/*
+!/docs/assets/
+!/docs/assets/**
+!/docs/launch/
+!/docs/launch/**
