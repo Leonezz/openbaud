@@ -32,6 +32,14 @@ case "$kernel:$machine" in
 esac
 
 destination="$plugin_root/bin/$bundle_target/openbaud"
+cargo_home=${CARGO_HOME:-$(CDPATH= cd -- "$(dirname -- "$(command -v cargo)")/.." && pwd)}
+rust_sysroot=$(rustc --print sysroot)
+remap_flags="--remap-path-prefix=$repo_root=/workspace/openbaud --remap-path-prefix=$cargo_home=/cargo-home --remap-path-prefix=$rust_sysroot=/rust-toolchain"
+if [ -n "${RUSTFLAGS:-}" ]; then
+  export RUSTFLAGS="$RUSTFLAGS $remap_flags"
+else
+  export RUSTFLAGS="$remap_flags"
+fi
 
 cd "$repo_root"
 cargo build --locked --release --package openbaud --target "$rust_target"
