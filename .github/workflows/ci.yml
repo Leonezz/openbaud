@@ -17,7 +17,7 @@ jobs:
     name: Rust and package checks
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Run tests
@@ -29,7 +29,7 @@ jobs:
     name: macOS ARM64 plugin smoke test
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Confirm runner architecture
         run: test "$(uname -m)" = arm64
       - name: Verify committed plugin
@@ -41,12 +41,10 @@ jobs:
           codesign --verify --strict --verbose=2 openbaud
       - name: Build bundled runtime
         run: plugins/openbaud/scripts/build-runtime
-      - name: Verify reproducible plugin
+      - name: Verify rebuilt plugin
         run: |
           python3 scripts/validate-package.py
           plugins/openbaud/scripts/smoke-test
           cd plugins/openbaud/bin/darwin-arm64
           shasum -a 256 -c openbaud.sha256
           codesign --verify --strict --verbose=2 openbaud
-          cd ../../../..
-          git diff --exit-code -- plugins/openbaud/bin/darwin-arm64

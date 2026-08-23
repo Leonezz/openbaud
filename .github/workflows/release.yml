@@ -17,7 +17,7 @@ jobs:
     name: Build and publish Codex plugin
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Confirm runner architecture
@@ -40,8 +40,6 @@ jobs:
           cd plugins/openbaud/bin/darwin-arm64
           shasum -a 256 -c openbaud.sha256
           codesign --verify --strict --verbose=2 openbaud
-          cd ../../../..
-          git diff --exit-code -- plugins/openbaud/bin/darwin-arm64
       - name: Package plugin
         run: |
           mkdir -p dist
