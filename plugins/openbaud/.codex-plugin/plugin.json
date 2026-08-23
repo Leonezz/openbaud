@@ -1,0 +1,40 @@
+{
+  "name": "openbaud",
+  "version": "0.1.0",
+  "description": "Explore, understand, profile, and automate local serial hardware with OpenBaud.",
+  "author": {
+    "name": "OpenBaud",
+    "url": "https://github.com/Leonezz"
+  },
+  "homepage": "https://github.com/Leonezz/openbaud",
+  "repository": "https://github.com/Leonezz/openbaud",
+  "license": "MIT",
+  "keywords": [
+    "serial",
+    "hardware",
+    "modbus",
+    "radar",
+    "mcp"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "OpenBaud",
+    "shortDescription": "Explore and automate serial hardware",
+    "longDescription": "Discover serial devices, reverse-engineer protocols, capture traffic, and turn verified behavior into reusable commands and workflows. The bundled local runtime keeps device access and captures on your computer.",
+    "developerName": "OpenBaud",
+    "category": "Developer Tools",
+    "websiteURL": "https://github.com/Leonezz/openbaud",
+    "capabilities": [
+      "Read",
+      "Write",
+      "Local hardware"
+    ],
+    "defaultPrompt": [
+      "Explore the serial devices connected to this computer.",
+      "Analyze this device's Modbus protocol and record verified commands.",
+      "Capture and visualize timing data from this radar device."
+    ],
+    "brandColor": "#0B6B61"
+  }
+}

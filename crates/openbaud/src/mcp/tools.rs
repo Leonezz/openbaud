@@ -46,13 +46,41 @@ fn arg_max_inline(args: &Value) -> anyhow::Result<usize> {
 }
 
 pub fn list() -> Vec<Value> {
-    let ro = json!({ "readOnlyHint": true });
+    // Codex uses all three MCP behavior hints when deciding how prominently to
+    // surface a tool and whether an invocation needs extra user attention.
+    // A serial device is an external entity, so hardware I/O is open-world even
+    // though OpenBaud itself does not use the network.
+    let read_only_local = json!({
+        "readOnlyHint": true,
+        "openWorldHint": false,
+        "destructiveHint": false
+    });
+    let read_only_hardware = json!({
+        "readOnlyHint": true,
+        "openWorldHint": true,
+        "destructiveHint": false
+    });
+    let local_mutation = json!({
+        "readOnlyHint": false,
+        "openWorldHint": false,
+        "destructiveHint": false
+    });
+    let hardware_session = json!({
+        "readOnlyHint": false,
+        "openWorldHint": true,
+        "destructiveHint": false
+    });
+    let hardware_write = json!({
+        "readOnlyHint": false,
+        "openWorldHint": true,
+        "destructiveHint": true
+    });
     vec![
         json!({
             "name": "list_ports",
             "description": "List serial ports (USB metadata included) plus the always-available mock:echo loopback.",
             "inputSchema": { "type": "object", "properties": {} },
-            "annotations": ro,
+            "annotations": read_only_hardware,
         }),
         json!({
             "name": "open",
@@ -66,6 +94,7 @@ pub fn list() -> Vec<Value> {
                 "stop_bits": { "type": "integer", "minimum": 1, "maximum": 2 },
                 "framing": { "type": "object", "description": "One of {delimiter}|{idle_ms}|{length_prefix:{header_len,len_at,len_size,endian,extra}}" }
             }},
+            "annotations": hardware_session,
         }),
         json!({
             "name": "close",
@@ -73,6 +102,7 @@ pub fn list() -> Vec<Value> {
             "inputSchema": { "type": "object", "required": ["session_id"], "properties": {
                 "session_id": { "type": "string" }
             }},
+            "annotations": hardware_session,
         }),
         json!({
             "name": "read",
@@ -83,7 +113,7 @@ pub fn list() -> Vec<Value> {
                 "max_frames": { "type": "integer", "default": 32 },
                 "max_inline_bytes": max_inline_bytes_schema()
             }},
-            "annotations": ro,
+            "annotations": read_only_hardware,
         }),
         json!({
             "name": "send",
@@ -93,6 +123,7 @@ pub fn list() -> Vec<Value> {
                 "hex": { "type": "string" },
                 "text": { "type": "string" }
             }},
+            "annotations": hardware_write,
         }),
         json!({
             "name": "request",
@@ -105,6 +136,7 @@ pub fn list() -> Vec<Value> {
                 "timeout_ms": { "type": "integer", "default": 3000 },
                 "max_inline_bytes": max_inline_bytes_schema()
             }},
+            "annotations": hardware_write,
         }),
         json!({
             "name": "run_command",
@@ -118,6 +150,7 @@ pub fn list() -> Vec<Value> {
                 "acknowledge_risk": { "type": "boolean" },
                 "max_inline_bytes": max_inline_bytes_schema()
             }},
+            "annotations": hardware_write,
         }),
         json!({
             "name": "run_workflow",
@@ -130,6 +163,7 @@ pub fn list() -> Vec<Value> {
                 "acknowledge_risk": { "type": "boolean" },
                 "max_inline_bytes": max_inline_bytes_schema()
             }},
+            "annotations": hardware_write,
         }),
         json!({
             "name": "schema",
@@ -138,7 +172,7 @@ pub fn list() -> Vec<Value> {
                 "kind": { "type": "string", "enum": ["profile", "command", "workflow"] },
                 "example": { "type": "boolean", "default": false, "description": "Return an annotated YAML example instead of the JSON Schema" }
             }},
-            "annotations": ro,
+            "annotations": read_only_local,
         }),
         json!({
             "name": "capture_start",
@@ -147,7 +181,7 @@ pub fn list() -> Vec<Value> {
                 "session_id": { "type": "string" },
                 "note": { "type": "string" }
             }},
-            "annotations": ro,
+            "annotations": local_mutation,
         }),
         json!({
             "name": "capture_stop",
@@ -155,7 +189,7 @@ pub fn list() -> Vec<Value> {
             "inputSchema": { "type": "object", "required": ["session_id"], "properties": {
                 "session_id": { "type": "string" }
             }},
-            "annotations": ro,
+            "annotations": local_mutation,
         }),
     ]
 }

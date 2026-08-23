@@ -1,0 +1,57 @@
+#!/bin/sh
+set -eu
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+plugin_root=$(CDPATH= cd -- "$script_dir/.." && pwd)
+repo_root=$(CDPATH= cd -- "$plugin_root/../.." && pwd)
+
+kernel=$(uname -s 2>/dev/null || printf unknown)
+machine=$(uname -m 2>/dev/null || printf unknown)
+
+case "$kernel:$machine" in
+  Darwin:arm64)
+    rust_target=aarch64-apple-darwin
+    bundle_target=darwin-arm64
+    ;;
+  Darwin:x86_64)
+    rust_target=x86_64-apple-darwin
+    bundle_target=darwin-x64
+    ;;
+  Linux:x86_64)
+    rust_target=x86_64-unknown-linux-gnu
+    bundle_target=linux-x64
+    ;;
+  Linux:aarch64|Linux:arm64)
+    rust_target=aarch64-unknown-linux-gnu
+    bundle_target=linux-arm64
+    ;;
+  *)
+    printf 'Unsupported build host: %s/%s\n' "$kernel" "$machine" >&2
+    exit 64
+    ;;
+esac
+
+destination="$plugin_root/bin/$bundle_target/openbaud"
+
+cd "$repo_root"
+cargo build --locked --release --package openbaud --target "$rust_target"
+
+mkdir -p "$(dirname -- "$destination")"
+install -m 0755 "target/$rust_target/release/openbaud" "$destination"
+
+if [ "$kernel" = Darwin ]; then
+  signing_identity=${OPENBAUD_CODESIGN_IDENTITY:--}
+  if [ "$signing_identity" = "-" ]; then
+    codesign --force --sign - "$destination"
+  else
+    codesign --force --options runtime --timestamp --sign "$signing_identity" "$destination"
+  fi
+  codesign --verify --strict --verbose=2 "$destination"
+fi
+
+"$destination" --version
+(
+  cd "$(dirname -- "$destination")"
+  shasum -a 256 openbaud > openbaud.sha256
+)
+printf 'Bundled runtime: %s\n' "$destination"

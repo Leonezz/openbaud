@@ -332,6 +332,30 @@ async fn broken_command_file_does_not_block_device() {
 async fn tool_list_includes_mock_and_schemas() {
     let listed = tools::list();
     assert_eq!(listed.len(), 11);
+    for tool in &listed {
+        let annotations = tool["annotations"].as_object().unwrap_or_else(|| {
+            panic!("tool {} is missing MCP behavior annotations", tool["name"])
+        });
+        for hint in ["readOnlyHint", "openWorldHint", "destructiveHint"] {
+            assert!(
+                annotations.get(hint).and_then(serde_json::Value::as_bool).is_some(),
+                "tool {} is missing boolean annotation {hint}",
+                tool["name"]
+            );
+        }
+    }
+    for name in ["send", "request", "run_command", "run_workflow"] {
+        let tool = listed.iter().find(|tool| tool["name"] == name).unwrap();
+        assert_eq!(tool["annotations"]["destructiveHint"], json!(true), "tool {name}");
+    }
+    for name in ["list_ports", "read", "schema"] {
+        let tool = listed.iter().find(|tool| tool["name"] == name).unwrap();
+        assert_eq!(tool["annotations"]["readOnlyHint"], json!(true), "tool {name}");
+    }
+    for name in ["list_ports", "open", "close", "read", "send", "request", "run_command", "run_workflow"] {
+        let tool = listed.iter().find(|tool| tool["name"] == name).unwrap();
+        assert_eq!(tool["annotations"]["openWorldHint"], json!(true), "tool {name}");
+    }
     let dir = scaffold_workspace();
     let ctx = ctx_for(&dir);
     let ports = tools::call("list_ports", json!({}), &ctx).await.unwrap();
