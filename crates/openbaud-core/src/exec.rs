@@ -4,7 +4,8 @@
 use crate::checksum::ChecksumKind;
 use crate::codec::{decode_ascii_int, FieldType};
 use crate::format::{
-    Command, CountSpec, Encoding, Expect, ExceptionSpec, FieldSpec, ParseSpec, ValidateSpec,
+    BitsSpec, Command, CountSpec, Encoding, Expect, ExceptionSpec, FieldSpec, ParseSpec, TextType,
+    ValidateSpec,
 };
 use crate::template::{render_text, HexTemplate};
 use crate::CoreError;
@@ -218,7 +219,7 @@ fn parse_with_spec(parse: &ParseSpec, raw: &[u8]) -> crate::Result<Value> {
                     if segment.is_empty() {
                         continue; // e.g. trailing separators
                     }
-                    let value = coerce_text(&split.type_name, segment).map_err(|e| {
+                    let value = coerce_text(&split.type_spec, segment).map_err(|e| {
                         CoreError::Parse(format!(
                             "capture {name:?} element {}: {e}",
                             arr.len() + 1
@@ -228,14 +229,11 @@ fn parse_with_spec(parse: &ParseSpec, raw: &[u8]) -> crate::Result<Value> {
                 }
                 out.insert(name.to_string(), Value::Array(arr));
             } else {
-                let coerce = parse
-                    .types
-                    .as_ref()
-                    .and_then(|t| t.get(name))
-                    .map(String::as_str)
-                    .unwrap_or("string");
-                let value = coerce_text(coerce, m.as_str())
-                    .map_err(|e| CoreError::Parse(format!("capture {name:?}: {e}")))?;
+                let value = match parse.types.as_ref().and_then(|t| t.get(name)) {
+                    Some(t) => coerce_text(t, m.as_str())
+                        .map_err(|e| CoreError::Parse(format!("capture {name:?}: {e}")))?,
+                    None => Value::from(m.as_str()),
+                };
                 out.insert(name.to_string(), value);
             }
         }
@@ -243,21 +241,44 @@ fn parse_with_spec(parse: &ParseSpec, raw: &[u8]) -> crate::Result<Value> {
     Ok(Value::Object(out))
 }
 
-/// Convert one text token per a declared coercion type. The error message
-/// carries the offending token; callers add the capture/element context.
-fn coerce_text(coerce: &str, s: &str) -> crate::Result<Value> {
-    match coerce {
-        "int" => Ok(Value::from(
+/// Convert one text token per a declared coercion type, then run the shared
+/// bits -> scale/offset pipeline. The error message carries the offending
+/// token; callers add the capture/element context.
+fn coerce_text(coerce: &TextType, s: &str) -> crate::Result<Value> {
+    let (type_name, bits, scale, offset) = match coerce {
+        TextType::Name(n) => (n.as_str(), None, None, None),
+        TextType::Spec(spec) => {
+            (spec.type_name.as_str(), spec.bits.as_ref(), spec.scale, spec.offset)
+        }
+    };
+    let value = match type_name {
+        "int" => Value::from(
             s.parse::<i64>()
                 .map_err(|_| CoreError::Parse(format!("{s:?} is not an int")))?,
-        )),
-        "float" => Ok(Value::from(
+        ),
+        "float" => Value::from(
             s.parse::<f64>()
                 .map_err(|_| CoreError::Parse(format!("{s:?} is not a float")))?,
-        )),
-        "hex_int" => Ok(Value::from(parse_hex_int(s)?)),
-        _ => Ok(Value::from(s)),
-    }
+        ),
+        "hex_int" => Value::from(parse_hex_int(s)?),
+        // string: bits/scale/offset are rejected at load time.
+        _ => return Ok(Value::from(s)),
+    };
+    let value = match bits {
+        None => value,
+        Some(b) => {
+            let n = value
+                .as_i64()
+                .expect("load-time validation restricts bits to integer text types");
+            if n < 0 {
+                return Err(CoreError::Parse(format!(
+                    "bits on negative value {n}: bit extraction of a negative number is undefined"
+                )));
+            }
+            Value::from(extract_bits(n as u64, b))
+        }
+    };
+    Ok(apply_linear(value, scale, offset))
 }
 
 /// Parse a hex integer token: optional 0x/0X prefix or bare hex digits,
@@ -271,8 +292,8 @@ fn parse_hex_int(s: &str) -> crate::Result<i64> {
         .map_err(|_| CoreError::Parse(format!("{s:?} is not a hex integer")))
 }
 
-/// Decode one scalar occurrence of `field` at absolute offset `at`, applying
-/// `scale`. `name` is only for error context.
+/// Decode one scalar occurrence of `field` at absolute offset `at`, running
+/// the bits -> scale/offset pipeline. `name` is only for error context.
 fn decode_scalar_at(field: &FieldSpec, raw: &[u8], at: usize, name: &str) -> crate::Result<Value> {
     let type_name = field
         .type_name
@@ -287,13 +308,36 @@ fn decode_scalar_at(field: &FieldSpec, raw: &[u8], at: usize, name: &str) -> cra
     } else {
         ty.decode(raw, at)?
     };
-    Ok(match field.scale {
-        Some(scale) => {
-            let n = value.as_f64().expect("binary decode always yields a number");
-            Value::from(round10(n * scale))
-        }
+    let value = match &field.bits {
         None => value,
-    })
+        Some(bits) => {
+            let n = value
+                .as_u64()
+                .expect("load-time validation restricts bits to unsigned integer types");
+            Value::from(extract_bits(n, bits))
+        }
+    };
+    Ok(apply_linear(value, field.scale, field.offset))
+}
+
+/// `(raw >> lsb) & mask(width)` — load-time validation guarantees
+/// `lsb + width <= 63` (text) or the type's bit width (binary), so the shifts
+/// cannot overflow.
+fn extract_bits(raw: u64, bits: &BitsSpec) -> u64 {
+    (raw >> bits.lsb) & ((1u64 << bits.width) - 1)
+}
+
+/// The canonical linear transform `value x scale + offset` (scale defaults
+/// to 1, offset to 0). Either present makes the result a rounded f64; both
+/// absent leave the value untouched.
+fn apply_linear(value: Value, scale: Option<f64>, offset: Option<f64>) -> Value {
+    match (scale, offset) {
+        (None, None) => value,
+        (scale, offset) => {
+            let n = value.as_f64().expect("decode always yields a number here");
+            Value::from(round10(n * scale.unwrap_or(1.0) + offset.unwrap_or(0.0)))
+        }
+    }
 }
 
 /// Byte width of one scalar occurrence: the type's size, or `len` for
@@ -1056,6 +1100,135 @@ response:
         assert!(parse_hex_int("0x").is_err());
         assert!(parse_hex_int("0xZZ").is_err());
         assert!(parse_hex_int("12.5").is_err());
+    }
+
+    // -- bits and offset --
+
+    const LIDAR_CMD: &str = r#"
+schema: openbaud/command@v0
+name: lidar_node
+frame: { hex: "A5 20" }
+response:
+  match: { length: 5 }
+  parse:
+    fields:
+      node:
+        at: 0
+        count: 1
+        stride: 5
+        elements:
+          start_flag: { at: 0, type: u8,    bits: { lsb: 0, width: 1 } }
+          quality:    { at: 0, type: u8,    bits: { lsb: 2, width: 6 } }
+          angle_deg:  { at: 1, type: u16le, bits: { lsb: 1, width: 15 }, scale: 0.015625 }
+          dist_mm:    { at: 3, type: u16le, scale: 0.25 }
+"#;
+
+    #[test]
+    fn bits_same_byte_fields_and_u16le_extraction() {
+        let cmd = parse_command(LIDAR_CMD, "c.yaml").unwrap();
+        // Byte 0 packs quality 45 in bits [7:2] and the start flag in bit 0.
+        // Angle raw 0x02C3 (LE on the wire) >> 1 = 0x0161 = 353;
+        // 353 x 0.015625 = 5.515625 deg.
+        let frame = [(45u8 << 2) | 0b01, 0xC3, 0x02, 0x40, 0x06];
+        let parsed = parse_response(&cmd, &frame).unwrap();
+        assert_eq!(
+            parsed,
+            json!({"node": [{
+                "start_flag": 1,
+                "quality": 45,
+                "angle_deg": 5.515625,
+                "dist_mm": 400.0,
+            }]})
+        );
+
+        // width-1 fields yield the numbers 0/1, not booleans.
+        let frame = [45u8 << 2, 0xC3, 0x02, 0x40, 0x06];
+        let parsed = parse_response(&cmd, &frame).unwrap();
+        let flag = &parsed["node"][0]["start_flag"];
+        assert_eq!(flag, &json!(0));
+        assert!(flag.is_u64() && !flag.is_boolean());
+    }
+
+    const OFFSET_CMD: &str = r#"
+schema: openbaud/command@v0
+name: read_temp
+frame: { hex: "01" }
+response:
+  match: { length: 2 }
+  parse:
+    fields:
+      temp_c:  { at: 0, type: u8, offset: -40 }
+      power_w: { at: 1, type: u8, scale: 0.5, offset: -10 }
+"#;
+
+    #[test]
+    fn offset_makes_float_and_applies_after_scale() {
+        let cmd = parse_command(OFFSET_CMD, "c.yaml").unwrap();
+        let parsed = parse_response(&cmd, &[65, 200]).unwrap();
+        // offset alone turns the integer into a float: 65 - 40 = 25.0.
+        // Order is raw x scale + offset: 200 x 0.5 - 10 = 90.0.
+        assert_eq!(parsed, json!({"temp_c": 25.0, "power_w": 90.0}));
+        assert!(parsed["temp_c"].is_f64());
+        assert!(parsed["power_w"].is_f64());
+    }
+
+    const TEXT_OBJ_CMD: &str = r#"
+schema: openbaud/command@v0
+name: obd_status
+frame: { text: "0105\r" }
+response:
+  match: { delimiter: "\r" }
+  parse:
+    regex: '41 05 (?P<temp>[0-9A-Fa-f]+) (?P<flags>[0-9A-Fa-f]+) (?P<values>\S*)'
+    types:
+      temp:  { type: hex_int, offset: -40 }
+      flags: { type: hex_int, bits: { lsb: 4, width: 4 } }
+    split:
+      values: { sep: ",", type: { type: int, scale: 0.5, offset: 1 } }
+"#;
+
+    #[test]
+    fn text_object_types_share_the_binary_pipeline() {
+        let cmd = parse_command(TEXT_OBJ_CMD, "c.yaml").unwrap();
+        // temp 0x5A = 90 - 40 = 50.0; flags 0xB3 >> 4 & 0xF = 11;
+        // split elements: n x 0.5 + 1.
+        let parsed = parse_response(&cmd, b"41 05 5A B3 2,4\r").unwrap();
+        assert_eq!(parsed, json!({"temp": 50.0, "flags": 11, "values": [2.0, 3.0]}));
+        assert!(parsed["temp"].is_f64());
+    }
+
+    const NEG_BITS_CMD: &str = r#"
+schema: openbaud/command@v0
+name: neg_bits
+frame: { text: "Q?\r" }
+response:
+  match: { delimiter: "\r" }
+  parse:
+    regex: 'V=(?P<x>-?\d+)'
+    types:
+      x: { type: int, bits: { lsb: 0, width: 4 } }
+"#;
+
+    #[test]
+    fn bits_on_negative_text_value_is_loud() {
+        let cmd = parse_command(NEG_BITS_CMD, "c.yaml").unwrap();
+        // Non-negative values extract normally: 0b10110 & 0xF = 6.
+        let parsed = parse_response(&cmd, b"V=22\r").unwrap();
+        assert_eq!(parsed, json!({"x": 6}));
+
+        let err = parse_response(&cmd, b"V=-5\r").unwrap_err();
+        assert!(err.to_string().contains("negative"), "{err}");
+        assert!(err.to_string().contains("\"x\""), "{err}");
+    }
+
+    #[test]
+    fn plain_string_types_still_work_unchanged() {
+        // Regression: bare-string types/split notation from before the
+        // object form must decode identically.
+        let cmd = parse_command(SPLIT_CMD, "c.yaml").unwrap();
+        let parsed = parse_response(&cmd, b"F=0x1AF8 V=1.5,2.5").unwrap();
+        assert_eq!(parsed, json!({"flags": 0x1AF8, "values": [1.5, 2.5]}));
+        assert!(parsed["flags"].is_i64());
     }
 
     #[test]

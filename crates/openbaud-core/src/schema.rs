@@ -31,6 +31,13 @@ hex-frame checksum placeholders ({crc16_modbus}, {xor8}, {sum8}, {sum16be}) cove
 a parse field sets exactly one of type / elements — elements makes a one-level record array and requires count and stride; \
 type ascii_int requires len; \
 count: {field: name} must reference a scalar field of the same parse block; \
+a field decodes as value = ((raw >> bits.lsb) & mask(bits.width)) x scale + offset — \
+bits only on unsigned integer types (u8, u16be, u16le, u32be, u32le, u32me) with lsb + width within the type's bit width, \
+and setting scale or offset makes the value a float; \
+scale/offset/bits/unit go on the element fields of a record array, not on its container; \
+types values and split.type are either a bare type name (int, float, string, hex_int) \
+or an object {type, bits, scale, offset} running the same pipeline — \
+bits only for int/hex_int (a negative value is a runtime error), scale/offset not for string; \
 split only applies to regex parsing, its keys must be named captures, and a capture cannot appear in both types and split; \
 validate.range and validate.at accept negative indices counted from the frame end (-1 = last byte); \
 validate defaults reproduce the classic tail checksum over all preceding bytes.";
@@ -116,6 +123,9 @@ response:
     fields:
       # ascii_int: len bytes of ASCII decimal digits (leading spaces/zeros ok).
       n_samples: { at: 2, type: ascii_int, len: 4 }
+      # Linear calibration is value = raw x scale + offset (scale defaults 1,
+      # offset 0); setting either makes the value a float.
+      temp_c: { at: 5, type: u8, offset: -40, unit: C }
       # Scalar array: count may reference a scalar field decoded first.
       samples:
         at: 6
@@ -124,14 +134,18 @@ response:
         scale: 0.0392          # applied per element
         unit: V
       # Record array: stride bytes per record; element offsets are record-relative.
+      # bits extracts ((raw >> lsb) & mask(width)) before scale/offset; lsb/width
+      # map onto register-table [msb:lsb] notation (width = msb - lsb + 1), only
+      # on unsigned integer types. Several fields may share one byte offset.
       points:
         at: 6
         count: 3               # or count: { field: ... }
         stride: 5
         elements:
-          quality: { at: 0, type: u8 }
-          angle:   { at: 1, type: u16le, scale: 0.015625, unit: deg }
-          dist_mm: { at: 3, type: u16le, scale: 0.25, unit: mm }
+          start_flag: { at: 0, type: u8,    bits: { lsb: 0, width: 1 } }
+          quality:    { at: 0, type: u8,    bits: { lsb: 2, width: 6 } }
+          angle_deg:  { at: 1, type: u16le, bits: { lsb: 1, width: 15 }, scale: 0.015625, unit: deg }
+          dist_mm:    { at: 3, type: u16le, scale: 0.25, unit: mm }
 provenance:
   datasheet: "datasheet.pdf#page=12"
 ---
@@ -148,10 +162,16 @@ response:
     at: -4                     # the two hex characters before "\r\n"
     encoding: ascii_hex        # checksum appears as ASCII hex, case-insensitive
   parse:
-    regex: 'S,(?P<flags>[0-9A-Fa-f]+),(?P<values>[^*]*)\*'
-    types: { flags: hex_int }  # int | float | string | hex_int
+    regex: 'S,(?P<flags>[0-9A-Fa-f]+),(?P<temp>[0-9A-Fa-f]+),(?P<values>[^*]*)\*'
+    types:
+      flags: hex_int           # bare form: int | float | string | hex_int
+      # Object form runs the same pipeline as binary fields:
+      # value = ((converted >> lsb) & mask(width)) x scale + offset.
+      # bits only for int/hex_int (negative values error at runtime).
+      temp: { type: hex_int, offset: -40 }
     split:
-      # Split the "values" capture on "," and convert each piece to float.
+      # Split the "values" capture on "," and convert each piece (the element
+      # type takes the bare or the object form too).
       values: { sep: ",", type: float }
 "#;
 
@@ -201,14 +221,20 @@ mod tests {
         // rename_all lowercase enums.
         assert!(text.contains("\"danger\""));
         assert!(text.contains("\"silence\""));
-        // New validate/array/split vocabulary is present.
-        for key in ["range", "encoding", "ascii_hex", "count", "stride", "elements", "split"] {
+        // New validate/array/split/bits vocabulary is present.
+        for key in [
+            "range", "encoding", "ascii_hex", "count", "stride", "elements", "split", "bits",
+            "offset", "lsb", "width",
+        ] {
             assert!(text.contains(key), "schema misses {key:?}");
         }
-        // untagged CountSpec becomes a union, not an externally-tagged object.
-        let count = serde_json::to_string(&defs["CountSpec"]).unwrap();
-        assert!(count.contains("anyOf") || count.contains("oneOf"), "{count}");
-        assert!(!count.contains("\"Fixed\""), "{count}");
+        // untagged CountSpec and TextType become unions, not externally-tagged
+        // objects.
+        for def in ["CountSpec", "TextType"] {
+            let union = serde_json::to_string(&defs[def]).unwrap();
+            assert!(union.contains("anyOf") || union.contains("oneOf"), "{def}: {union}");
+            assert!(!union.contains("\"Fixed\"") && !union.contains("\"Name\""), "{def}: {union}");
+        }
     }
 
     #[test]

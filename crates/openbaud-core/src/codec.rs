@@ -61,6 +61,17 @@ impl FieldType {
         })
     }
 
+    /// Bit width of unsigned integer types — the only ones `bits` extraction
+    /// applies to. None for signed, float and text types.
+    pub fn unsigned_bits(&self) -> Option<u32> {
+        match self {
+            Self::U8 => Some(8),
+            Self::U16Be | Self::U16Le => Some(16),
+            Self::U32Be | Self::U32Le | Self::U32Me => Some(32),
+            _ => None,
+        }
+    }
+
     /// Binary width in bytes; None for text-only types.
     pub fn size(&self) -> Option<usize> {
         match self {

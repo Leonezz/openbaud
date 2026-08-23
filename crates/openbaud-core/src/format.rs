@@ -531,10 +531,11 @@ pub struct ParseSpec {
     /// Text decode: regex with named captures applied to the frame text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub regex: Option<String>,
-    /// Type coercion per named capture: int, float, string or hex_int
-    /// (default string).
+    /// Type coercion per named capture: a bare type name (int, float, string
+    /// or hex_int; default string), or an object
+    /// `{type, bits?, scale?, offset?}` sharing the binary decode pipeline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub types: Option<BTreeMap<String, String>>,
+    pub types: Option<BTreeMap<String, TextType>>,
     /// Split a named capture into an array: capture name -> separator and
     /// element type. A capture cannot appear in both `types` and `split`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -548,9 +549,57 @@ pub struct ParseSpec {
 pub struct SplitSpec {
     /// Separator string the capture is split on.
     pub sep: String,
-    /// Element type: int, float, string or hex_int.
+    /// Element type: a bare type name (int, float, string or hex_int), or an
+    /// object `{type, bits?, scale?, offset?}` applied per element.
+    #[serde(rename = "type")]
+    pub type_spec: TextType,
+}
+
+/// A text-side coercion type: either a bare type name, or an object adding
+/// bit extraction and the linear transform to the conversion.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum TextType {
+    /// Bare type name: int, float, string or hex_int.
+    Name(String),
+    /// Type name plus optional bits / scale / offset, evaluated as
+    /// `value = ((converted >> lsb) & mask(width)) x scale + offset`.
+    Spec(TextTypeSpec),
+}
+
+/// Object form of a text-side coercion type. `bits` requires an integer type
+/// (int or hex_int) and errors at runtime on negative converted values;
+/// `scale`/`offset` require a numeric type; none of the three apply to
+/// `string`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TextTypeSpec {
+    /// Base type: int, float, string or hex_int.
     #[serde(rename = "type")]
     pub type_name: String,
+    /// Extract a bit sub-field of the converted integer before scaling.
+    /// Only valid for int and hex_int; negative values are a runtime error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bits: Option<BitsSpec>,
+    /// Multiply the converted number by this factor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale: Option<f64>,
+    /// Added after scaling: `value = converted x scale + offset`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<f64>,
+}
+
+/// A bit sub-field of an unsigned integer value, evaluated as
+/// `((raw >> lsb) & mask(width))` before scale/offset. `lsb`/`width` map
+/// directly onto register-table `[msb:lsb]` notation:
+/// `lsb` is the table's lsb and `width = msb - lsb + 1`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BitsSpec {
+    /// Lowest bit of the sub-field (0 = least significant bit of the value).
+    pub lsb: u32,
+    /// Number of bits (>= 1); `lsb + width` must fit the field's bit width.
+    pub width: u32,
 }
 
 /// One decoded binary field — a scalar at a byte offset, or (with `count`) an
@@ -570,9 +619,20 @@ pub struct FieldSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub len: Option<usize>,
     /// Multiply the decoded number by this factor (applied per element for
-    /// arrays).
+    /// arrays). Setting scale or offset makes the value a float.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scale: Option<f64>,
+    /// Added after scaling — the canonical linear calibration is
+    /// `value = raw x scale + offset` (scale defaults to 1, offset to 0).
+    /// Setting scale or offset makes the value a float.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<f64>,
+    /// Extract a bit sub-field of the unsigned decoded value before scaling:
+    /// `value = ((raw >> lsb) & mask(width)) x scale + offset`. Only valid on
+    /// unsigned integer types (u8, u16be, u16le, u32be, u32le, u32me);
+    /// several fields may read different bits of the same byte offset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bits: Option<BitsSpec>,
     /// Unit label reported alongside the value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unit: Option<String>,
@@ -788,7 +848,7 @@ fn check_parse_spec(parse: &ParseSpec, path: &str, ctx: &str) -> crate::Result<(
                     if s.sep.is_empty() {
                         return Err(ferr(path, format!("{ctx}.split.{name}.sep must not be empty")));
                     }
-                    check_text_type(&s.type_name, path, &format!("{ctx}.split.{name}.type"))?;
+                    check_text_type(&s.type_spec, path, &format!("{ctx}.split.{name}.type"))?;
                     if parse.types.as_ref().is_some_and(|t| t.contains_key(name)) {
                         return Err(ferr(
                             path,
@@ -807,12 +867,64 @@ fn check_parse_spec(parse: &ParseSpec, path: &str, ctx: &str) -> crate::Result<(
     Ok(())
 }
 
-/// Allowed text-side coercion types (regex `types` and `split.type`).
-fn check_text_type(t: &str, path: &str, ctx: &str) -> crate::Result<()> {
+/// Allowed text-side coercion types (regex `types` and `split.type`): a bare
+/// type name, or an object whose bits/scale/offset must fit the base type.
+fn check_text_type(t: &TextType, path: &str, ctx: &str) -> crate::Result<()> {
+    match t {
+        TextType::Name(name) => check_text_type_name(name, path, ctx),
+        TextType::Spec(spec) => {
+            check_text_type_name(&spec.type_name, path, ctx)?;
+            match spec.type_name.as_str() {
+                "string" => {
+                    if spec.bits.is_some() || spec.scale.is_some() || spec.offset.is_some() {
+                        return Err(ferr(
+                            path,
+                            format!("{ctx}: bits/scale/offset do not apply to type string"),
+                        ));
+                    }
+                }
+                "float" if spec.bits.is_some() => {
+                    return Err(ferr(
+                        path,
+                        format!("{ctx}: bits requires an integer type (int, hex_int), not float"),
+                    ));
+                }
+                _ => {} // int / hex_int: bits, scale and offset all apply
+            }
+            if let Some(bits) = &spec.bits {
+                // Text integers are non-negative i64 at extraction time.
+                check_bits(bits, 63, "text integer", path, ctx)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// The four allowed text-side base type names.
+fn check_text_type_name(t: &str, path: &str, ctx: &str) -> crate::Result<()> {
     if !matches!(t, "int" | "float" | "string" | "hex_int") {
         return Err(ferr(
             path,
             format!("{ctx}: {t:?} is not one of int, float, string, hex_int"),
+        ));
+    }
+    Ok(())
+}
+
+/// Shared bits sanity checks: non-zero width, and the sub-field must fit the
+/// carrier's bit width. `what` names the carrier in the error message.
+fn check_bits(bits: &BitsSpec, carrier_bits: u32, what: &str, path: &str, ctx: &str) -> crate::Result<()> {
+    if bits.width == 0 {
+        return Err(ferr(path, format!("{ctx}: bits.width must be >= 1")));
+    }
+    if u64::from(bits.lsb) + u64::from(bits.width) > u64::from(carrier_bits) {
+        return Err(ferr(
+            path,
+            format!(
+                "{ctx}: bits [msb:lsb] = [{}:{}] exceeds the {carrier_bits}-bit {what}",
+                u64::from(bits.lsb) + u64::from(bits.width) - 1,
+                bits.lsb
+            ),
         ));
     }
     Ok(())
@@ -851,10 +963,12 @@ fn check_field_spec(
             if f.len.is_some() {
                 return Err(ferr(path, format!("{ctx}: len is only valid for type ascii_int")));
             }
-            if f.scale.is_some() || f.unit.is_some() {
+            if f.scale.is_some() || f.offset.is_some() || f.bits.is_some() || f.unit.is_some() {
                 return Err(ferr(
                     path,
-                    format!("{ctx}: scale/unit belong on the element fields of a record array"),
+                    format!(
+                        "{ctx}: scale/offset/bits/unit belong on the element fields of a record array"
+                    ),
                 ));
             }
             let stride = f
@@ -920,10 +1034,24 @@ fn check_field_spec(
     Ok(())
 }
 
-/// Check a scalar field's type/len combination and return its byte width.
+/// Check a scalar field's type/len/bits combination and return its byte width.
 fn check_scalar_type(f: &FieldSpec, path: &str, ctx: &str) -> crate::Result<usize> {
     let name = f.type_name.as_ref().expect("caller ensures type is present");
     let ty = FieldType::from_name(name).map_err(|e| ferr(path, format!("{ctx}: {e}")))?;
+    if let Some(bits) = &f.bits {
+        match ty.unsigned_bits() {
+            None => {
+                return Err(ferr(
+                    path,
+                    format!(
+                        "{ctx}: bits requires an unsigned integer type \
+                         (u8, u16be, u16le, u32be, u32le, u32me), got {name}"
+                    ),
+                ))
+            }
+            Some(carrier) => check_bits(bits, carrier, &format!("type {name}"), path, ctx)?,
+        }
+    }
     if ty == FieldType::AsciiInt {
         let len =
             f.len.ok_or_else(|| ferr(path, format!("{ctx}: type ascii_int requires len")))?;
@@ -1305,7 +1433,7 @@ response:
         let parse = c.response.as_ref().unwrap().parse.as_ref().unwrap();
         let split = parse.split.as_ref().unwrap();
         assert_eq!(split["values"].sep, ",");
-        assert_eq!(split["values"].type_name, "float");
+        assert!(matches!(&split["values"].type_spec, TextType::Name(n) if n == "float"));
     }
 
     #[test]
@@ -1335,6 +1463,118 @@ response:
         );
         let err = parse_command(&bad, "c.yaml").unwrap_err();
         assert!(err.to_string().contains("only applies to regex"), "{err}");
+    }
+
+    const BITS_CMD: &str = r#"
+schema: openbaud/command@v0
+name: lidar_node
+frame: { hex: "A5 20" }
+response:
+  match: { length: 7 }
+  parse:
+    fields:
+      temp_c: { at: 6, type: u8, offset: -40 }
+      points:
+        at: 1
+        count: 1
+        stride: 5
+        elements:
+          start_flag: { at: 0, type: u8,    bits: { lsb: 0, width: 1 } }
+          quality:    { at: 0, type: u8,    bits: { lsb: 2, width: 6 } }
+          angle_deg:  { at: 1, type: u16le, bits: { lsb: 1, width: 15 }, scale: 0.015625 }
+"#;
+
+    #[test]
+    fn parses_bits_and_offset() {
+        let c = parse_command(BITS_CMD, "c.yaml").unwrap();
+        let parse = c.response.as_ref().unwrap().parse.as_ref().unwrap();
+        let fields = parse.fields.as_ref().unwrap();
+        assert_eq!(fields["temp_c"].offset, Some(-40.0));
+        let elements = fields["points"].elements.as_ref().unwrap();
+        assert_eq!(elements["quality"].bits, Some(BitsSpec { lsb: 2, width: 6 }));
+        assert_eq!(elements["angle_deg"].bits, Some(BitsSpec { lsb: 1, width: 15 }));
+    }
+
+    #[test]
+    fn rejects_bad_bits_and_offset_specs() {
+        for (from, to, needle) in [
+            // bits only on unsigned integer types: not signed ...
+            ("start_flag: { at: 0, type: u8, ", "start_flag: { at: 0, type: i8, ", "unsigned integer type"),
+            // ... not float ...
+            ("angle_deg:  { at: 1, type: u16le,", "angle_deg:  { at: 3, type: f32le,", "unsigned integer type"),
+            // ... not ascii_int
+            ("temp_c: { at: 6, type: u8, offset: -40 }",
+             "temp_c: { at: 0, type: ascii_int, len: 2, bits: { lsb: 0, width: 4 } }",
+             "unsigned integer type"),
+            // width must be non-zero
+            ("bits: { lsb: 0, width: 1 }", "bits: { lsb: 0, width: 0 }", "width must be >= 1"),
+            // lsb + width must fit the type's bit width
+            ("bits: { lsb: 2, width: 6 }", "bits: { lsb: 3, width: 6 }", "exceeds the 8-bit type u8"),
+            ("bits: { lsb: 1, width: 15 }", "bits: { lsb: 2, width: 15 }", "exceeds the 16-bit type u16le"),
+            // the array container may not carry offset/bits (element fields do)
+            ("count: 1\n        stride: 5", "count: 1\n        stride: 5\n        offset: -1", "belong on the element fields"),
+            ("count: 1\n        stride: 5", "count: 1\n        stride: 5\n        bits: { lsb: 0, width: 1 }", "belong on the element fields"),
+        ] {
+            let bad = BITS_CMD.replace(from, to);
+            assert_ne!(bad, BITS_CMD, "replacement {from:?} did not apply");
+            let err = parse_command(&bad, "c.yaml").unwrap_err();
+            assert!(err.to_string().contains(needle), "expected {needle:?} in: {err}");
+        }
+    }
+
+    const TEXT_OBJ_CMD: &str = r#"
+schema: openbaud/command@v0
+name: obd_status
+frame: { text: "0105\r" }
+response:
+  match: { delimiter: "\r" }
+  parse:
+    regex: '41 05 (?P<temp>[0-9A-Fa-f]+) (?P<flags>[0-9A-Fa-f]+) (?P<values>.*)$'
+    types:
+      temp:  { type: hex_int, offset: -40 }
+      flags: { type: hex_int, bits: { lsb: 4, width: 4 } }
+    split:
+      values: { sep: ",", type: { type: int, scale: 0.5, offset: 1 } }
+"#;
+
+    #[test]
+    fn parses_object_form_text_types() {
+        let c = parse_command(TEXT_OBJ_CMD, "c.yaml").unwrap();
+        let parse = c.response.as_ref().unwrap().parse.as_ref().unwrap();
+        let types = parse.types.as_ref().unwrap();
+        assert!(matches!(&types["temp"], TextType::Spec(s)
+            if s.type_name == "hex_int" && s.offset == Some(-40.0) && s.bits.is_none()));
+        assert!(matches!(&types["flags"], TextType::Spec(s)
+            if s.bits == Some(BitsSpec { lsb: 4, width: 4 })));
+        let split = parse.split.as_ref().unwrap();
+        assert!(matches!(&split["values"].type_spec, TextType::Spec(s)
+            if s.type_name == "int" && s.scale == Some(0.5) && s.offset == Some(1.0)));
+    }
+
+    #[test]
+    fn rejects_bad_object_form_text_types() {
+        for (from, to, needle) in [
+            // string takes none of bits/scale/offset
+            ("temp:  { type: hex_int, offset: -40 }",
+             "temp:  { type: string, offset: -40 }",
+             "do not apply to type string"),
+            // float takes scale/offset but not bits
+            ("flags: { type: hex_int, bits: { lsb: 4, width: 4 } }",
+             "flags: { type: float, bits: { lsb: 4, width: 4 } }",
+             "bits requires an integer type"),
+            // shared bits sanity checks apply on the text side too
+            ("bits: { lsb: 4, width: 4 }", "bits: { lsb: 4, width: 0 }", "width must be >= 1"),
+            ("bits: { lsb: 4, width: 4 }", "bits: { lsb: 60, width: 10 }", "exceeds the 63-bit text integer"),
+            // the base type name is still checked in object form
+            ("{ type: int, scale: 0.5, offset: 1 }",
+             "{ type: bytes, scale: 0.5, offset: 1 }",
+             "not one of int, float, string, hex_int"),
+        ] {
+            let bad = TEXT_OBJ_CMD.replace(from, to);
+            assert_ne!(bad, TEXT_OBJ_CMD, "replacement {from:?} did not apply");
+            let err = parse_command(&bad, "c.yaml").unwrap_err();
+            assert!(err.to_string().contains(needle), "expected {needle:?} in: {err}");
+        }
     }
 
     const WORKFLOW: &str = r#"
