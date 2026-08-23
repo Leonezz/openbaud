@@ -29,6 +29,10 @@ pub enum FieldType {
     Float,
     /// Text-frame only: interpolated verbatim.
     Str,
+    /// Decode-only: `len` bytes of ASCII decimal digits (leading spaces and
+    /// zeros allowed) read as an integer. Width comes from the field's `len`,
+    /// so `size()` is None; use [`decode_ascii_int`]. Not usable in TX frames.
+    AsciiInt,
 }
 
 impl FieldType {
@@ -52,6 +56,7 @@ impl FieldType {
             "int" => Self::Int,
             "float" => Self::Float,
             "string" => Self::Str,
+            "ascii_int" => Self::AsciiInt,
             other => return Err(CoreError::UnknownFieldType(other.to_string())),
         })
     }
@@ -70,7 +75,7 @@ impl FieldType {
             | Self::U32Me
             | Self::I32Me
             | Self::F32Me => Some(4),
-            Self::Int | Self::Float | Self::Str => None,
+            Self::Int | Self::Float | Self::Str | Self::AsciiInt => None,
         }
     }
 
@@ -129,6 +134,9 @@ impl FieldType {
             Self::Int | Self::Float | Self::Str => {
                 return Err(err("text-only type cannot be encoded into a hex frame".to_string()))
             }
+            Self::AsciiInt => {
+                return Err(err("ascii_int is decode-only and cannot be encoded into a frame".to_string()))
+            }
         })
     }
 
@@ -161,10 +169,35 @@ impl FieldType {
             Self::F32Me => {
                 Value::from(f32::from_be_bytes(cdab_swap(slice.try_into().unwrap())) as f64)
             }
-            Self::Int | Self::Float | Self::Str => unreachable!("guarded by size() above"),
+            Self::Int | Self::Float | Self::Str | Self::AsciiInt => {
+                unreachable!("guarded by size() above")
+            }
         };
         Ok(val)
     }
+}
+
+/// Decode `len` bytes at `at` in `data` as an ASCII decimal integer. Leading
+/// spaces and leading zeros are allowed (IEEE-488.2 `#4 1200`-style headers);
+/// anything else non-numeric is a loud Parse error.
+pub fn decode_ascii_int(data: &[u8], at: usize, len: usize) -> crate::Result<Value> {
+    let slice = data.get(at..at + len).ok_or_else(|| {
+        CoreError::Parse(format!(
+            "ascii_int field at byte {at} (len {len}) exceeds response length {}",
+            data.len()
+        ))
+    })?;
+    let text = std::str::from_utf8(slice).map_err(|_| {
+        CoreError::Parse(format!(
+            "ascii_int field at byte {at} is not ASCII text: {:?}",
+            crate::hex::to_hex(slice)
+        ))
+    })?;
+    let trimmed = text.trim_start_matches(' ');
+    let n: i64 = trimmed.parse().map_err(|_| {
+        CoreError::Parse(format!("ascii_int field at byte {at}: {text:?} is not a decimal integer"))
+    })?;
+    Ok(Value::from(n))
 }
 
 /// CDAB word swap: logical big-endian bytes [A,B,C,D] <-> wire order [C,D,A,B].
@@ -226,5 +259,27 @@ mod tests {
     fn text_types_reject_binary_use() {
         assert!(FieldType::Str.encode("s", &json!("hi")).is_err());
         assert!(FieldType::Int.decode(&[1, 2], 0).is_err());
+    }
+
+    #[test]
+    fn ascii_int_decodes_with_padding() {
+        // IEEE-488.2 style "#41200": four ASCII digits after the header.
+        assert_eq!(decode_ascii_int(b"#41200", 2, 4).unwrap(), json!(1200));
+        // Leading spaces and zeros allowed.
+        assert_eq!(decode_ascii_int(b"  42", 0, 4).unwrap(), json!(42));
+        assert_eq!(decode_ascii_int(b"0042", 0, 4).unwrap(), json!(42));
+    }
+
+    #[test]
+    fn ascii_int_rejects_junk_and_overrun() {
+        let err = decode_ascii_int(b"12x4", 0, 4).unwrap_err();
+        assert!(err.to_string().contains("not a decimal integer"), "{err}");
+        let err = decode_ascii_int(b"12", 0, 4).unwrap_err();
+        assert!(err.to_string().contains("exceeds response length"), "{err}");
+        // Non-UTF8 bytes are loud, not lossy.
+        assert!(decode_ascii_int(&[0xFF, 0xFE], 0, 2).is_err());
+        // ascii_int has no fixed width and cannot be TX-encoded.
+        assert!(FieldType::AsciiInt.size().is_none());
+        assert!(FieldType::AsciiInt.encode("n", &json!(5)).is_err());
     }
 }

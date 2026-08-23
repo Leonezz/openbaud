@@ -18,6 +18,7 @@ next session (or the next person) starts where you finished.
 - `devices/<name>/notes.md` — quirks, datasheet errata, open questions
 - `captures/*.obcap` — lossless wire captures (JSONL: ts_ms, dir, hex)
 - `.openbaud/audit.jsonl` — every write you performed, append-only
+- `.openbaud/out/` — full copies of oversized tool results (see `full_result` below)
 
 ## Exploration workflow
 
@@ -38,7 +39,21 @@ next session (or the next person) starts where you finished.
    path and what you observed. Never mark `verified` without a real device
    interaction backing it.
 
-## Command format (openbaud/command@v0)
+## The YAML formats: `schema` is the single authority
+
+The complete, always-current reference for the three formats (profile,
+command, workflow) is the **`schema` MCP tool** — `kind:
+profile|command|workflow`, plus `example: true` for an annotated YAML sample —
+or, outside MCP, `openbaud schema <kind> [--example]`. It is generated from
+the exact code that parses the files and includes the semantic rules the
+schema grammar cannot express. **Call it before writing or editing any YAML
+under `devices/`** instead of guessing field names or type lists.
+
+The vocabulary covers, beyond the basics: binary/scalar and record **arrays**
+(`count`/`stride`/`elements`), text **`split`** arrays, `hex_int` captures,
+and checksum `validate` with `range`/`at`/`encoding: ascii_hex`.
+
+A short taste of a command (`openbaud/command@v0`):
 
 ```yaml
 schema: openbaud/command@v0
@@ -54,18 +69,10 @@ response:
   parse:
     fields:
       voltage: { at: 3, type: u16be, scale: 0.1, unit: "V" }
-    # text protocols instead: regex with named captures + types: {rssi: int}
 provenance:
   datasheet: "datasheet.pdf#page=7"
   verified: { capture: "captures/cap-....obcap", note: "matches multimeter", date: 2026-08-22 }
 ```
-
-Binary field types (hex frames and response fields):
-`u8 i8 u16be u16le i16be i16le u32be u32le i32be i32le f32be f32le u32me i32me f32me`.
-The `*me` types are CDAB word-swapped ("mid-endian"): low 16-bit word first on
-the wire, big-endian within each word — common in Modbus meters (e.g. PZEM-004T).
-Text-only param types (for `text:` frame interpolation): `int float string`.
-Checksums: `crc16_modbus xor8 sum8` (computed over all preceding frame bytes).
 
 ## Outcomes, expectations and protocol exceptions
 
@@ -79,55 +86,25 @@ JSON always carries `outcome`, `expect`, `expect_met`, `tx_hex`, plus
 A command *declares* which outcome means success with `expect:`
 (`normal` — the default — | `exception` | `silence`). An unmet expectation is
 an error whose text embeds the full result JSON. This turns negative tests
-into first-class commands — a Modbus illegal-function probe:
+into first-class commands: a Modbus illegal-function probe declares
+`expect: exception` plus an `exception` recognizer block; a wrong-station
+probe declares `expect: silence` (the `match` rule may then be omitted; set a
+short `timeout_ms`). See the `schema` tool for the exact syntax, including
+`timing` settling delays.
 
-```yaml
-response:
-  match: { length: 7 }        # the normal-frame rule (never arrives here)
-  expect: exception
-  first_byte_ms: 500          # optional: no first byte in 500 ms -> silence early
-  exception:                  # how to recognize + decode the exception frame
-    when: { at: 1, mask: "FF", equals: "84" }   # (byte[1] & FF) == 84 (FC | 0x80)
-    match: { length: 5 }
-    validate: { checksum: crc16_modbus }
-    parse:
-      fields:
-        function: { at: 1, type: u8 }
-        exception_code: { at: 2, type: u8 }
-```
+## Oversized results
 
-A wrong-station-number probe expects nothing back: `expect: silence` (the
-`match` rule may then be omitted; set a short `timeout_ms`).
-
-## Timing
-
-Commands may declare settling delays; the values actually applied are echoed
-in the result and audit:
-
-```yaml
-timing:
-  pre_delay_ms: 100   # wait before sending
-  post_delay_ms: 50   # quiet period after the command completes
-```
+A result JSON larger than `max_inline_bytes` (default 4096; a tool parameter
+and a `--max-inline-bytes` CLI flag) is written in full to `.openbaud/out/`
+and returned as a summary: long strings and arrays are visibly truncated and
+the top-level `full_result` field points at the complete file — read it from
+there when you need every element.
 
 ## Workflows (openbaud/workflow@v0)
 
 A workflow is a *fixed sequence* of this device's commands plus a `finally`
-block, in `devices/<name>/workflows/*.yaml`:
-
-```yaml
-schema: openbaud/workflow@v0
-name: pzem_full_check
-description: enter Modbus mode, read + exception test, always restore ECHO
-steps:
-  - command: set_mode_modbus
-  - command: read_voltage
-    params: { addr: 1 }       # step params override command defaults
-  - command: illegal_function_test
-finally:
-  - command: escape_binary
-  - command: set_mode_echo
-```
+block, in `devices/<name>/workflows/*.yaml` (steps may carry `params`
+overriding command defaults — `schema` tool has the format).
 
 Semantics: steps run in order on one session; the first failing step skips
 the rest; `finally` steps are **all attempted regardless**, failures recorded

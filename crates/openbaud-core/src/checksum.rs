@@ -9,6 +9,8 @@ pub enum ChecksumKind {
     Crc16Modbus,
     Xor8,
     Sum8,
+    /// 16-bit sum of all bytes, emitted as two big-endian bytes (PMS5003 style).
+    Sum16Be,
 }
 
 impl ChecksumKind {
@@ -17,6 +19,7 @@ impl ChecksumKind {
             "crc16_modbus" => Ok(Self::Crc16Modbus),
             "xor8" => Ok(Self::Xor8),
             "sum8" => Ok(Self::Sum8),
+            "sum16be" => Ok(Self::Sum16Be),
             other => Err(CoreError::UnknownChecksum(other.to_string())),
         }
     }
@@ -26,6 +29,7 @@ impl ChecksumKind {
             Self::Crc16Modbus => "crc16_modbus",
             Self::Xor8 => "xor8",
             Self::Sum8 => "sum8",
+            Self::Sum16Be => "sum16be",
         }
     }
 
@@ -33,7 +37,7 @@ impl ChecksumKind {
     #[allow(clippy::len_without_is_empty)] // a checksum width is never zero
     pub fn len(&self) -> usize {
         match self {
-            Self::Crc16Modbus => 2,
+            Self::Crc16Modbus | Self::Sum16Be => 2,
             Self::Xor8 | Self::Sum8 => 1,
         }
     }
@@ -43,6 +47,11 @@ impl ChecksumKind {
             Self::Crc16Modbus => crc16_modbus(data).to_le_bytes().to_vec(),
             Self::Xor8 => vec![data.iter().fold(0u8, |acc, b| acc ^ b)],
             Self::Sum8 => vec![data.iter().fold(0u8, |acc, b| acc.wrapping_add(*b))],
+            Self::Sum16Be => data
+                .iter()
+                .fold(0u16, |acc, b| acc.wrapping_add(*b as u16))
+                .to_be_bytes()
+                .to_vec(),
         }
     }
 
@@ -62,6 +71,7 @@ impl ChecksumKind {
             return Err(CoreError::ChecksumMismatch {
                 expected: hex::to_hex(&expected),
                 actual: hex::to_hex(tail),
+                at: frame.len() - n,
             });
         }
         Ok(())
@@ -116,5 +126,24 @@ mod tests {
     #[test]
     fn unknown_name_is_loud() {
         assert!(ChecksumKind::from_name("crc32").is_err());
+    }
+
+    #[test]
+    fn sum16be_known_vector() {
+        // PMS5003-style: 0x42 + 0x4D + 0x00 + 0x1C = 0x00AB, big-endian tail.
+        assert_eq!(
+            ChecksumKind::Sum16Be.compute(&[0x42, 0x4D, 0x00, 0x1C]),
+            vec![0x00, 0xAB]
+        );
+        // Sum overflowing one byte: 0xFF * 3 = 0x02FD.
+        assert_eq!(ChecksumKind::Sum16Be.compute(&[0xFF, 0xFF, 0xFF]), vec![0x02, 0xFD]);
+        assert_eq!(ChecksumKind::from_name("sum16be").unwrap(), ChecksumKind::Sum16Be);
+        assert_eq!(ChecksumKind::Sum16Be.len(), 2);
+
+        let mut frame = vec![0x42, 0x4D, 0x00, 0x1C];
+        frame.extend(ChecksumKind::Sum16Be.compute(&[0x42, 0x4D, 0x00, 0x1C]));
+        assert!(ChecksumKind::Sum16Be.verify_frame(&frame).is_ok());
+        frame[2] ^= 0x01;
+        assert!(ChecksumKind::Sum16Be.verify_frame(&frame).is_err());
     }
 }

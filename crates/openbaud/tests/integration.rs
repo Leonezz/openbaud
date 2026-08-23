@@ -331,7 +331,7 @@ async fn broken_command_file_does_not_block_device() {
 #[tokio::test]
 async fn tool_list_includes_mock_and_schemas() {
     let listed = tools::list();
-    assert_eq!(listed.len(), 10);
+    assert_eq!(listed.len(), 11);
     let dir = scaffold_workspace();
     let ctx = ctx_for(&dir);
     let ports = tools::call("list_ports", json!({}), &ctx).await.unwrap();
@@ -598,4 +598,129 @@ async fn replay_relative_path_resolves_against_workspace() {
     assert_eq!(replayed["expect_met"], json!(true));
     assert_eq!(replayed["parsed"]["y"], json!(66));
     assert_eq!(replayed["parsed"], live["parsed"], "replay must reproduce the live result");
+}
+
+// ---------------------------------------------------------------------------
+// Output shaping (spill-to-disk summaries) and schema surfacing
+// ---------------------------------------------------------------------------
+
+/// 400-element u8 array response: 2 header bytes + 400 payload bytes.
+const BIG_ARRAY_CMD: &str = r#"
+schema: openbaud/command@v0
+name: big_read
+frame: { hex: "01" }
+response:
+  match: { length: 402 }
+  timeout_ms: 2000
+  parse:
+    fields:
+      samples: { at: 2, type: u8, count: 400 }
+"#;
+
+fn big_array_reply() -> Vec<u8> {
+    let mut reply = vec![0x00, 0x00];
+    reply.extend((0..400u32).map(|i| (i % 251) as u8));
+    reply
+}
+
+#[tokio::test]
+async fn oversized_result_spills_to_disk_with_summary() {
+    let dir = scaffold_workspace();
+    std::fs::write(dir.path().join("devices/echodev/commands/big_read.yaml"), BIG_ARRAY_CMD)
+        .unwrap();
+    let ctx = ctx_for(&dir);
+
+    let session = ctx.sessions.open(
+        "scripted",
+        Framing::Idle { idle_ms: 20 },
+        scripted_port(vec![0x01], big_array_reply()),
+    );
+    let result = tools::call(
+        "run_command",
+        json!({ "device": "echodev", "command": "big_read", "session_id": session.id }),
+        &ctx,
+    )
+    .await
+    .unwrap();
+
+    // Inline view: array head + explicit truncation marker, strings cut with
+    // a byte-count note, scalars untouched.
+    let samples = result["parsed"]["samples"].as_array().unwrap();
+    assert_eq!(samples.len(), 9, "8 head elements + truncation marker");
+    assert_eq!(samples[0], json!(0));
+    assert_eq!(samples[8], json!({ "truncated": 392 }));
+    let raw_hex = result["raw_hex"].as_str().unwrap();
+    assert!(raw_hex.contains("…("), "long strings carry a truncation note, got: {raw_hex}");
+    assert_eq!(result["outcome"], json!("normal"));
+
+    // The full-result file holds every element.
+    let rel = result["full_result"].as_str().unwrap();
+    assert!(rel.starts_with(".openbaud/out/"), "workspace-relative path, got: {rel}");
+    let full: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.path().join(rel)).unwrap()).unwrap();
+    let full_samples = full["parsed"]["samples"].as_array().unwrap();
+    assert_eq!(full_samples.len(), 400);
+    assert_eq!(full_samples[399], json!(399 % 251));
+    assert!(full.get("full_result").is_none(), "the spilled file is the untouched result");
+
+    // Raising max_inline_bytes forces the same call fully inline.
+    let session = ctx.sessions.open(
+        "scripted",
+        Framing::Idle { idle_ms: 20 },
+        scripted_port(vec![0x01], big_array_reply()),
+    );
+    let inline = tools::call(
+        "run_command",
+        json!({
+            "device": "echodev",
+            "command": "big_read",
+            "session_id": session.id,
+            "max_inline_bytes": 1_000_000,
+        }),
+        &ctx,
+    )
+    .await
+    .unwrap();
+    assert!(inline.get("full_result").is_none(), "inline result must not spill");
+    assert_eq!(inline["parsed"]["samples"].as_array().unwrap().len(), 400);
+    assert_eq!(inline["parsed"]["samples"], full["parsed"]["samples"]);
+}
+
+#[tokio::test]
+async fn schema_tool_returns_schema_and_parsable_example() {
+    let dir = scaffold_workspace();
+    let ctx = ctx_for(&dir);
+
+    let result = tools::call("schema", json!({ "kind": "command" }), &ctx).await.unwrap();
+    assert_eq!(result["kind"], json!("command"));
+    assert_eq!(result["schema"]["$id"], json!("openbaud/command@v0"));
+    assert_eq!(result["schema"]["additionalProperties"], json!(false));
+
+    // example: true returns YAML that the real parser accepts (the command
+    // example is two `---`-separated documents: binary, then text).
+    let result = tools::call("schema", json!({ "kind": "command", "example": true }), &ctx)
+        .await
+        .unwrap();
+    assert!(result.get("schema").is_none());
+    let yaml = result["example"].as_str().unwrap();
+    let docs: Vec<&str> = yaml.split("\n---\n").collect();
+    assert_eq!(docs.len(), 2, "command example holds two documents");
+    for doc in docs {
+        parse_command(doc, "example.yaml").unwrap();
+    }
+
+    let err = tools::call("schema", json!({ "kind": "bogus" }), &ctx).await.unwrap_err();
+    assert!(err.to_string().contains("bogus"), "got: {err:#}");
+}
+
+#[test]
+fn cli_schema_example_prints_yaml() {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_openbaud"))
+        .args(["schema", "command", "--example"])
+        .output()
+        .expect("openbaud binary runs");
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(!stdout.trim().is_empty());
+    assert!(stdout.contains("openbaud/command@v0"), "got: {stdout}");
 }

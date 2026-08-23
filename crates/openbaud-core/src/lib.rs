@@ -6,6 +6,7 @@ pub mod exec;
 pub mod format;
 pub mod framing;
 pub mod hex;
+pub mod schema;
 pub mod template;
 
 use thiserror::Error;
@@ -14,7 +15,7 @@ use thiserror::Error;
 pub enum CoreError {
     #[error("invalid hex string {input:?}: {reason}")]
     InvalidHex { input: String, reason: String },
-    #[error("unknown checksum {0:?} (expected crc16_modbus, xor8 or sum8)")]
+    #[error("unknown checksum {0:?} (expected crc16_modbus, xor8, sum8 or sum16be)")]
     UnknownChecksum(String),
     #[error("unknown field type {0:?}")]
     UnknownFieldType(String),
@@ -26,8 +27,8 @@ pub enum CoreError {
     Format { path: String, reason: String },
     #[error("response parse error: {0}")]
     Parse(String),
-    #[error("checksum mismatch: expected {expected} at frame tail, got {actual}")]
-    ChecksumMismatch { expected: String, actual: String },
+    #[error("checksum mismatch at byte {at}: expected {expected}, got {actual}")]
+    ChecksumMismatch { expected: String, actual: String, at: usize },
 }
 
 pub type Result<T> = std::result::Result<T, CoreError>;

@@ -1,6 +1,7 @@
 mod cmd_init;
 mod cmd_ports;
 mod cmd_run;
+mod cmd_schema;
 
 use openbaud::{engine, mcp, workspace};
 
@@ -44,6 +45,19 @@ enum Command {
         /// Required to execute commands marked risk=danger
         #[arg(long)]
         acknowledge_risk: bool,
+        /// Result JSONs longer than this many bytes are written in full to
+        /// .openbaud/out/ and printed as a summary carrying a full_result
+        /// path; raise it to force large results inline
+        #[arg(long, default_value_t = openbaud::output::DEFAULT_MAX_INLINE_BYTES)]
+        max_inline_bytes: usize,
+    },
+    /// Print the JSON Schema of a knowledge format (--example for annotated YAML)
+    Schema {
+        /// Which format to describe
+        kind: cmd_schema::Kind,
+        /// Print an annotated YAML example instead of the JSON Schema
+        #[arg(long)]
+        example: bool,
     },
 }
 
@@ -67,9 +81,11 @@ async fn main() {
                 Err(e) => Err(e),
             }
         }
-        Command::Run { spec, port, sets, workspace, acknowledge_risk } => {
-            cmd_run::run(&spec, port.as_deref(), &sets, &workspace, acknowledge_risk).await
+        Command::Run { spec, port, sets, workspace, acknowledge_risk, max_inline_bytes } => {
+            cmd_run::run(&spec, port.as_deref(), &sets, &workspace, acknowledge_risk, max_inline_bytes)
+                .await
         }
+        Command::Schema { kind, example } => cmd_schema::run(kind, example),
     };
     if let Err(e) = result {
         eprintln!("error: {e:#}");

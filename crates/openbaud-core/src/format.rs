@@ -9,6 +9,7 @@ use crate::codec::FieldType;
 use crate::framing::{Framing, MatchRule};
 use crate::template::HexTemplate;
 use crate::CoreError;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
@@ -24,17 +25,25 @@ fn ferr(path: &str, reason: impl Into<String>) -> CoreError {
 // Profile
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// A device profile: serial transport settings, response framing and the
+/// stable identity used to resolve the physical port automatically.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Profile {
+    /// Format identifier; must be "openbaud/profile@v0".
     pub schema: String,
+    /// Device name; used as the directory name in the workspace.
     pub name: String,
+    /// Free-form description of the device.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Serial port parameters (baud, data bits, parity, stop bits).
     #[serde(default)]
     pub transport: Transport,
+    /// Default framing for unsolicited/streamed device output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub framing: Option<FramingSpec>,
+    /// USB identity for automatic port resolution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selector: Option<SelectorSpec>,
 }
@@ -42,7 +51,7 @@ pub struct Profile {
 /// Stable device identity for automatic port resolution: all present fields
 /// must match (AND). vid/pid are hex, case-insensitive; product is a
 /// substring match; serial_number is exact.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SelectorSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -64,15 +73,20 @@ impl SelectorSpec {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Serial line parameters. Defaults: 115200 8N1.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Transport {
+    /// Baud rate (default 115200).
     #[serde(default = "default_baud")]
     pub baud: u32,
+    /// Data bits, 5..=8 (default 8).
     #[serde(default = "default_data_bits")]
     pub data_bits: u8,
+    /// Parity bit (default none).
     #[serde(default)]
     pub parity: Parity,
+    /// Stop bits, 1 or 2 (default 1).
     #[serde(default = "default_stop_bits")]
     pub stop_bits: u8,
 }
@@ -98,7 +112,7 @@ impl Default for Transport {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Parity {
     #[default]
@@ -107,30 +121,42 @@ pub enum Parity {
     Odd,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// How to cut the byte stream into frames. Exactly one of the three modes
+/// must be set.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct FramingSpec {
+    /// Frame ends with this byte sequence (given as text, e.g. "\r\n").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delimiter: Option<String>,
+    /// Frame ends after this many milliseconds of line silence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_ms: Option<u64>,
+    /// Frame length is read from a fixed-size header.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub length_prefix: Option<LengthPrefixSpec>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Length-prefixed framing: a `header_len`-byte header carries the payload
+/// length at `len_at`; total frame = header + payload + `extra` trailer bytes.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct LengthPrefixSpec {
+    /// Header size in bytes.
     pub header_len: usize,
+    /// Byte offset of the length field within the header.
     pub len_at: usize,
+    /// Width of the length field in bytes (1..=4).
     pub len_size: usize,
+    /// Byte order of the length field (default big-endian).
     #[serde(default)]
     pub endian: Endian,
+    /// Trailer bytes after the payload not counted by the length field.
     #[serde(default)]
     pub extra: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Endian {
     #[default]
@@ -220,38 +246,51 @@ pub fn parse_profile(yaml: &str, path: &str) -> crate::Result<Profile> {
 // Command
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// A named, parameterized device command: the TX frame template plus how to
+/// match, validate and parse the response.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Command {
+    /// Format identifier; must be "openbaud/command@v0".
     pub schema: String,
+    /// Command name; used as the file name in the device directory.
     pub name: String,
+    /// Free-form description of what the command does.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Risk class gating execution (default read).
     #[serde(default)]
     pub risk: Risk,
+    /// Declared parameters usable in the frame template.
     #[serde(default)]
     pub params: Vec<ParamSpec>,
+    /// The bytes to transmit.
     pub frame: FrameSpec,
+    /// How to collect and interpret the reply; omit for fire-and-forget.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response: Option<ResponseSpec>,
+    /// Optional delays around the exchange.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timing: Option<TimingSpec>,
+    /// Where this knowledge came from and how it was verified.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provenance: Option<Provenance>,
 }
 
 /// Optional command-level timing: delay before sending and quiet period after
 /// the command completes. Absent field == 0.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TimingSpec {
+    /// Milliseconds to wait before transmitting.
     #[serde(default)]
     pub pre_delay_ms: u64,
+    /// Quiet period in milliseconds after the command completes.
     #[serde(default)]
     pub post_delay_ms: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Risk {
     #[default]
@@ -260,32 +299,47 @@ pub enum Risk {
     Danger,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// One declared command parameter, referenced from the frame template as
+/// `{name}`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ParamSpec {
+    /// Parameter name, matching a `{name}` placeholder in the frame.
     pub name: String,
+    /// Encoding type: binary (u8, u16be, ...) for hex frames; int, float or
+    /// string for text frames.
     #[serde(rename = "type")]
     pub type_name: String,
+    /// Value used when the caller does not supply one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default: Option<serde_json::Value>,
+    /// Minimum accepted numeric value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min: Option<f64>,
+    /// Maximum accepted numeric value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max: Option<f64>,
+    /// What the parameter means.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// The TX frame template. Exactly one of `hex` / `text` must be set.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct FrameSpec {
+    /// Whitespace-separated hex bytes with `{param}` and checksum
+    /// placeholders ({crc16_modbus}, {xor8}, {sum8}, {sum16be}); checksum
+    /// placeholders are computed over every byte built before them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hex: Option<String>,
+    /// Literal text with `{param}` interpolation; `{{`/`}}` escape braces.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// How to collect the reply and what to do with it.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ResponseSpec {
     /// Required unless `expect: silence` (checked in `parse_command`).
@@ -300,8 +354,10 @@ pub struct ResponseSpec {
     /// may classify `silence` before `timeout_ms` elapses.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_byte_ms: Option<u64>,
+    /// Checksum verification of the collected frame.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub validate: Option<ValidateSpec>,
+    /// How to decode the frame into named values.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parse: Option<ParseSpec>,
     /// Recognition and decoding of protocol-level exception frames.
@@ -314,7 +370,7 @@ fn default_timeout_ms() -> u64 {
 }
 
 /// Declared success outcome for a response.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Expect {
     #[default]
@@ -327,7 +383,7 @@ pub enum Expect {
 /// FC|0x80 replies). `when` is a prefix test on the incoming bytes; once it
 /// hits, the frame is collected with `match` and processed with
 /// `validate`/`parse` — same semantics as the main response.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ExceptionSpec {
     pub when: WhenSpec,
@@ -341,7 +397,7 @@ pub struct ExceptionSpec {
 
 /// Byte-position predicate: `(byte[at] & mask) == equals`. `mask` and
 /// `equals` are single hex bytes; `mask` defaults to "FF".
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WhenSpec {
     pub at: usize,
@@ -375,13 +431,18 @@ fn hex_byte(s: &str) -> crate::Result<u8> {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// When the collected reply counts as one complete frame. Exactly one of the
+/// three modes must be set.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MatchSpec {
+    /// Frame is complete after exactly this many bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub length: Option<usize>,
+    /// Frame ends with this byte sequence (given as text).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delimiter: Option<String>,
+    /// Frame ends after this many milliseconds of line silence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_ms: Option<u64>,
 }
@@ -412,51 +473,165 @@ impl MatchSpec {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Checksum verification of a received frame. Defaults reproduce the classic
+/// tail checksum: computed over every byte before the checksum value, which
+/// sits at the frame tail as raw bytes.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ValidateSpec {
+    /// Checksum algorithm: crc16_modbus, xor8, sum8 or sum16be.
     pub checksum: String,
+    /// Byte range the checksum is computed over, both ends inclusive.
+    /// Negative indices count from the frame end (-1 = last byte).
+    /// Default: byte 0 through the byte before the checksum value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range: Option<RangeSpec>,
+    /// Position of the stored checksum value in the frame; negative counts
+    /// from the frame end. Default: the frame tail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<i64>,
+    /// How the checksum value appears in the frame: raw bytes (default) or
+    /// ASCII hex characters, two per checksum byte, compared
+    /// case-insensitively (NMEA-style `*4A`).
+    #[serde(default)]
+    pub encoding: Encoding,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Inclusive byte range; negative indices count from the frame end
+/// (-1 = last byte).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RangeSpec {
+    /// First byte of the range (inclusive).
+    pub from: i64,
+    /// Last byte of the range (inclusive).
+    pub to: i64,
+}
+
+/// On-wire representation of a checksum value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Encoding {
+    /// The checksum's bytes appear verbatim.
+    #[default]
+    Raw,
+    /// The checksum appears as ASCII hex characters (two per byte),
+    /// compared case-insensitively.
+    AsciiHex,
+}
+
+/// How to decode a frame into named values. Exactly one of `fields` (binary)
+/// / `regex` (text) must be set.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ParseSpec {
+    /// Binary decode: field name -> byte layout.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fields: Option<BTreeMap<String, FieldSpec>>,
+    /// Text decode: regex with named captures applied to the frame text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub regex: Option<String>,
+    /// Type coercion per named capture: int, float, string or hex_int
+    /// (default string).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub types: Option<BTreeMap<String, String>>,
+    /// Split a named capture into an array: capture name -> separator and
+    /// element type. A capture cannot appear in both `types` and `split`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub split: Option<BTreeMap<String, SplitSpec>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// How to split one named regex capture into an array of converted values.
+/// Empty segments (e.g. from trailing separators) are skipped.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct FieldSpec {
-    pub at: usize,
+pub struct SplitSpec {
+    /// Separator string the capture is split on.
+    pub sep: String,
+    /// Element type: int, float, string or hex_int.
     #[serde(rename = "type")]
     pub type_name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scale: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub unit: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// One decoded binary field — a scalar at a byte offset, or (with `count`) an
+/// array of scalars or records.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FieldSpec {
+    /// Byte offset in the frame; inside `elements`, offset within the record.
+    pub at: usize,
+    /// Scalar type: u8, i8, u16be/le, i16be/le, u32be/le/me, i32be/le/me,
+    /// f32be/le/me, or ascii_int (requires `len`). Mutually exclusive with
+    /// `elements`.
+    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
+    pub type_name: Option<String>,
+    /// Byte length of an ascii_int field; required by and only valid for
+    /// type ascii_int.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub len: Option<usize>,
+    /// Multiply the decoded number by this factor (applied per element for
+    /// arrays).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale: Option<f64>,
+    /// Unit label reported alongside the value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+    /// Makes this field an array: a fixed element count, or `{field: name}`
+    /// referencing a scalar field of the same parse block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<CountSpec>,
+    /// Bytes from one element start to the next. Defaults to the scalar
+    /// type's width; required with `elements`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stride: Option<usize>,
+    /// Record-array layout: element field name -> scalar spec whose `at` is
+    /// the offset within one record. Arrays nest only one level. Mutually
+    /// exclusive with `type`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elements: Option<BTreeMap<String, FieldSpec>>,
+}
+
+/// Element count of an array field.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum CountSpec {
+    /// Fixed number of elements (must be >= 1).
+    Fixed(i64),
+    /// Count read from a scalar field decoded from the same frame.
+    Field(CountFieldRef),
+}
+
+/// Reference to the scalar field that carries an array's element count.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CountFieldRef {
+    /// Name of the scalar field in the same parse block.
+    pub field: String,
+}
+
+/// Where this command's knowledge came from.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Provenance {
+    /// Datasheet reference, e.g. "datasheet.pdf#page=7".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub datasheet: Option<String>,
+    /// Evidence that the command was verified against a real device.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verified: Option<Verified>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Real-device verification evidence.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Verified {
+    /// Path of the capture file that proves the exchange.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture: Option<String>,
+    /// Free-form verification note.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// When the verification happened (ISO date).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub date: Option<String>,
 }
@@ -485,6 +660,12 @@ pub fn parse_command(yaml: &str, path: &str) -> crate::Result<Command> {
     for p in &cmd.params {
         let ty = FieldType::from_name(&p.type_name)
             .map_err(|e| ferr(path, format!("param {:?}: {e}", p.name)))?;
+        if ty == FieldType::AsciiInt {
+            return Err(ferr(
+                path,
+                format!("param {:?}: ascii_int is a response-field type, not a param type", p.name),
+            ));
+        }
         if declared.insert(p.name.as_str(), ty).is_some() {
             return Err(ferr(path, format!("duplicate param {:?}", p.name)));
         }
@@ -536,7 +717,7 @@ pub fn parse_command(yaml: &str, path: &str) -> crate::Result<Command> {
             ));
         }
         if let Some(v) = &resp.validate {
-            ChecksumKind::from_name(&v.checksum).map_err(|e| ferr(path, format!("validate: {e}")))?;
+            check_validate_spec(v, path, "validate")?;
         }
         if let Some(parse) = &resp.parse {
             check_parse_spec(parse, path, "parse")?;
@@ -550,8 +731,7 @@ pub fn parse_command(yaml: &str, path: &str) -> crate::Result<Command> {
                 .map_err(|e| ferr(path, format!("exception.when.equals: {e}")))?;
             exc.match_spec.to_rule(path)?;
             if let Some(v) = &exc.validate {
-                ChecksumKind::from_name(&v.checksum)
-                    .map_err(|e| ferr(path, format!("exception.validate: {e}")))?;
+                check_validate_spec(v, path, "exception.validate")?;
             }
             if let Some(parse) = &exc.parse {
                 check_parse_spec(parse, path, "exception.parse")?;
@@ -559,6 +739,22 @@ pub fn parse_command(yaml: &str, path: &str) -> crate::Result<Command> {
         }
     }
     Ok(cmd)
+}
+
+/// Static checks for a `validate` block: known checksum name, and range
+/// inversion when both ends are non-negative (mixed signs are resolved at
+/// runtime against the actual frame length).
+fn check_validate_spec(v: &ValidateSpec, path: &str, ctx: &str) -> crate::Result<()> {
+    ChecksumKind::from_name(&v.checksum).map_err(|e| ferr(path, format!("{ctx}: {e}")))?;
+    if let Some(r) = &v.range {
+        if r.from >= 0 && r.to >= 0 && r.from > r.to {
+            return Err(ferr(
+                path,
+                format!("{ctx}.range: from {} is after to {}", r.from, r.to),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Shared semantic checks for a `parse` block (main response and exception).
@@ -570,33 +766,178 @@ fn check_parse_spec(parse: &ParseSpec, path: &str, ctx: &str) -> crate::Result<(
         }
         (None, None) => return Err(ferr(path, format!("{ctx} must set one of: fields, regex"))),
         (Some(fields), None) => {
+            if parse.split.is_some() {
+                return Err(ferr(path, format!("{ctx}.split only applies to regex parsing")));
+            }
             for (fname, f) in fields {
-                let ty = FieldType::from_name(&f.type_name)
-                    .map_err(|e| ferr(path, format!("{ctx}.fields.{fname}: {e}")))?;
-                if ty.size().is_none() {
-                    return Err(ferr(
-                        path,
-                        format!("{ctx}.fields.{fname}: text-only type not usable for binary decode"),
-                    ));
-                }
+                check_field_spec(f, fields, path, &format!("{ctx}.fields.{fname}"))?;
             }
         }
         (None, Some(re)) => {
-            regex::Regex::new(re)
+            let regex = regex::Regex::new(re)
                 .map_err(|e| ferr(path, format!("{ctx}.regex does not compile: {e}")))?;
+            if let Some(split) = &parse.split {
+                let captures: Vec<&str> = regex.capture_names().flatten().collect();
+                for (name, s) in split {
+                    if !captures.contains(&name.as_str()) {
+                        return Err(ferr(
+                            path,
+                            format!("{ctx}.split.{name}: regex has no named capture {name:?}"),
+                        ));
+                    }
+                    if s.sep.is_empty() {
+                        return Err(ferr(path, format!("{ctx}.split.{name}.sep must not be empty")));
+                    }
+                    check_text_type(&s.type_name, path, &format!("{ctx}.split.{name}.type"))?;
+                    if parse.types.as_ref().is_some_and(|t| t.contains_key(name)) {
+                        return Err(ferr(
+                            path,
+                            format!("{ctx}: capture {name:?} is declared in both types and split"),
+                        ));
+                    }
+                }
+            }
         }
     }
     if let Some(types) = &parse.types {
         for (name, t) in types {
-            if !matches!(t.as_str(), "int" | "float" | "string") {
-                return Err(ferr(
-                    path,
-                    format!("{ctx}.types.{name}: {t:?} is not one of int, float, string"),
-                ));
-            }
+            check_text_type(t, path, &format!("{ctx}.types.{name}"))?;
         }
     }
     Ok(())
+}
+
+/// Allowed text-side coercion types (regex `types` and `split.type`).
+fn check_text_type(t: &str, path: &str, ctx: &str) -> crate::Result<()> {
+    if !matches!(t, "int" | "float" | "string" | "hex_int") {
+        return Err(ferr(
+            path,
+            format!("{ctx}: {t:?} is not one of int, float, string, hex_int"),
+        ));
+    }
+    Ok(())
+}
+
+/// Static checks for one binary field: scalar type rules, and — when `count`
+/// is set — the array rules (count source, stride, one-level `elements`).
+fn check_field_spec(
+    f: &FieldSpec,
+    all: &BTreeMap<String, FieldSpec>,
+    path: &str,
+    ctx: &str,
+) -> crate::Result<()> {
+    match (&f.type_name, &f.elements) {
+        (Some(_), Some(_)) => {
+            return Err(ferr(path, format!("{ctx}: type and elements are mutually exclusive")))
+        }
+        (None, None) => {
+            return Err(ferr(path, format!("{ctx}: must set one of: type, elements")))
+        }
+        (Some(_), None) => {
+            let width = check_scalar_type(f, path, ctx)?;
+            if let (Some(stride), Some(_)) = (f.stride, &f.count) {
+                if stride < width {
+                    return Err(ferr(
+                        path,
+                        format!("{ctx}: stride {stride} is smaller than the element width {width}"),
+                    ));
+                }
+            }
+        }
+        (None, Some(elements)) => {
+            if f.count.is_none() {
+                return Err(ferr(path, format!("{ctx}: elements requires count")));
+            }
+            if f.len.is_some() {
+                return Err(ferr(path, format!("{ctx}: len is only valid for type ascii_int")));
+            }
+            if f.scale.is_some() || f.unit.is_some() {
+                return Err(ferr(
+                    path,
+                    format!("{ctx}: scale/unit belong on the element fields of a record array"),
+                ));
+            }
+            let stride = f
+                .stride
+                .ok_or_else(|| ferr(path, format!("{ctx}: stride is required with elements")))?;
+            if stride == 0 {
+                return Err(ferr(path, format!("{ctx}: stride must be >= 1")));
+            }
+            if elements.is_empty() {
+                return Err(ferr(path, format!("{ctx}: elements must not be empty")));
+            }
+            for (ename, e) in elements {
+                let ectx = format!("{ctx}.elements.{ename}");
+                if e.count.is_some() || e.elements.is_some() || e.stride.is_some() {
+                    return Err(ferr(
+                        path,
+                        format!("{ectx}: arrays nest only one level; element fields must be scalars"),
+                    ));
+                }
+                if e.type_name.is_none() {
+                    return Err(ferr(path, format!("{ectx}: must set type")));
+                }
+                let width = check_scalar_type(e, path, &ectx)?;
+                if e.at + width > stride {
+                    return Err(ferr(
+                        path,
+                        format!(
+                            "{ectx}: at {} + width {width} exceeds the record stride {stride}",
+                            e.at
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    match &f.count {
+        None => {
+            if f.stride.is_some() {
+                return Err(ferr(path, format!("{ctx}: stride requires count")));
+            }
+        }
+        Some(CountSpec::Fixed(n)) => {
+            if *n < 1 {
+                return Err(ferr(path, format!("{ctx}: count must be >= 1, got {n}")));
+            }
+        }
+        Some(CountSpec::Field(r)) => match all.get(&r.field) {
+            None => {
+                return Err(ferr(
+                    path,
+                    format!("{ctx}: count field {:?} is not declared in this parse", r.field),
+                ))
+            }
+            Some(target) if target.count.is_some() || target.elements.is_some() => {
+                return Err(ferr(
+                    path,
+                    format!("{ctx}: count field {:?} must be a scalar field, not an array", r.field),
+                ))
+            }
+            Some(_) => {}
+        },
+    }
+    Ok(())
+}
+
+/// Check a scalar field's type/len combination and return its byte width.
+fn check_scalar_type(f: &FieldSpec, path: &str, ctx: &str) -> crate::Result<usize> {
+    let name = f.type_name.as_ref().expect("caller ensures type is present");
+    let ty = FieldType::from_name(name).map_err(|e| ferr(path, format!("{ctx}: {e}")))?;
+    if ty == FieldType::AsciiInt {
+        let len =
+            f.len.ok_or_else(|| ferr(path, format!("{ctx}: type ascii_int requires len")))?;
+        if len == 0 {
+            return Err(ferr(path, format!("{ctx}: len must be >= 1")));
+        }
+        Ok(len)
+    } else {
+        if f.len.is_some() {
+            return Err(ferr(path, format!("{ctx}: len is only valid for type ascii_int")));
+        }
+        ty.size()
+            .ok_or_else(|| ferr(path, format!("{ctx}: text-only type not usable for binary decode")))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -607,22 +948,30 @@ fn check_parse_spec(parse: &ParseSpec, path: &str, ctx: &str) -> crate::Result<(
 /// block — deliberately not a programming language. Whether the referenced
 /// commands exist is a device-level check (core does not know the device
 /// directory); use `Workflow::referenced_commands` for it.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Workflow {
+    /// Format identifier; must be "openbaud/workflow@v0".
     pub schema: String,
+    /// Workflow name; used as the file name in the device directory.
     pub name: String,
+    /// Free-form description of what the workflow does.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Commands run in order; a failing step aborts the sequence.
     pub steps: Vec<StepSpec>,
+    /// Commands always run afterwards, even when a step failed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub finally: Vec<StepSpec>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// One workflow step: a command invocation with optional parameter values.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StepSpec {
+    /// Name of the command to run (must exist in the device directory).
     pub command: String,
+    /// Parameter values passed to the command.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<serde_json::Map<String, serde_json::Value>>,
 }
@@ -849,6 +1198,143 @@ response:
         // Default expect (normal) also requires match.
         let bad = silent.replace("  expect: silence\n", "");
         assert!(parse_command(&bad, "c.yaml").is_err());
+    }
+
+    const ARRAY_CMD: &str = r#"
+schema: openbaud/command@v0
+name: read_block
+frame: { hex: "01" }
+response:
+  match: { idle_ms: 20 }
+  validate: { checksum: sum16be, range: { from: 2, to: 7 }, at: -2, encoding: ascii_hex }
+  parse:
+    fields:
+      n_points: { at: 0, type: ascii_int, len: 4 }
+      samples: { at: 4, type: u8, count: { field: n_points }, scale: 0.5 }
+      points:
+        at: 4
+        count: 3
+        stride: 5
+        elements:
+          quality: { at: 0, type: u8 }
+          dist: { at: 1, type: u16le, scale: 0.25 }
+"#;
+
+    #[test]
+    fn parses_arrays_and_extended_validate() {
+        let c = parse_command(ARRAY_CMD, "c.yaml").unwrap();
+        let parse = c.response.as_ref().unwrap().parse.as_ref().unwrap();
+        let fields = parse.fields.as_ref().unwrap();
+        assert!(matches!(fields["points"].count, Some(CountSpec::Fixed(3))));
+        assert!(matches!(&fields["samples"].count, Some(CountSpec::Field(r)) if r.field == "n_points"));
+        let v = c.response.as_ref().unwrap().validate.as_ref().unwrap();
+        assert_eq!(v.at, Some(-2));
+        assert_eq!(v.encoding, Encoding::AsciiHex);
+        assert_eq!((v.range.unwrap().from, v.range.unwrap().to), (2, 7));
+    }
+
+    #[test]
+    fn rejects_bad_array_specs() {
+        for (from, to, needle) in [
+            // type and elements are mutually exclusive
+            ("count: 3\n        stride: 5", "count: 3\n        stride: 5\n        type: u8", "mutually exclusive"),
+            // ascii_int requires len
+            ("type: ascii_int, len: 4", "type: ascii_int", "requires len"),
+            // len only valid for ascii_int
+            ("type: u8, count: { field: n_points }", "type: u8, len: 2, count: { field: n_points }", "only valid for type ascii_int"),
+            // count field must exist
+            ("count: { field: n_points }", "count: { field: nope }", "not declared"),
+            // count field must be scalar
+            ("count: { field: n_points }", "count: { field: points }", "must be a scalar field"),
+            // fixed count must be >= 1
+            ("count: 3", "count: 0", "count must be >= 1"),
+            // record arrays need stride
+            ("stride: 5", "", "stride is required with elements"),
+            // element offset must fit the stride
+            ("dist: { at: 1, type: u16le", "dist: { at: 4, type: u16le", "exceeds the record stride"),
+            // one-level arrays only
+            ("quality: { at: 0, type: u8 }", "quality: { at: 0, type: u8, count: 2 }", "nest only one level"),
+            // stride requires count
+            ("type: u8, count: { field: n_points }, scale: 0.5", "type: u8, stride: 2", "stride requires count"),
+            // static range inversion (both ends non-negative)
+            ("range: { from: 2, to: 7 }", "range: { from: 7, to: 2 }", "is after"),
+        ] {
+            let bad = ARRAY_CMD.replace(from, to);
+            assert_ne!(bad, ARRAY_CMD, "replacement {from:?} did not apply");
+            let err = parse_command(&bad, "c.yaml").unwrap_err();
+            assert!(err.to_string().contains(needle), "expected {needle:?} in: {err}");
+        }
+    }
+
+    #[test]
+    fn rejects_ascii_int_param_and_stride_smaller_than_width() {
+        let cmd = r#"
+schema: openbaud/command@v0
+name: t
+params:
+  - { name: n, type: ascii_int }
+frame: { text: "{n}" }
+"#;
+        let err = parse_command(cmd, "c.yaml").unwrap_err();
+        assert!(err.to_string().contains("not a param type"), "{err}");
+
+        let bad = ARRAY_CMD.replace(
+            "samples: { at: 4, type: u8, count: { field: n_points }, scale: 0.5 }",
+            "samples: { at: 4, type: u16le, count: { field: n_points }, stride: 1 }",
+        );
+        let err = parse_command(&bad, "c.yaml").unwrap_err();
+        assert!(err.to_string().contains("smaller than the element width"), "{err}");
+    }
+
+    const SPLIT_CMD: &str = r#"
+schema: openbaud/command@v0
+name: read_trace
+frame: { text: "TRAC?\n" }
+response:
+  match: { delimiter: "\n" }
+  parse:
+    regex: 'F=(?P<flags>\S+) V=(?P<values>.*)$'
+    types: { flags: hex_int }
+    split:
+      values: { sep: ",", type: float }
+"#;
+
+    #[test]
+    fn parses_split_and_hex_int_types() {
+        let c = parse_command(SPLIT_CMD, "c.yaml").unwrap();
+        let parse = c.response.as_ref().unwrap().parse.as_ref().unwrap();
+        let split = parse.split.as_ref().unwrap();
+        assert_eq!(split["values"].sep, ",");
+        assert_eq!(split["values"].type_name, "float");
+    }
+
+    #[test]
+    fn rejects_bad_split_specs() {
+        for (from, to, needle) in [
+            // split key must be a named capture
+            ("values: { sep: \",\", type: float }", "nope: { sep: \",\", type: float }", "no named capture"),
+            // split element type restricted
+            ("type: float }", "type: bytes }", "not one of int, float, string, hex_int"),
+            // separator must not be empty
+            ("sep: \",\"", "sep: \"\"", "must not be empty"),
+            // a capture cannot be in both types and split
+            ("types: { flags: hex_int }", "types: { values: string }", "both types and split"),
+            // hex_int is fine, other unknown type names are not
+            ("types: { flags: hex_int }", "types: { flags: hexint }", "not one of int, float, string, hex_int"),
+        ] {
+            let bad = SPLIT_CMD.replace(from, to);
+            assert_ne!(bad, SPLIT_CMD, "replacement {from:?} did not apply");
+            let err = parse_command(&bad, "c.yaml").unwrap_err();
+            assert!(err.to_string().contains(needle), "expected {needle:?} in: {err}");
+        }
+
+        // split only applies to regex parsing
+        let bad = ARRAY_CMD.replace(
+            "    fields:",
+            "    split:\n      x: { sep: \",\", type: int }\n    fields:",
+        );
+        let err = parse_command(&bad, "c.yaml").unwrap_err();
+        assert!(err.to_string().contains("only applies to regex"), "{err}");
     }
 
     const WORKFLOW: &str = r#"

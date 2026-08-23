@@ -3,5 +3,6 @@
 
 pub mod engine;
 pub mod mcp;
+pub mod output;
 pub mod run;
 pub mod workspace;

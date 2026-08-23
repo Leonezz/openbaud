@@ -1,29 +1,48 @@
-//! The ten MCP tools: schemas and dispatch.
+//! The eleven MCP tools: schemas and dispatch.
 
 use crate::engine::session::Session;
 use crate::engine::transport::{self, open_port, resolve_selector};
 use crate::mcp::Ctx;
+use crate::output::{self, shape_result};
 use crate::run;
 use crate::workspace::Device;
 use anyhow::{anyhow, bail};
 use openbaud_core::format::{FramingSpec, MatchSpec, Risk};
 use openbaud_core::framing::{Framing, MatchRule};
 use openbaud_core::hex;
+use openbaud_core::schema::{example, json_schema, SchemaKind};
 use serde_json::{json, Map, Value};
 use std::sync::Arc;
 
 pub const SERVER_INSTRUCTIONS: &str = "openbaud gives you structured, audited access to serial \
 ports plus a workspace knowledge format. Device knowledge lives in devices/<name>/ \
 (profile.yaml, commands/*.yaml, workflows/*.yaml, notes.md) in the current workspace — read \
-those files directly, and sediment what you learn about a device into them. Port 'mock:echo' \
-always exists for smoke-testing without hardware; 'replay:<capture path>' replays a recorded \
-.obcap. Every write is appended to .openbaud/audit.jsonl. Prefer run_command (typed, parsed, \
-provenance-tracked) over raw send/request once a command exists.";
+those files directly, and sediment what you learn about a device into them. Use the schema \
+tool to get the full JSON Schema and an annotated example of each format before writing or \
+editing YAML under devices/. Port 'mock:echo' always exists for smoke-testing without \
+hardware; 'replay:<capture path>' replays a recorded .obcap. Every write is appended to \
+.openbaud/audit.jsonl. Prefer run_command (typed, parsed, provenance-tracked) over raw \
+send/request once a command exists.";
 
 /// Default framing when neither profile nor caller specifies one: frame on a
 /// 30 ms receive gap, a sane exploration default.
 fn default_framing() -> Framing {
     Framing::Idle { idle_ms: 30 }
+}
+
+/// Input-schema fragment for the shared `max_inline_bytes` tool parameter.
+fn max_inline_bytes_schema() -> Value {
+    json!({
+        "type": "integer",
+        "default": output::DEFAULT_MAX_INLINE_BYTES,
+        "description": "Result JSONs longer than this many bytes are written in full to \
+            .openbaud/out/ and returned as a summary carrying a full_result path — keeps huge \
+            payloads out of your context. Raise it to force large results inline."
+    })
+}
+
+fn arg_max_inline(args: &Value) -> anyhow::Result<usize> {
+    Ok(arg_u64_or(args, "max_inline_bytes", output::DEFAULT_MAX_INLINE_BYTES as u64)? as usize)
 }
 
 pub fn list() -> Vec<Value> {
@@ -61,7 +80,8 @@ pub fn list() -> Vec<Value> {
             "inputSchema": { "type": "object", "required": ["session_id"], "properties": {
                 "session_id": { "type": "string" },
                 "timeout_ms": { "type": "integer", "default": 500 },
-                "max_frames": { "type": "integer", "default": 32 }
+                "max_frames": { "type": "integer", "default": 32 },
+                "max_inline_bytes": max_inline_bytes_schema()
             }},
             "annotations": ro,
         }),
@@ -82,7 +102,8 @@ pub fn list() -> Vec<Value> {
                 "hex": { "type": "string" },
                 "text": { "type": "string" },
                 "match": { "type": "object" },
-                "timeout_ms": { "type": "integer", "default": 3000 }
+                "timeout_ms": { "type": "integer", "default": 3000 },
+                "max_inline_bytes": max_inline_bytes_schema()
             }},
         }),
         json!({
@@ -94,7 +115,8 @@ pub fn list() -> Vec<Value> {
                 "params": { "type": "object" },
                 "session_id": { "type": "string" },
                 "port": { "type": "string", "description": "Optional when session_id is given or the device profile has a selector" },
-                "acknowledge_risk": { "type": "boolean" }
+                "acknowledge_risk": { "type": "boolean" },
+                "max_inline_bytes": max_inline_bytes_schema()
             }},
         }),
         json!({
@@ -105,8 +127,18 @@ pub fn list() -> Vec<Value> {
                 "workflow": { "type": "string" },
                 "session_id": { "type": "string" },
                 "port": { "type": "string", "description": "Optional when session_id is given or the device profile has a selector" },
-                "acknowledge_risk": { "type": "boolean" }
+                "acknowledge_risk": { "type": "boolean" },
+                "max_inline_bytes": max_inline_bytes_schema()
             }},
+        }),
+        json!({
+            "name": "schema",
+            "description": "The authoritative JSON Schema (or, with example=true, an annotated YAML example) of the openbaud knowledge formats — profile, command, workflow. Call this before writing or modifying any YAML under devices/: it is generated from the exact types that parse those files and includes the semantic rules the schema grammar cannot express.",
+            "inputSchema": { "type": "object", "required": ["kind"], "properties": {
+                "kind": { "type": "string", "enum": ["profile", "command", "workflow"] },
+                "example": { "type": "boolean", "default": false, "description": "Return an annotated YAML example instead of the JSON Schema" }
+            }},
+            "annotations": ro,
         }),
         json!({
             "name": "capture_start",
@@ -141,8 +173,9 @@ pub async fn call(name: &str, args: Value, ctx: &Arc<Ctx>) -> anyhow::Result<Val
             let session = ctx.sessions.get(arg_str(&args, "session_id")?)?;
             let timeout = arg_u64_or(&args, "timeout_ms", 500)?;
             let max = arg_u64_or(&args, "max_frames", 32)? as usize;
+            let max_inline = arg_max_inline(&args)?;
             let result = session.read_frames(timeout, max.max(1)).await?;
-            Ok(serde_json::to_value(result)?)
+            shape_result(serde_json::to_value(result)?, &ctx.workspace.root, "read", max_inline)
         }
         "send" => tool_send(args, ctx).await,
         "request" => tool_request(args, ctx).await,
@@ -159,6 +192,7 @@ pub async fn call(name: &str, args: Value, ctx: &Arc<Ctx>) -> anyhow::Result<Val
             let session = ctx.sessions.get(arg_str(&args, "session_id")?)?;
             Ok(serde_json::to_value(session.capture_stop()?)?)
         }
+        "schema" => tool_schema(&args),
         other => bail!("unknown tool {other:?}"),
     }
 }
@@ -237,6 +271,21 @@ fn resolve_framing(
     Ok(default_framing())
 }
 
+fn tool_schema(args: &Value) -> anyhow::Result<Value> {
+    let kind_str = arg_str(args, "kind")?;
+    let kind = match kind_str {
+        "profile" => SchemaKind::Profile,
+        "command" => SchemaKind::Command,
+        "workflow" => SchemaKind::Workflow,
+        other => bail!("unknown schema kind {other:?} (expected profile, command or workflow)"),
+    };
+    Ok(if args.get("example").and_then(Value::as_bool).unwrap_or(false) {
+        json!({ "kind": kind_str, "example": example(kind) })
+    } else {
+        json!({ "kind": kind_str, "schema": json_schema(kind) })
+    })
+}
+
 fn payload_bytes(args: &Value) -> anyhow::Result<Vec<u8>> {
     match (args.get("hex").and_then(Value::as_str), args.get("text").and_then(Value::as_str)) {
         (Some(h), None) => Ok(hex::parse_hex(h)?),
@@ -294,9 +343,10 @@ async fn tool_request(args: Value, ctx: &Arc<Ctx>) -> anyhow::Result<Value> {
             None => MatchRule::Idle { idle_ms: 50 },
         };
         let timeout = arg_u64_or(&args, "timeout_ms", 3000)?;
-        Ok((session, data, rule, timeout))
+        let max_inline = arg_max_inline(&args)?;
+        Ok((session, data, rule, timeout, max_inline))
     })();
-    let (session, data, rule, timeout) = match staged {
+    let (session, data, rule, timeout, max_inline) = match staged {
         Ok(ok) => ok,
         Err(e) => {
             audit_fail(ctx, json!({ "tool": "request", "session": sid }), &e)?;
@@ -313,7 +363,8 @@ async fn tool_request(args: Value, ctx: &Arc<Ctx>) -> anyhow::Result<Value> {
         "detail": outcome.as_ref().err().map(|e| format!("{e:#}")),
     }))?;
     let raw = outcome?;
-    Ok(json!({ "hex": hex::to_hex(&raw), "text": hex::to_text_lossy(&raw) }))
+    let result = json!({ "hex": hex::to_hex(&raw), "text": hex::to_text_lossy(&raw) });
+    shape_result(result, &ctx.workspace.root, "request", max_inline)
 }
 
 /// Session for run_command/run_workflow: an existing one by id, or an
@@ -383,12 +434,15 @@ async fn tool_run_command(args: Value, ctx: &Arc<Ctx>) -> anyhow::Result<Value> 
         return Err(e);
     }
 
-    let staged = (|| match args.get("params") {
-        Some(Value::Object(m)) => Ok(m.clone()),
-        Some(other) => bail!("params must be an object, got {other}"),
-        None => Ok(Map::new()),
+    let staged = (|| {
+        let params = match args.get("params") {
+            Some(Value::Object(m)) => m.clone(),
+            Some(other) => bail!("params must be an object, got {other}"),
+            None => Map::new(),
+        };
+        Ok((params, arg_max_inline(&args)?))
     })();
-    let params = match staged {
+    let (params, max_inline) = match staged {
         Ok(p) => p,
         Err(e) => {
             audit_fail(ctx, base, &e)?;
@@ -435,6 +489,10 @@ async fn tool_run_command(args: Value, ctx: &Arc<Ctx>) -> anyhow::Result<Value> 
 
     let (mut result, ok) = exec?;
     attach_warnings(&mut result, &device);
+    // Shaping happens after auditing — the audit trail always sees the
+    // untruncated fields — and on both the success and the unmet-expectation
+    // paths, so a huge payload never floods the caller's context.
+    let result = shape_result(result, &ctx.workspace.root, "run_command", max_inline)?;
     if !ok {
         bail!(
             "command {device_name}/{command_name} expectation not met — outcome {}, expected {}. Full result:\n{}",
@@ -455,9 +513,9 @@ async fn tool_run_workflow(args: Value, ctx: &Arc<Ctx>) -> anyhow::Result<Value>
         let device = ctx.workspace.load_device(&device_name)?;
         let wf = device.workflow(&workflow_name)?.clone();
         let (risk, danger_steps) = run::workflow_risk(&device, &wf)?;
-        Ok((device, wf, risk, danger_steps))
+        Ok((device, wf, risk, danger_steps, arg_max_inline(&args)?))
     })();
-    let (device, wf, risk, danger_steps) = match staged {
+    let (device, wf, risk, danger_steps, max_inline) = match staged {
         Ok(ok) => ok,
         Err(e) => {
             audit_fail(ctx, base, &e)?;
@@ -533,6 +591,10 @@ async fn tool_run_workflow(args: Value, ctx: &Arc<Ctx>) -> anyhow::Result<Value>
     ctx.audit.record(base)?;
 
     attach_warnings(&mut result, &device);
+    // Shaping happens after the per-step audit extraction above (audit always
+    // sees the untruncated result) and applies to both the success and the
+    // failed-workflow paths.
+    let result = shape_result(result, &ctx.workspace.root, "run_workflow", max_inline)?;
     if !ok {
         bail!(
             "workflow {device_name}/{workflow_name} failed. Full result:\n{}",

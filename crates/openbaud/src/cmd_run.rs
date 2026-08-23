@@ -6,6 +6,7 @@ use anyhow::{anyhow, bail};
 use openbaud::engine::audit::Audit;
 use openbaud::engine::session::Session;
 use openbaud::engine::transport::open_port;
+use openbaud::output::shape_result;
 use openbaud::run::{execute_command, execute_workflow, resolve_port, workflow_risk};
 use openbaud::workspace::{Device, Workspace};
 use openbaud_core::format::Risk;
@@ -20,6 +21,7 @@ pub async fn run(
     sets: &[String],
     workspace_dir: &Path,
     acknowledge_risk: bool,
+    max_inline_bytes: usize,
 ) -> anyhow::Result<()> {
     let (device_name, name) = spec
         .split_once('/')
@@ -31,12 +33,16 @@ pub async fn run(
     // Commands shadow workflows by construction (name conflicts are rejected
     // at load time), so command lookup goes first.
     if device.commands.contains_key(name) {
-        return run_command_cli(spec, &device, name, port, sets, &workspace, &audit, acknowledge_risk)
-            .await;
+        return run_command_cli(
+            spec, &device, name, port, sets, &workspace, &audit, acknowledge_risk, max_inline_bytes,
+        )
+        .await;
     }
     if device.workflows.contains_key(name) {
-        return run_workflow_cli(spec, &device, name, port, sets, &workspace, &audit, acknowledge_risk)
-            .await;
+        return run_workflow_cli(
+            spec, &device, name, port, sets, &workspace, &audit, acknowledge_risk, max_inline_bytes,
+        )
+        .await;
     }
 
     let mut commands: Vec<&str> = device.commands.keys().map(String::as_str).collect();
@@ -78,6 +84,7 @@ async fn run_command_cli(
     workspace: &Workspace,
     audit: &Audit,
     acknowledge_risk: bool,
+    max_inline_bytes: usize,
 ) -> anyhow::Result<()> {
     let cmd = device.command(name)?;
 
@@ -137,6 +144,7 @@ async fn run_command_cli(
     audit.record(entry)?;
 
     let (result, ok) = exec?;
+    let result = shape_result(result, &workspace.root, "cli.run", max_inline_bytes)?;
     println!("{}", serde_json::to_string_pretty(&result)?);
     if !ok {
         bail!(
@@ -158,6 +166,7 @@ async fn run_workflow_cli(
     workspace: &Workspace,
     audit: &Audit,
     acknowledge_risk: bool,
+    max_inline_bytes: usize,
 ) -> anyhow::Result<()> {
     if !sets.is_empty() {
         bail!("--set does not apply to workflows — parameters live in the workflow's steps");
@@ -233,6 +242,9 @@ async fn run_workflow_cli(
         "detail": if ok { Value::Null } else { json!("workflow failed (see cli.run.step entries)") },
     }))?;
 
+    // Shaping happens after the per-step audit extraction above — audit
+    // entries always see the untruncated result.
+    let result = shape_result(result, &workspace.root, "cli.run", max_inline_bytes)?;
     println!("{}", serde_json::to_string_pretty(&result)?);
     if !ok {
         bail!("workflow {spec} failed");
