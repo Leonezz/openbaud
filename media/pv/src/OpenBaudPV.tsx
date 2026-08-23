@@ -254,7 +254,8 @@ const ToolLoop: React.FC = () => {
     ['openbaud.list_ports', '{}', 'Espressif · available'],
     ['openbaud.open', '115200 · 8N1', 'session s2'],
     ['openbaud.capture_start', 'lossless RX/TX', 'recording'],
-    ['openbaud.request', '10 B → match 196 B', 'CRC valid'],
+    ['openbaud.request', '10 B bounded probe', '196 B · CRC valid'],
+    ['openbaud.capture_stop', 'persist evidence', 'obp1-radar-seq42.obcap'],
   ];
   const active = Math.min(tools.length - 1, Math.floor(Math.max(0, frame - 42) / 48));
   return (
@@ -263,7 +264,7 @@ const ToolLoop: React.FC = () => {
         <div style={{display: 'flex', alignItems: 'end', justifyContent: 'space-between', marginBottom: 28}}>
           <div>
             <Pill>02 · AGENT TOOL LOOP</Pill>
-            <h1 style={{color: C.paper, fontSize: 62, letterSpacing: -3, margin: '22px 0 0'}}>Every hardware action is visible, typed, and auditable.</h1>
+            <h1 style={{color: C.paper, fontSize: 62, letterSpacing: -3, margin: '22px 0 0'}}>Every action is visible. Every write is audited.</h1>
           </div>
           <div style={{fontFamily: mono, color: C.muted, fontSize: 16}}>LIVE · /dev/cu.usbmodem213101</div>
         </div>
@@ -271,20 +272,20 @@ const ToolLoop: React.FC = () => {
           <ChatShell title="Codex · task transcript">
             <div style={{padding: '29px 32px', display: 'flex', flexDirection: 'column', gap: 26}}>
               <Message role="agent" compact opacity={appear(frame, 18)}>
-                I found one matching Espressif device. I’m opening it read-only and starting a capture before the first request.
+                The USB identity matches the test board. I’ll capture first, then send one bounded probe; no persistent state change is expected.
               </Message>
               <div style={{height: 1, background: C.line}} />
-              <Message role="agent" compact opacity={appear(frame, 226)}>
+              <Message role="agent" compact opacity={appear(frame, 250)}>
                 The frame is complete and its checksum passes. I’ll repeat the probe, compare the records, then encode the verified behavior as a command.
               </Message>
-              <div style={{opacity: appear(frame, 272), borderLeft: `3px solid ${C.green}`, padding: '13px 17px', background: 'rgba(97,242,176,.05)'}}>
+              <div style={{opacity: appear(frame, 292), borderLeft: `3px solid ${C.green}`, padding: '13px 17px', background: 'rgba(97,242,176,.05)'}}>
                 <div style={{fontFamily: mono, color: C.green, fontSize: 15}}>DECISION</div>
-                <div style={{color: C.paper, fontSize: 19, marginTop: 6}}>Safe to sediment: 8/8 responses valid</div>
+                <div style={{color: C.paper, fontSize: 19, marginTop: 6}}>Safe to sediment: 8/8 bounded probes valid</div>
               </div>
             </div>
           </ChatShell>
           <div style={{background: 'rgba(13,26,23,.9)', border: `1px solid ${C.line}`, borderRadius: 25, padding: '25px 27px'}}>
-            <div style={{fontFamily: mono, color: C.muted, fontSize: 15, marginBottom: 18}}>TOOL CALLS · APPEND-ONLY AUDIT</div>
+            <div style={{fontFamily: mono, color: C.muted, fontSize: 15, marginBottom: 18}}>TOOL CALLS · WRITE AUDIT IS APPEND-ONLY</div>
             <div style={{display: 'flex', flexDirection: 'column', gap: 12}}>
               {tools.map(([name, detail, result], i) => (
                 <ToolCall
@@ -297,7 +298,7 @@ const ToolLoop: React.FC = () => {
                 />
               ))}
             </div>
-            <div style={{marginTop: 20, display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10, opacity: appear(frame, 236)}}>
+            <div style={{marginTop: 16, display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10, opacity: appear(frame, 278)}}>
               {[
                 ['8', 'requests'],
                 ['0', 'CRC errors'],
@@ -309,7 +310,7 @@ const ToolLoop: React.FC = () => {
                 </div>
               ))}
             </div>
-            <div style={{height: 5, borderRadius: 99, background: '#172a25', marginTop: 20, overflow: 'hidden'}}>
+            <div style={{height: 5, borderRadius: 99, background: '#172a25', marginTop: 16, overflow: 'hidden'}}>
               <div style={{height: '100%', width: `${((active + 1) / tools.length) * 100}%`, background: `linear-gradient(90deg, ${C.green}, ${C.lime})`}} />
             </div>
           </div>

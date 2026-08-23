@@ -13,7 +13,7 @@ ffmpeg -y -loglevel error \
   -f lavfi -t 46 -i "sine=frequency=55:sample_rate=48000" \
   -f lavfi -t 46 -i "sine=frequency=82.5:sample_rate=48000" \
   -f lavfi -t 46 -i "sine=frequency=110:sample_rate=48000" \
-  -f lavfi -t 46 -i "anoisesrc=color=pink:amplitude=0.025:sample_rate=48000" \
+  -f lavfi -t 46 -i "anoisesrc=color=pink:amplitude=0.025:sample_rate=48000:seed=4242" \
   -f lavfi -t 0.5 -i "sine=frequency=660:sample_rate=48000" \
   -f lavfi -t 0.5 -i "sine=frequency=880:sample_rate=48000" \
   -filter_complex \
