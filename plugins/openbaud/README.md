@@ -28,18 +28,18 @@ Register the OpenBaud Git marketplace once, then install the plugin:
 
 ```sh
 codex plugin marketplace add Leonezz/openbaud
-codex plugin add openbaud@openbaud
+codex plugin add openbaud@openbaud-marketplace
 ```
 
 An HTTPS or SSH Git URL works as well. Private repositories require the user to
 already have Git access. To pin a reproducible release rather than track the
-default branch, add `--ref v0.1.0` to the marketplace command.
+default branch, add `--ref v0.1.1` to the marketplace command.
 
 To refresh a marketplace that tracks a branch and reinstall its latest plugin:
 
 ```sh
-codex plugin marketplace upgrade openbaud
-codex plugin add openbaud@openbaud
+codex plugin marketplace upgrade openbaud-marketplace
+codex plugin add openbaud@openbaud-marketplace
 ```
 
 ## Install from a checkout
@@ -48,7 +48,7 @@ Register the repository marketplace once, then install the plugin:
 
 ```sh
 codex plugin marketplace add /absolute/path/to/openbaud
-codex plugin add openbaud@openbaud
+codex plugin add openbaud@openbaud-marketplace
 ```
 
 Start a new Codex task after installation. The MCP process inherits that task's
