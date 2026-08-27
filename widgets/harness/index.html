@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>openbaud widget harness</title>
+    <style>
+      /* Fixture chrome only — neutral system colors, no palette of its own. */
+      :root {
+        color-scheme: light dark;
+      }
+      body {
+        margin: 0;
+        font: 13px/1.45 -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+        background: Canvas;
+        color: CanvasText;
+      }
+      header {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        align-items: center;
+        padding: 10px 14px;
+        border-bottom: 1px solid rgba(128, 128, 128, 0.35);
+      }
+      header .title {
+        font-weight: 700;
+        margin-right: 8px;
+      }
+      input,
+      select,
+      button {
+        font: inherit;
+        padding: 4px 8px;
+      }
+      #app-url {
+        min-width: 260px;
+        font-family: ui-monospace, Menlo, monospace;
+        font-size: 12px;
+      }
+      main {
+        display: grid;
+        grid-template-columns: minmax(360px, 780px) 1fr;
+        gap: 12px;
+        padding: 12px 14px;
+        align-items: start;
+      }
+      #frame {
+        width: 100%;
+        height: 640px;
+        border: 1px solid rgba(128, 128, 128, 0.35);
+        border-radius: 8px;
+        background: transparent;
+      }
+      #log {
+        margin: 0;
+        height: 640px;
+        overflow: auto;
+        font: 11px/1.5 ui-monospace, Menlo, monospace;
+        white-space: pre-wrap;
+        word-break: break-all;
+        border: 1px solid rgba(128, 128, 128, 0.35);
+        border-radius: 8px;
+        padding: 8px 10px;
+        background: rgba(128, 128, 128, 0.08);
+      }
+      label {
+        display: inline-flex;
+        gap: 4px;
+        align-items: center;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <span class="title">openbaud widget harness</span>
+      <input id="app-url" type="text" spellcheck="false" />
+      <button id="load" type="button">Load</button>
+      <label>
+        scenario
+        <select id="scenario">
+          <option value="list_ports">list_ports (3 candidates)</option>
+          <option value="radar">obp1 radar frame</option>
+        </select>
+      </label>
+      <label>
+        open →
+        <select id="open-mode">
+          <option value="ok">success</option>
+          <option value="ebusy">EBUSY failure</option>
+        </select>
+      </label>
+      <button id="send-scenario" type="button">Send tool-input + result</button>
+      <button id="next-frame" type="button">Next radar frame</button>
+      <button id="toggle-theme" type="button">Toggle theme</button>
+    </header>
+    <main>
+      <iframe id="frame" title="widget under test" sandbox="allow-scripts allow-same-origin"></iframe>
+      <pre id="log"></pre>
+    </main>
+    <script type="module" src="./host.ts"></script>
+  </body>
+</html>

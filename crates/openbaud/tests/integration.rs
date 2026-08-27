@@ -9,7 +9,7 @@ use openbaud::workspace::Workspace;
 use openbaud_core::exec::{build_frame, parse_response};
 use openbaud_core::format::{parse_command, Transport};
 use openbaud_core::framing::{Framing, MatchRule};
-use serde_json::{json, Map};
+use serde_json::{json, Map, Value};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -141,6 +141,7 @@ fn ctx_for(dir: &tempfile::TempDir) -> Arc<Ctx> {
         sessions: SessionManager::default(),
         workspace: Workspace::at(dir.path()),
         audit: Audit::new(dir.path()).unwrap(),
+        client_info: Default::default(),
     })
 }
 
@@ -747,4 +748,152 @@ fn cli_schema_example_prints_yaml() {
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert!(!stdout.trim().is_empty());
     assert!(stdout.contains("openbaud/command@v0"), "got: {stdout}");
+}
+
+// ---- MCP protocol surface (JSON-RPC layer, for Apps hosts) ----
+
+#[tokio::test]
+async fn rpc_tool_call_carries_structured_content() {
+    let dir = scaffold_workspace();
+    let ctx = ctx_for(&dir);
+
+    let result = openbaud::mcp::handle("tools/call", json!({ "name": "list_ports", "arguments": {} }), &ctx)
+        .await
+        .expect("list_ports succeeds");
+
+    let structured = result.get("structuredContent").expect("structuredContent present");
+    assert!(structured["ports"].is_array(), "structured: {structured}");
+    // Widget and model must see the same data: text block parses to structuredContent.
+    let text = result["content"][0]["text"].as_str().expect("text block");
+    let from_text: Value = serde_json::from_str(text).expect("text block is JSON");
+    assert_eq!(&from_text, structured);
+}
+
+#[tokio::test]
+async fn rpc_tool_error_stays_text_only() {
+    let dir = scaffold_workspace();
+    let ctx = ctx_for(&dir);
+
+    let result = openbaud::mcp::handle(
+        "tools/call",
+        json!({ "name": "run_command", "arguments": { "device": "echodev", "command": "wipe", "port": "mock:echo" } }),
+        &ctx,
+    )
+    .await
+    .expect("tool errors are Ok envelopes with isError");
+
+    assert_eq!(result["isError"], json!(true));
+    assert!(result.get("structuredContent").is_none(), "error path must stay byte-identical for non-Apps hosts");
+    let text = result["content"][0]["text"].as_str().expect("text block");
+    assert!(text.contains("danger"), "got: {text}");
+}
+
+#[tokio::test]
+async fn rpc_initialize_records_client_info() {
+    let dir = scaffold_workspace();
+    let ctx = ctx_for(&dir);
+
+    let result = openbaud::mcp::handle(
+        "initialize",
+        json!({
+            "protocolVersion": "2025-06-18",
+            "clientInfo": { "name": "claude-desktop", "version": "1.0.0" }
+        }),
+        &ctx,
+    )
+    .await
+    .expect("initialize succeeds");
+
+    assert!(result["capabilities"]["tools"].is_object());
+    let recorded = ctx.client_info.get().expect("clientInfo recorded for host routing");
+    assert_eq!(recorded["name"], json!("claude-desktop"));
+}
+
+#[tokio::test]
+async fn rpc_initialize_declares_resources_capability() {
+    let dir = scaffold_workspace();
+    let ctx = ctx_for(&dir);
+
+    let result = openbaud::mcp::handle("initialize", json!({}), &ctx).await.unwrap();
+    assert!(result["capabilities"]["resources"].is_object(), "got: {result}");
+}
+
+#[tokio::test]
+async fn rpc_resources_list_serves_ui_templates() {
+    let dir = scaffold_workspace();
+    let ctx = ctx_for(&dir);
+
+    let result = openbaud::mcp::handle("resources/list", json!({}), &ctx).await.unwrap();
+    let resources = result["resources"].as_array().expect("resources array");
+    assert_eq!(resources.len(), 2);
+    for r in resources {
+        let uri = r["uri"].as_str().expect("uri");
+        assert!(uri.starts_with("ui://openbaud/"), "got: {uri}");
+        assert_eq!(r["mimeType"], json!("text/html;profile=mcp-app"));
+        assert!(r["name"].is_string());
+    }
+}
+
+#[tokio::test]
+async fn rpc_resources_read_returns_embedded_html() {
+    let dir = scaffold_workspace();
+    let ctx = ctx_for(&dir);
+
+    let result = openbaud::mcp::handle(
+        "resources/read",
+        json!({ "uri": "ui://openbaud/viewer.html" }),
+        &ctx,
+    )
+    .await
+    .unwrap();
+
+    let content = &result["contents"][0];
+    assert_eq!(content["uri"], json!("ui://openbaud/viewer.html"));
+    assert_eq!(content["mimeType"], json!("text/html;profile=mcp-app"));
+    let html = content["text"].as_str().expect("inline html");
+    assert!(html.len() > 10_000, "embedded widget looks too small: {} bytes", html.len());
+    assert!(html.to_lowercase().contains("<!doctype html"), "not an html document");
+}
+
+#[tokio::test]
+async fn rpc_resources_read_unknown_uri_is_loud() {
+    let dir = scaffold_workspace();
+    let ctx = ctx_for(&dir);
+
+    let err = openbaud::mcp::handle(
+        "resources/read",
+        json!({ "uri": "ui://openbaud/nope.html" }),
+        &ctx,
+    )
+    .await
+    .expect_err("unknown uri must be an RPC error, not empty contents");
+    assert_eq!(err.code, -32002);
+    assert!(err.message.contains("nope.html"), "got: {}", err.message);
+}
+
+#[tokio::test]
+async fn tools_list_binds_ui_templates_consistently() {
+    let bound: Vec<(String, String)> = tools::list()
+        .into_iter()
+        .filter_map(|t| {
+            let uri = t["_meta"]["ui"]["resourceUri"].as_str()?.to_string();
+            Some((t["name"].as_str().unwrap().to_string(), uri))
+        })
+        .collect();
+
+    let find = |name: &str| -> Option<&str> {
+        bound.iter().find(|(n, _)| n == name).map(|(_, u)| u.as_str())
+    };
+    assert_eq!(find("list_ports"), Some("ui://openbaud/port-picker.html"));
+    assert_eq!(find("run_command"), Some("ui://openbaud/viewer.html"));
+    assert_eq!(find("request"), Some("ui://openbaud/viewer.html"));
+    assert_eq!(find("read"), Some("ui://openbaud/viewer.html"));
+
+    // Every bound uri must actually be served by resources/list.
+    let served = openbaud::mcp::resources::list();
+    let served: Vec<&str> =
+        served["resources"].as_array().unwrap().iter().map(|r| r["uri"].as_str().unwrap()).collect();
+    for (name, uri) in &bound {
+        assert!(served.contains(&uri.as_str()), "tool {name} binds unserved uri {uri}");
+    }
 }

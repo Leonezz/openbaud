@@ -2,6 +2,7 @@
 //! initialize / ping / tools/list / tools/call. Hand-rolled on purpose — four
 //! methods, zero protocol-SDK drift.
 
+pub mod resources;
 pub mod tools;
 
 use crate::engine::audit::Audit;
@@ -16,6 +17,9 @@ pub struct Ctx {
     pub sessions: SessionManager,
     pub workspace: Workspace,
     pub audit: Audit,
+    /// Client identity from `initialize` (name/version), kept for host-capability
+    /// routing (e.g. Apps confirm-card vs elicitation). Self-reported, unverifiable.
+    pub client_info: std::sync::OnceLock<Value>,
 }
 
 const PROTOCOL_FALLBACK: &str = "2025-06-18";
@@ -58,21 +62,30 @@ pub async fn serve(ctx: Arc<Ctx>) -> anyhow::Result<()> {
     Ok(())
 }
 
-struct RpcError {
-    code: i64,
-    message: String,
+#[derive(Debug)]
+pub struct RpcError {
+    pub code: i64,
+    pub message: String,
 }
 
-async fn handle(method: &str, params: Value, ctx: &Arc<Ctx>) -> Result<Value, RpcError> {
+/// Handle one JSON-RPC request. Public as the protocol-layer test seam:
+/// integration tests drive this directly instead of going through stdio.
+pub async fn handle(method: &str, params: Value, ctx: &Arc<Ctx>) -> Result<Value, RpcError> {
     match method {
         "initialize" => {
             let requested = params
                 .get("protocolVersion")
                 .and_then(Value::as_str)
                 .unwrap_or(PROTOCOL_FALLBACK);
+            if let Some(client) = params.get("clientInfo") {
+                let _ = ctx.client_info.set(client.clone());
+            }
             Ok(json!({
                 "protocolVersion": requested,
-                "capabilities": { "tools": { "listChanged": false } },
+                "capabilities": {
+                    "tools": { "listChanged": false },
+                    "resources": { "listChanged": false },
+                },
                 "serverInfo": {
                     "name": "openbaud",
                     "version": env!("CARGO_PKG_VERSION"),
@@ -82,6 +95,15 @@ async fn handle(method: &str, params: Value, ctx: &Arc<Ctx>) -> Result<Value, Rp
         }
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({ "tools": tools::list() })),
+        "resources/list" => Ok(resources::list()),
+        "resources/read" => {
+            let uri = params
+                .get("uri")
+                .and_then(Value::as_str)
+                .ok_or_else(|| RpcError { code: -32602, message: "resources/read requires uri".into() })?;
+            resources::read(uri)
+                .ok_or_else(|| RpcError { code: -32002, message: format!("unknown resource {uri:?}") })
+        }
         "tools/call" => {
             let name = params
                 .get("name")
@@ -90,12 +112,15 @@ async fn handle(method: &str, params: Value, ctx: &Arc<Ctx>) -> Result<Value, Rp
                 .to_string();
             let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
             match tools::call(&name, args, ctx).await {
-                Ok(result) => Ok(json!({
-                    "content": [{
-                        "type": "text",
-                        "text": serde_json::to_string_pretty(&result).expect("tool results are valid JSON"),
-                    }],
-                })),
+                Ok(result) => {
+                    let text = serde_json::to_string_pretty(&result).expect("tool results are valid JSON");
+                    // Same shaped (summarized) value in both channels: the model reads
+                    // the text block, an Apps widget consumes structuredContent.
+                    Ok(json!({
+                        "content": [{ "type": "text", "text": text }],
+                        "structuredContent": result,
+                    }))
+                }
                 Err(e) => Ok(json!({
                     "content": [{ "type": "text", "text": format!("error: {e:#}") }],
                     "isError": true,

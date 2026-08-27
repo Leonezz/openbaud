@@ -75,6 +75,7 @@ async fn main() {
                     sessions: engine::session::SessionManager::default(),
                     workspace: workspace::Workspace::at(&root),
                     audit: engine::audit::Audit::new(&root)?,
+                    client_info: Default::default(),
                 }))
             };
             match ctx() {

@@ -47,6 +47,14 @@ jobs:
             os: windows-latest
     steps:
       - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: widgets/pnpm-lock.yaml
       - name: Build bundled runtime
         shell: bash
         run: plugins/openbaud/scripts/build-runtime

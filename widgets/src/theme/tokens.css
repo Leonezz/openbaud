@@ -1,0 +1,194 @@
+/* Design Tokens - Auto-generated */
+/* Do not edit directly - modify tokens.json instead */
+
+/* === PRIMITIVES === */
+:root {
+  --primitive-color-graphite-paper: #f7f7f8;
+  --primitive-color-graphite-cloud: #f6f6f7;
+  --primitive-color-graphite-fog: #ececec;
+  --primitive-color-graphite-border: #e2e3e5;
+  --primitive-color-graphite-silver: #9aa0a6;
+  --primitive-color-graphite-slate: #666b70;
+  --primitive-color-graphite-shade: #5f6469;
+  --primitive-color-graphite-dusk: #565b60;
+  --primitive-color-graphite-line: #35383c;
+  --primitive-color-graphite-ridge: #2e3236;
+  --primitive-color-graphite-seam: #26282b;
+  --primitive-color-graphite-panel: #1b1d20;
+  --primitive-color-graphite-ink: #1a1c1e;
+  --primitive-color-graphite-pit: #17191c;
+  --primitive-color-graphite-night: #131416;
+  --primitive-color-graphite-well: #101214;
+  --primitive-color-graphite-frost: #e8eaec;
+  --primitive-color-mint-brand: #61f2b0;
+  --primitive-color-mint-soft: #4cc79a;
+  --primitive-color-mint-lime: #c7ff6b;
+  --primitive-color-chart-green: #17a678;
+  --primitive-color-chart-blue: #3b82e8;
+  --primitive-color-chart-amber: #b97f10;
+  --primitive-color-chart-violet: #9257ee;
+  --primitive-color-ramp-intensity-1: #0e3a2d;
+  --primitive-color-ramp-intensity-2: #14573f;
+  --primitive-color-ramp-intensity-3: #178a5f;
+  --primitive-color-ramp-intensity-4: #2cc389;
+  --primitive-color-ramp-intensity-5: #61f2b0;
+  --primitive-color-ramp-thermal-1: #3a2402;
+  --primitive-color-ramp-thermal-2: #6b4506;
+  --primitive-color-ramp-thermal-3: #a26a0b;
+  --primitive-color-ramp-thermal-4: #d99a2e;
+  --primitive-color-ramp-thermal-5: #ffcf7d;
+  --primitive-color-status-light-ok: #0c7a55;
+  --primitive-color-status-light-warn: #8a5a00;
+  --primitive-color-status-light-danger: #b3261e;
+  --primitive-color-status-light-danger-solid: #c62f2f;
+  --primitive-color-status-dark-warn: #ffbd65;
+  --primitive-color-status-dark-danger: #ff8f85;
+  --primitive-color-status-dark-danger-solid: #c73f38;
+  --primitive-color-neutral-white: #ffffff;
+  --primitive-color-evergreen-ink: #07110f;
+  --primitive-color-evergreen-well: #081411;
+  --primitive-color-evergreen-panel: #0d1a17;
+  --primitive-color-evergreen-line: #23473f;
+  --primitive-color-evergreen-mist: #8da69e;
+  --primitive-color-evergreen-paper: #f3f7ee;
+  --primitive-font-ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif;
+  --primitive-font-mono: ui-monospace, 'SF Mono', 'Cascadia Code', 'Roboto Mono', Menlo, monospace;
+  --primitive-fontSize-2xs: 10px;
+  --primitive-fontSize-xs: 11px;
+  --primitive-fontSize-sm: 12px;
+  --primitive-fontSize-base: 13px;
+  --primitive-fontSize-watermark: 42px;
+  --primitive-spacing-1: 4px;
+  --primitive-spacing-2: 6px;
+  --primitive-spacing-3: 8px;
+  --primitive-spacing-4: 10px;
+  --primitive-spacing-5: 12px;
+  --primitive-spacing-6: 14px;
+  --primitive-radius-sm: 4px;
+  --primitive-radius-md: 7px;
+  --primitive-radius-lg: 8px;
+  --primitive-radius-xl: 10px;
+  --primitive-radius-full: 999px;
+  --primitive-size-inline-card: 720px;
+  --primitive-size-icon: 14px;
+  --primitive-size-led: 7px;
+  --primitive-duration-hover: 180ms;
+  --primitive-duration-pulse: 1.6s;
+  --primitive-duration-shimmer: 1.4s;
+  --primitive-shadow-card-light: 0 1px 3px rgba(0, 0, 0, 0.06);
+  --primitive-shadow-card-dark: 0 1px 3px rgba(0, 0, 0, 0.4);
+}
+
+/* === SEMANTIC === */
+:root {
+  --color-bg: #f6f6f7;
+  --color-surface: #ffffff;
+  --color-ink: #1a1c1e;
+  --color-muted: #666b70;
+  --color-faint: #9aa0a6;
+  --color-accent: #0c7a55;
+  --color-accent-weak: rgba(12, 122, 85, 0.08);
+  --color-ok: #0c7a55;
+  --color-warn: #8a5a00;
+  --color-warn-weak: rgba(138, 90, 0, 0.1);
+  --color-danger: #b3261e;
+  --color-danger-solid: #c62f2f;
+  --color-danger-weak: rgba(198, 47, 47, 0.08);
+  --color-border: #e2e3e5;
+  --color-hairline: #ececec;
+  --color-field: #f7f7f8;
+  --color-brand: #4cc79a;
+  --color-brand-glow: rgba(76, 199, 154, 0.18);
+  --color-scope-bg: #101214;
+  --color-scope-surface: #17191c;
+  --color-scope-ink: #e8eaec;
+  --color-scope-muted: #9aa0a6;
+  --color-scope-faint: #565b60;
+  --color-scope-line: #2e3236;
+  --color-scope-grid: rgba(255, 255, 255, 0.05);
+  --color-series-1: #17a678;
+  --color-series-2: #3b82e8;
+  --color-series-3: #b97f10;
+  --color-series-4: #9257ee;
+  --color-hex-magic: #3b82e8;
+  --color-hex-seq: #9257ee;
+  --color-hex-payload: #17a678;
+  --color-hex-crc: #b97f10;
+  --typography-font-ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif;
+  --typography-font-data: ui-monospace, 'SF Mono', 'Cascadia Code', 'Roboto Mono', Menlo, monospace;
+  --motion-hover: 180ms;
+}
+
+/* === COMPONENTS === */
+:root {
+  --card-bg: #ffffff;
+  --card-border: #e2e3e5;
+  --card-radius: 10px;
+  --card-max-width: 720px;
+  --card-head-pad: {primitive.spacing.4} {primitive.spacing.6};
+  --card-body-pad: 14px;
+  --card-foot-bg: #f7f7f8;
+  --button-font-size: 12px;
+  --button-radius: 7px;
+  --button-pad: {primitive.spacing.2} {primitive.spacing.6};
+  --button-primary-bg: #0c7a55;
+  --button-primary-fg: #ffffff;
+  --button-ghost-fg: #666b70;
+  --button-arm-bg: #c62f2f;
+  --button-arm-fg: #ffffff;
+  --button-focus-ring: 2px solid;
+  --chip-font: ui-monospace, 'SF Mono', 'Cascadia Code', 'Roboto Mono', Menlo, monospace;
+  --chip-font-size: 11px;
+  --chip-radius: 999px;
+  --chip-border: #e2e3e5;
+  --chip-fg: #666b70;
+  --badge-sim-fg: #8a5a00;
+  --badge-sim-bg: rgba(138, 90, 0, 0.1);
+  --badge-sim-radius: 4px;
+  --badge-replay-fg: #3b82e8;
+  --badge-replay-bg: rgba(59, 130, 232, 0.1);
+  --badge-replay-radius: 4px;
+  --led-size: 7px;
+  --led-ok: #0c7a55;
+  --led-warn: #8a5a00;
+  --led-err: #b3261e;
+  --led-off: #9aa0a6;
+  --led-glow: none;
+  --scope-bg: #101214;
+  --scope-border: #2e3236;
+  --scope-radius: 8px;
+  --scope-grid-size: 32px;
+  --scope-grid: rgba(255, 255, 255, 0.05);
+  --hex-font-size: 12px;
+  --hex-line-height: 2;
+  --hex-underline-width: 2px;
+  --hex-bg: #f7f7f8;
+  --table-row-hover: rgba(12, 122, 85, 0.08);
+  --table-row-selected: rgba(12, 122, 85, 0.08);
+  --table-head-fg: #666b70;
+  --icon-size: 14px;
+  --icon-stroke-width: 1.8;
+  --watermark-font-size: 42px;
+  --watermark-fg: rgba(255, 255, 255, 0.07);
+  --watermark-rotate: -18deg;
+}
+
+/* === DARK MODE === */
+.dark {
+  --color-bg: #131416;
+  --color-surface: #1b1d20;
+  --color-ink: #ececec;
+  --color-muted: #9aa0a6;
+  --color-faint: #5f6469;
+  --color-accent: #4cc79a;
+  --color-accent-weak: rgba(76, 199, 154, 0.1);
+  --color-ok: #4cc79a;
+  --color-warn: #ffbd65;
+  --color-warn-weak: rgba(255, 189, 101, 0.12);
+  --color-danger: #ff8f85;
+  --color-danger-solid: #c73f38;
+  --color-danger-weak: rgba(255, 143, 133, 0.1);
+  --color-border: #35383c;
+  --color-hairline: #26282b;
+  --color-field: #17191c;
+}

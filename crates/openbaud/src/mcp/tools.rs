@@ -2,7 +2,7 @@
 
 use crate::engine::session::Session;
 use crate::engine::transport::{self, open_port, resolve_selector};
-use crate::mcp::Ctx;
+use crate::mcp::{resources, Ctx};
 use crate::output::{self, shape_result};
 use crate::run;
 use crate::workspace::Device;
@@ -81,6 +81,7 @@ pub fn list() -> Vec<Value> {
             "description": "List serial ports (USB metadata included) plus the always-available mock:echo loopback.",
             "inputSchema": { "type": "object", "properties": {} },
             "annotations": read_only_hardware,
+            "_meta": { "ui": { "resourceUri": resources::PORT_PICKER_URI } },
         }),
         json!({
             "name": "open",
@@ -114,6 +115,7 @@ pub fn list() -> Vec<Value> {
                 "max_inline_bytes": max_inline_bytes_schema()
             }},
             "annotations": read_only_hardware,
+            "_meta": { "ui": { "resourceUri": resources::VIEWER_URI } },
         }),
         json!({
             "name": "send",
@@ -137,6 +139,7 @@ pub fn list() -> Vec<Value> {
                 "max_inline_bytes": max_inline_bytes_schema()
             }},
             "annotations": hardware_write,
+            "_meta": { "ui": { "resourceUri": resources::VIEWER_URI } },
         }),
         json!({
             "name": "run_command",
@@ -151,6 +154,7 @@ pub fn list() -> Vec<Value> {
                 "max_inline_bytes": max_inline_bytes_schema()
             }},
             "annotations": hardware_write,
+            "_meta": { "ui": { "resourceUri": resources::VIEWER_URI } },
         }),
         json!({
             "name": "run_workflow",

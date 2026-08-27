@@ -1,0 +1,56 @@
+/* Viewer app styles.
+ * The radar block is verbatim from the design SoT card-specific sheet
+ * (docs/design/mcp-apps-ui/library/widgets/w02-radar-panel.html) — keep it
+ * byte-comparable when the SoT changes. Colors are tokens from widget.css only. */
+
+.viewer-root {
+  padding: 16px;
+}
+
+/* ===== W2 radar panel (SoT copy) ===== */
+.ob-scope--radar { height: 420px; }
+canvas.radar { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+
+.live-tag {
+  font-family: var(--font-mono); font-size: 10px; font-weight: 700;
+  letter-spacing: 1px; color: var(--muted);
+}
+.ob-btn--icon { padding: 4px 9px; font-size: 14px; line-height: 1; }
+
+/* 帧率分段控件 */
+.ob-seg { display: inline-flex; border: 1px solid var(--card-border); border-radius: 7px; overflow: hidden; }
+.ob-seg button {
+  font-family: var(--font-mono); font-size: 11px; padding: 5px 10px;
+  border: 0; background: transparent; color: var(--muted); cursor: pointer;
+}
+.ob-seg button + button { border-left: 1px solid var(--card-border); }
+.ob-seg button.is-on { background: var(--accent-weak); color: var(--accent); font-weight: 700; }
+.ob-seg button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.ob-seg button[disabled] { opacity: 0.45; cursor: not-allowed; }
+
+/* intensity 色标(单系列，无图例框；5 格 ramp + min/max，2px 表面缝) */
+.ob-ramp {
+  position: absolute; right: 10px; bottom: 26px;
+  display: flex; align-items: center;
+  font-family: var(--font-mono); font-size: 9px; color: var(--scope-muted);
+}
+.ob-ramp i { width: 13px; height: 6px; border-radius: 1px; margin-right: 2px; }
+.ob-ramp i:last-of-type { margin-right: 0; }
+.ob-ramp .t { color: var(--scope-faint); letter-spacing: 0.4px; margin-right: 6px; }
+.ob-ramp .v { margin: 0 5px; }
+
+.ob-scope__meta .is-pass { color: var(--brand); }
+
+/* ===== viewer additions (tokens only) ===== */
+
+/* Live values stay readable as text even when the canvas is frozen
+   (prefers-reduced-motion) — never animation-only information. */
+.viewer-kpi {
+  margin-top: 8px;
+  display: flex; gap: 14px; flex-wrap: wrap;
+  font-family: var(--font-mono); font-size: 11px; color: var(--muted);
+}
+.viewer-kpi b { color: var(--ink); font-weight: 600; }
+
+.jsonkv-index { color: var(--faint); }
+.jsonkv-muted { color: var(--muted); }

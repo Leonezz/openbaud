@@ -36,6 +36,18 @@ case "$kernel:$machine" in
     ;;
 esac
 
+if ! command -v pnpm >/dev/null 2>&1; then
+  printf 'pnpm not found: it is required to build the MCP widget UI.\n' >&2
+  printf 'Install it with "corepack enable pnpm" or "npm install -g pnpm@10".\n' >&2
+  exit 69
+fi
+
+cd "$repo_root/widgets"
+pnpm install --frozen-lockfile
+pnpm build
+mkdir -p "$repo_root/crates/openbaud/src/mcp/ui"
+cp dist/port-picker.html dist/viewer.html "$repo_root/crates/openbaud/src/mcp/ui/"
+
 destination="$plugin_root/bin/$bundle_target/openbaud${executable_suffix:-}"
 cargo_home=${CARGO_HOME:-$(CDPATH= cd -- "$(dirname -- "$(command -v cargo)")/.." && pwd)}
 rust_sysroot=$(rustc --print sysroot)

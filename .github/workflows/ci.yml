@@ -25,6 +25,29 @@ jobs:
       - name: Validate Skill and plugin package
         run: python3 scripts/validate-package.py
 
+  widgets:
+    name: Widget checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: widgets/pnpm-lock.yaml
+      - name: Install widget dependencies
+        working-directory: widgets
+        run: pnpm install --frozen-lockfile
+      - name: Typecheck widgets
+        working-directory: widgets
+        run: pnpm typecheck
+      - name: Build widgets
+        working-directory: widgets
+        run: pnpm build
+
   platform-build:
     name: Build ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
@@ -50,6 +73,14 @@ jobs:
             os: windows-latest
     steps:
       - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: widgets/pnpm-lock.yaml
       - name: Compile and test workspace
         shell: bash
         run: cargo test --workspace --locked
