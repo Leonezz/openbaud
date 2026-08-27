@@ -19,6 +19,10 @@ const ARRAY_INLINE_FULL: usize = 16;
 /// Longer arrays keep this many leading elements plus a truncation marker.
 const ARRAY_SUMMARY_HEAD: usize = 8;
 
+/// Workspace-relative directory holding spilled full results. Also the only
+/// directory `show_result` and the result resource will read from.
+pub const SPILL_DIR: &str = ".openbaud/out";
+
 /// Shape a result JSON for inline return. Results whose pretty serialization
 /// fits in `max_inline_bytes` pass through untouched; larger ones are written
 /// in full (pretty) to `<root>/.openbaud/out/res-<ms>-<tool>.json` and
@@ -56,7 +60,7 @@ pub fn shape_result(
 /// a same-millisecond name collision appends a counter. Returns the path
 /// relative to the workspace root.
 fn write_full(pretty: &str, workspace_root: &Path, tool: &str) -> anyhow::Result<String> {
-    let out_dir = workspace_root.join(".openbaud").join("out");
+    let out_dir = workspace_root.join(SPILL_DIR);
     std::fs::create_dir_all(&out_dir)
         .with_context(|| format!("cannot create {}", out_dir.display()))?;
     let now_ms = std::time::SystemTime::now()
@@ -76,7 +80,7 @@ fn write_full(pretty: &str, workspace_root: &Path, tool: &str) -> anyhow::Result
                 file.write_all(pretty.as_bytes())
                     .and_then(|()| file.write_all(b"\n"))
                     .with_context(|| format!("cannot write {}", path.display()))?;
-                return Ok(format!(".openbaud/out/{name}"));
+                return Ok(format!("{SPILL_DIR}/{name}"));
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => counter += 1,
             Err(e) => {

@@ -101,7 +101,8 @@ pub async fn handle(method: &str, params: Value, ctx: &Arc<Ctx>) -> Result<Value
                 .get("uri")
                 .and_then(Value::as_str)
                 .ok_or_else(|| RpcError { code: -32602, message: "resources/read requires uri".into() })?;
-            resources::read(uri)
+            resources::read(uri, &ctx.workspace.root)
+                .map_err(|e| RpcError { code: -32002, message: format!("{e:#}") })?
                 .ok_or_else(|| RpcError { code: -32002, message: format!("unknown resource {uri:?}") })
         }
         "tools/call" => {

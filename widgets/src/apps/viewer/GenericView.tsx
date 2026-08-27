@@ -2,25 +2,21 @@ import { Card, CardSpacer } from '../../components/Card'
 import { Chip } from '../../components/Chip'
 import type { OpenbaudSummary } from '../../mcp/useWidget'
 import { JsonKv } from './JsonKv'
+import type { ResultRef } from './state'
 
 export interface GenericViewProps {
   readonly structured: OpenbaudSummary
-  readonly toolName: string | undefined
+  readonly resultRef: ResultRef
 }
 
-/** Generic fallback: any non-polar tool result as a recursive key/value card. */
-export function GenericView({ structured, toolName }: GenericViewProps) {
+/** Generic fallback: any non-polar result as a recursive key/value card. */
+export function GenericView({ structured, resultRef }: GenericViewProps) {
   const command = typeof structured.command === 'string' ? structured.command : undefined
   const outcome = typeof structured.outcome === 'string' ? structured.outcome : undefined
-  const fullResult = typeof structured.full_result === 'string' ? structured.full_result : undefined
-  const title =
-    command !== undefined
-      ? `Result — ${command}`
-      : toolName !== undefined
-        ? `Result — ${toolName}`
-        : 'Tool result'
+  const title = command !== undefined ? `Result — ${command}` : 'Result'
   const ok = outcome === 'normal' || outcome === 'sent'
-  const body = Object.fromEntries(Object.entries(structured).filter(([key]) => key !== 'full_result'))
+  const provenance =
+    resultRef.path ?? (resultRef.source === 'file' ? resultRef.uri : 'inline result')
   return (
     <div className="viewer-root">
       <Card
@@ -34,14 +30,14 @@ export function GenericView({ structured, toolName }: GenericViewProps) {
           ) : undefined
         }
         foot={
-          fullResult !== undefined ? (
-            <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11 }}>
-              full result: {fullResult}
-            </span>
-          ) : undefined
+          <>
+            <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11 }}>{provenance}</span>
+            <CardSpacer />
+            {resultRef.bytes !== undefined && <Chip>{resultRef.bytes} B</Chip>}
+          </>
         }
       >
-        <JsonKv value={body} />
+        <JsonKv value={structured} />
       </Card>
     </div>
   )

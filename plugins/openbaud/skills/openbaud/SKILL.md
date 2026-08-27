@@ -50,6 +50,18 @@ the claim. Use `replay:<capture path>` for hardware-free regression tests.
 
 Prefer verified commands over repeated raw byte construction.
 
+Two tools address the user rather than the hardware, so invoke them
+deliberately and not by habit:
+
+- `show_result`: render a saved result for the user, given the `path` from an
+  earlier `full_result`. The view reads the complete payload itself, so large
+  data reaches the user without entering your context. Use it when the shape of
+  the data is the point; say a two-field answer instead of drawing it.
+- `ask_port`: ask which port to use when several could be the device and the
+  choice is the user's. It opens nothing — the answer returns to you and you
+  call `open`. For your own discovery use `list_ports`, which reports device
+  matches, ports held by a session, and `/dev/tty.*` twins.
+
 ## Safety boundary
 
 Serial writes can reconfigure, actuate, or permanently damage hardware.

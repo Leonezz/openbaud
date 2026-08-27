@@ -17,16 +17,8 @@ canvas.radar { position: absolute; inset: 0; width: 100%; height: 100%; display:
 }
 .ob-btn--icon { padding: 4px 9px; font-size: 14px; line-height: 1; }
 
-/* 帧率分段控件 */
-.ob-seg { display: inline-flex; border: 1px solid var(--card-border); border-radius: 7px; overflow: hidden; }
-.ob-seg button {
-  font-family: var(--font-mono); font-size: 11px; padding: 5px 10px;
-  border: 0; background: transparent; color: var(--muted); cursor: pointer;
-}
-.ob-seg button + button { border-left: 1px solid var(--card-border); }
-.ob-seg button.is-on { background: var(--accent-weak); color: var(--accent); font-weight: 700; }
-.ob-seg button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
-.ob-seg button[disabled] { opacity: 0.45; cursor: not-allowed; }
+/* The SoT card's .ob-seg poll-rate control is intentionally absent: show_result
+   renders one saved result, so the widget has no scan rate to set. */
 
 /* intensity 色标(单系列，无图例框；5 格 ramp + min/max，2px 表面缝) */
 .ob-ramp {
@@ -43,8 +35,8 @@ canvas.radar { position: absolute; inset: 0; width: 100%; height: 100%; display:
 
 /* ===== viewer additions (tokens only) ===== */
 
-/* Live values stay readable as text even when the canvas is frozen
-   (prefers-reduced-motion) — never animation-only information. */
+/* Scope values stay readable as text next to the canvas — never
+   render-only information, and nothing here depends on animation. */
 .viewer-kpi {
   margin-top: 8px;
   display: flex; gap: 14px; flex-wrap: wrap;

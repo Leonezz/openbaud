@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { BadgeSim } from '../../components/Badges'
 import { Btn } from '../../components/Btn'
 import { Card, CardSpacer } from '../../components/Card'
@@ -6,140 +6,85 @@ import { Chip } from '../../components/Chip'
 import { Icon } from '../../components/Icon'
 import { Led } from '../../components/Led'
 import { ObError } from '../../components/ObError'
-import { ObEmpty } from '../../components/ObEmpty'
-import type { ToolArgs, ToolResult, WidgetHandle } from '../../mcp/useWidget'
-import { drawPolar, type PolarFrame, type PolarPoint } from '../../render/polar'
-import { radarScale } from './dispatch'
-import { intensityRange, type RadarState } from './state'
-import { RATE_OPTIONS, useRadarLoop } from './useRadarLoop'
-import { useReducedMotion } from './useReducedMotion'
+import type { WidgetHandle } from '../../mcp/useWidget'
+import { drawPolar, type PolarFrame } from '../../render/polar'
+import { radarScale, type PolarScan } from './dispatch'
+import { intensityRange, type ResultRef } from './state'
 
 const RAMP_TOKENS = ['--ramp-g1', '--ramp-g2', '--ramp-g3', '--ramp-g4', '--ramp-g5'] as const
-const POLL_DISABLED_REASON =
-  'the host did not provide the originating tool call — continuous scan unavailable'
 
 export interface PolarViewProps {
   readonly widget: WidgetHandle
-  readonly radar: RadarState
-  readonly toolName: string | undefined
-  readonly toolArgs: ToolArgs
-  readonly onResult: (result: ToolResult) => void
-  readonly onFailure: (message: string) => void
+  readonly scan: PolarScan
+  readonly resultRef: ResultRef
 }
 
 function formatAngle(angleDeg: number): string {
   return `${Number.isInteger(angleDeg) ? angleDeg : angleDeg.toFixed(1)}°`
 }
 
-/** Radar panel per the w02 design card: scope, corner meta, ramp, controls. */
-export function PolarView({ widget, radar, toolName, toolArgs, onResult, onFailure }: PolarViewProps) {
-  const reducedMotion = useReducedMotion()
+/**
+ * Radar panel per the w02 design card: scope, corner meta, ramp.
+ *
+ * One saved scan, drawn once. There is no animation loop here — the sweep line
+ * is parked at the newest bearing and the frame carries no afterglow, because a
+ * stored result has no predecessor to fade. That leaves the prefers-reduced-
+ * motion policy entirely to the CSS block in theme/widget.css: no JS-driven
+ * motion exists to freeze.
+ */
+export function PolarView({ widget, scan, resultRef }: PolarViewProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
-  const scan = radar.current
+  const [modeError, setModeError] = useState<string | undefined>(undefined)
 
-  const canPoll = toolName !== undefined && toolArgs !== undefined
-  const poll = useCallback(async (): Promise<boolean> => {
-    if (toolName === undefined) {
-      onFailure(`cannot poll — ${POLL_DISABLED_REASON}`)
-      return false
-    }
-    try {
-      onResult(await widget.callTool(toolName, toolArgs))
-      return true
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
-      onFailure(`tool call failed: ${message} — auto-scan paused`)
-      return false
-    }
-  }, [widget, toolName, toolArgs, onResult, onFailure])
-  const loop = useRadarLoop({ canPoll, reducedMotion, poll })
-
-  const range = useMemo(() => intensityRange(radar), [radar])
-  const scale = useMemo(() => {
-    const points: PolarPoint[] = [...(scan?.points ?? []), ...(radar.ghost?.points ?? [])]
-    return radarScale(points)
-  }, [scan, radar.ghost])
-  const frame: PolarFrame | undefined = useMemo(
-    () =>
-      scan === undefined
-        ? undefined
-        : {
-            points: scan.points,
-            ghost: radar.ghost?.points,
-            intensityMin: range.min,
-            intensityMax: range.max,
-          },
-    [scan, radar.ghost, range],
-  )
-
-  const draw = useCallback(
-    (sweepDeg: number | null): void => {
-      const canvas = canvasRef.current
-      if (!canvas || frame === undefined) return
-      drawPolar(canvas, frame, { ...scale, sweepDeg, annotateNearest: true })
-    },
-    [frame, scale],
+  const range = useMemo(() => intensityRange(scan), [scan])
+  const scale = useMemo(() => radarScale(scan.points), [scan])
+  const frame: PolarFrame = useMemo(
+    () => ({ points: scan.points, intensityMin: range.min, intensityMax: range.max }),
+    [scan, range],
   )
 
   // Frozen-frame sweep angle: where the newest data ends (design default).
-  const staticSweepDeg = scan?.points.at(-1)?.angleDeg ?? null
+  const sweepDeg = scan.points.at(-1)?.angleDeg ?? null
 
-  const animating = loop.playing && !reducedMotion && frame !== undefined
+  const draw = useCallback((): void => {
+    const canvas = canvasRef.current
+    if (!canvas) return
+    drawPolar(canvas, frame, { ...scale, sweepDeg, annotateNearest: true })
+  }, [frame, scale, sweepDeg])
+
   useEffect(() => {
-    if (!animating) {
-      draw(staticSweepDeg)
-      return
-    }
-    let raf = 0
-    const start = performance.now()
-    const base = staticSweepDeg ?? 0
-    const tick = (now: number): void => {
-      // One revolution per poll period, so the sweep tracks the chosen rate.
-      draw((base + ((now - start) / 1000) * loop.rateHz * 360) % 360)
-      raf = requestAnimationFrame(tick)
-    }
-    raf = requestAnimationFrame(tick)
-    return () => cancelAnimationFrame(raf)
-  }, [animating, draw, staticSweepDeg, loop.rateHz])
+    draw()
+  }, [draw])
 
   useEffect(() => {
     const canvas = canvasRef.current
     if (!canvas) return
-    const observer = new ResizeObserver(() => draw(staticSweepDeg))
+    const observer = new ResizeObserver(() => draw())
     observer.observe(canvas)
     return () => observer.disconnect()
-  }, [draw, staticSweepDeg])
+  }, [draw])
 
   const modes = widget.hostContext?.availableDisplayModes
   const fullscreen = widget.displayMode === 'fullscreen'
   const canFullscreen = fullscreen || modes === undefined || modes.includes('fullscreen')
   const onFullscreen = useCallback((): void => {
+    setModeError(undefined)
     widget.requestDisplayMode(fullscreen ? 'inline' : 'fullscreen').catch((error: unknown) => {
-      const message = error instanceof Error ? error.message : String(error)
-      onFailure(`display mode request failed: ${message}`)
+      const detail = error instanceof Error ? error.message : String(error)
+      setModeError(`display mode request failed: ${detail}`)
     })
-  }, [widget, fullscreen, onFailure])
-
-  if (scan === undefined) {
-    // ingestResult only enters polar state with a good frame; keep the guard loud.
-    return (
-      <div className="viewer-root">
-        <Card title="Radar">
-          <ObEmpty>No radar frame received yet.</ObEmpty>
-        </Card>
-      </div>
-    )
-  }
+  }, [widget, fullscreen])
 
   const nearest = scan.points.reduce((a, b) => (b.distanceMm < a.distanceMm ? b : a))
+  const outcomeOk = scan.outcome === undefined || scan.outcome === 'normal'
   const blParts: string[] = []
   if (scan.uptimeMs !== undefined) blParts.push(`uptime ${(scan.uptimeMs / 1000).toFixed(1)}s`)
   blParts.push(
     `${scan.points.length} pts${scan.truncatedPoints > 0 ? ` (+${scan.truncatedPoints} truncated)` : ''}`,
   )
   const fullscreenTitle = fullscreen ? 'Exit fullscreen' : 'Fullscreen'
-  const port = typeof toolArgs?.port === 'string' ? toolArgs.port : undefined
-  const sessionId = typeof toolArgs?.session_id === 'string' ? toolArgs.session_id : undefined
+  const sourceLabel = resultRef.source === 'file' ? 'saved result' : 'inline result'
+  const hasProvenance = resultRef.path !== undefined || resultRef.bytes !== undefined
 
   return (
     <div className="viewer-root">
@@ -148,6 +93,7 @@ export function PolarView({ widget, radar, toolName, toolArgs, onResult, onFailu
         head={
           <>
             {scan.simulatedScene && <BadgeSim />}
+            {!outcomeOk && <Chip variant="warn">outcome: {scan.outcome}</Chip>}
             <CardSpacer />
             {canFullscreen && (
               <Btn
@@ -160,44 +106,24 @@ export function PolarView({ widget, radar, toolName, toolArgs, onResult, onFailu
                 <Icon name="expand" />
               </Btn>
             )}
-            <Led
-              tone={radar.error !== undefined ? 'warn' : loop.playing ? 'ok' : 'off'}
-              pulse={loop.playing}
-            />
-            <span className="live-tag">{loop.playing ? 'LIVE' : 'PAUSED'}</span>
+            <Led tone={outcomeOk ? 'ok' : 'warn'} />
+            <span className="live-tag">SNAPSHOT</span>
           </>
         }
         foot={
-          <>
-            <Btn
-              onClick={loop.toggle}
-              disabled={!canPoll}
-              title={canPoll ? undefined : POLL_DISABLED_REASON}
-            >
-              <Icon name={loop.playing ? 'pause' : 'play'} />
-              {loop.playing ? 'Pause' : 'Resume'}
-            </Btn>
-            <div className="ob-seg" role="group" aria-label="Poll rate">
-              {RATE_OPTIONS.map((rate) => (
-                <button
-                  key={rate}
-                  type="button"
-                  className={rate === loop.rateHz ? 'is-on' : undefined}
-                  aria-pressed={rate === loop.rateHz}
-                  disabled={!canPoll}
-                  title={canPoll ? undefined : POLL_DISABLED_REASON}
-                  onClick={() => loop.setRate(rate)}
-                >
-                  {rate} Hz
-                </button>
-              ))}
-            </div>
-            <CardSpacer />
-            {port !== undefined && (
-              <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11 }}>{port}</span>
-            )}
-            {sessionId !== undefined && <Chip>session: {sessionId}</Chip>}
-          </>
+          // An inline result has neither path nor size; skip the bar entirely
+          // rather than leave an empty strip under the scope.
+          hasProvenance ? (
+            <>
+              {resultRef.path !== undefined && (
+                <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11 }}>
+                  {resultRef.path}
+                </span>
+              )}
+              <CardSpacer />
+              {resultRef.bytes !== undefined && <Chip>{resultRef.bytes} B</Chip>}
+            </>
+          ) : undefined
         }
       >
         <div className="ob-scope ob-scope--radar">
@@ -217,7 +143,7 @@ export function PolarView({ widget, radar, toolName, toolArgs, onResult, onFailu
             <span>{blParts.join(' · ')}</span>
           </div>
           <div className="ob-scope__meta ob-scope__meta--br">
-            <span>{loop.playing ? `poll ${loop.rateHz.toFixed(1)} Hz` : 'paused'}</span>
+            <span>{sourceLabel}</span>
           </div>
           {scan.hasIntensity && (
             <div className="ob-ramp">
@@ -235,13 +161,12 @@ export function PolarView({ widget, radar, toolName, toolArgs, onResult, onFailu
             nearest <b>{Math.round(nearest.distanceMm)} mm</b> @ {formatAngle(nearest.angleDeg)}
           </span>
         </div>
-        {radar.error !== undefined && (
+        {modeError !== undefined && (
           <div style={{ marginTop: 10 }}>
             <ObError
-              title="Scan failed"
-              detail={radar.error}
-              onRetry={!loop.playing && canPoll ? loop.resume : undefined}
-              retryLabel="Resume"
+              title="Display mode unchanged"
+              detail={modeError}
+              onRetry={onFullscreen}
             />
           </div>
         )}

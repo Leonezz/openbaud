@@ -54,8 +54,50 @@
   gap: 6px;
   flex-wrap: wrap;
 }
+/* 占用说明:LED 与多行说明左对齐,文字自身换行而不是整块折行 */
+.pp-sub--warn {
+  color: var(--warn);
+  flex-wrap: nowrap;
+  align-items: flex-start;
+}
+.pp-sub--warn .ob-led {
+  margin-top: 4px;
+}
 .pp-table tr:last-child td {
   border-bottom: 0;
+}
+
+/* 匹配列:accent 匹配片 / warn 占用片 / 折叠孪生计数,右对齐可换行 */
+.pp-match {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  justify-content: flex-end;
+}
+.pp-nomatch {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.2px;
+  color: var(--faint);
+}
+
+/* agent 的提问理由:紧贴卡头的一条说明带 */
+.pp-ask {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--hairline);
+  font-size: 12px;
+  color: var(--muted);
+}
+.pp-ask__label {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+  color: var(--faint);
 }
 
 /* Open 按钮加载态:spinner 用 currentColor,不引新色 */

@@ -2,11 +2,14 @@
 // SDK's AppBridge, so this fixture exercises the wire protocol independently
 // of the library under test. JSON-RPC 2.0 over window.postMessage.
 import {
+  ASK_PORT_INPUT,
+  ASK_PORT_RESULT,
   LIST_PORTS_RESULT,
-  OPEN_EBUSY_MESSAGE,
-  OPEN_OK_RESULT,
   radarCommandResult,
   radarScanCount,
+  resultTextForUri,
+  showResultEnvelope,
+  SHOW_RESULT_INLINE,
   wrapToolError,
   wrapToolResult,
   type JsonObject,
@@ -37,7 +40,11 @@ const frame = el<HTMLIFrameElement>('#frame')
 const logEl = el<HTMLPreElement>('#log')
 const appUrlInput = el<HTMLInputElement>('#app-url')
 const scenarioSel = el<HTMLSelectElement>('#scenario')
-const openModeSel = el<HTMLSelectElement>('#open-mode')
+const ctxModeSel = el<HTMLSelectElement>('#ctx-mode')
+const resourceModeSel = el<HTMLSelectElement>('#resource-mode')
+
+/** Delay before a slow resources/read answers — long enough to see the skeleton. */
+const SLOW_RESOURCE_MS = 2500
 
 let theme: Theme = 'light'
 let radarIndex = 0
@@ -85,24 +92,42 @@ function hostContext(): JsonObject {
 function handleToolsCall(id: number | string, params: JsonObject): void {
   const name = typeof params.name === 'string' ? params.name : undefined
   switch (name) {
+    // list_ports has no UI binding, so the picker may call it for a rescan.
     case 'list_ports':
       respond(id, wrapToolResult(LIST_PORTS_RESULT))
       break
-    case 'open':
-      if (openModeSel.value === 'ebusy') {
-        respond(id, wrapToolError(OPEN_EBUSY_MESSAGE))
-      } else {
-        respond(id, wrapToolResult(OPEN_OK_RESULT))
-      }
+    case 'ask_port':
+      respond(id, wrapToolResult(ASK_PORT_RESULT))
       break
-    case 'run_command':
-      respond(id, wrapToolResult(radarCommandResult(radarIndex++)))
-      break
+    // No case for `open` or the other data tools (run_command, read,
+    // request…): under the 2026-08 contract only the agent calls those.
     default:
       respond(
         id,
         wrapToolError(`no canned result for tool ${JSON.stringify(name)} — add one to harness/fixtures.ts`),
       )
+  }
+}
+
+/** MCP resources/read: serves the full saved result show_result pointed at. */
+function handleResourcesRead(id: number | string, params: JsonObject): void {
+  const uri = typeof params.uri === 'string' ? params.uri : ''
+  if (resourceModeSel.value === 'fail') {
+    respondError(id, -32002, `resource ${uri} not found (harness: resource mode = fail)`)
+    return
+  }
+  const text = resultTextForUri(uri)
+  if (text === undefined) {
+    respondError(id, -32002, `harness has no fixture for resource ${JSON.stringify(uri)}`)
+    return
+  }
+  const send = (): void =>
+    respond(id, { contents: [{ uri, mimeType: 'application/json', text }] })
+  if (resourceModeSel.value === 'slow') {
+    log('harness', `delaying resources/read ${uri} by ${SLOW_RESOURCE_MS} ms`)
+    window.setTimeout(send, SLOW_RESOURCE_MS)
+  } else {
+    send()
   }
 }
 
@@ -114,7 +139,12 @@ function handleRequest(msg: JsonRpcMessage): void {
       respond(id, {
         protocolVersion: PROTOCOL_VERSION,
         hostInfo: { name: 'openbaud-harness', version: '0.0.0' },
-        hostCapabilities: { serverTools: {}, logging: {} },
+        hostCapabilities: {
+          serverTools: {},
+          serverResources: {},
+          logging: {},
+          updateModelContext: { text: {}, structuredContent: {} },
+        },
         hostContext: hostContext(),
       })
       break
@@ -127,6 +157,19 @@ function handleRequest(msg: JsonRpcMessage): void {
     case 'tools/call':
       handleToolsCall(id, (msg.params ?? {}) as JsonObject)
       break
+    case 'resources/read':
+      handleResourcesRead(id, (msg.params ?? {}) as JsonObject)
+      break
+    case 'ui/update-model-context':
+      // What the agent would receive; logged in full so the payload the
+      // picker pushes can be inspected.
+      log('model-context', JSON.stringify(msg.params, null, 2))
+      if (ctxModeSel.value === 'reject') {
+        respondError(id, -32001, 'harness: model context update rejected (ctx mode = reject)')
+      } else {
+        respond(id, {})
+      }
+      break
     case 'ping':
       respond(id, {})
       break
@@ -135,16 +178,26 @@ function handleRequest(msg: JsonRpcMessage): void {
   }
 }
 
-function sendScenario(): void {
-  if (scenarioSel.value === 'list_ports') {
-    notify('ui/notifications/tool-input', { arguments: {} })
-    notify('ui/notifications/tool-result', wrapToolResult(LIST_PORTS_RESULT))
-  } else {
-    notify('ui/notifications/tool-input', {
-      arguments: { device: 'openbaud-pv-board', command: 'obp1_radar_scan', params: { seq: 42 } },
-    })
-    notify('ui/notifications/tool-result', wrapToolResult(radarCommandResult(radarIndex++)))
+/** show_result for scan `index`: the envelope only — the payload is a resource. */
+function sendShowResult(index: number): void {
+  if (scenarioSel.value === 'show_result_inline') {
+    const full = radarCommandResult(index)
+    notify('ui/notifications/tool-input', { arguments: { data: full } })
+    notify('ui/notifications/tool-result', wrapToolResult(SHOW_RESULT_INLINE))
+    return
   }
+  const envelope = showResultEnvelope(index)
+  notify('ui/notifications/tool-input', { arguments: { path: envelope.path } })
+  notify('ui/notifications/tool-result', wrapToolResult(envelope))
+}
+
+function sendScenario(): void {
+  if (scenarioSel.value.startsWith('show_result')) {
+    sendShowResult(radarIndex++)
+    return
+  }
+  notify('ui/notifications/tool-input', { arguments: ASK_PORT_INPUT })
+  notify('ui/notifications/tool-result', wrapToolResult(ASK_PORT_RESULT))
 }
 
 window.addEventListener('message', (event: MessageEvent) => {
@@ -170,9 +223,9 @@ el<HTMLButtonElement>('#load').addEventListener('click', () => {
 
 el<HTMLButtonElement>('#send-scenario').addEventListener('click', sendScenario)
 
-el<HTMLButtonElement>('#next-frame').addEventListener('click', () => {
-  notify('ui/notifications/tool-result', wrapToolResult(radarCommandResult(radarIndex++)))
-  log('harness', `sent radar frame ${((radarIndex - 1) % radarScanCount()) + 1}/${radarScanCount()}`)
+el<HTMLButtonElement>('#next-result').addEventListener('click', () => {
+  sendShowResult(radarIndex++)
+  log('harness', `sent saved result ${((radarIndex - 1) % radarScanCount()) + 1}/${radarScanCount()}`)
 })
 
 el<HTMLButtonElement>('#toggle-theme').addEventListener('click', () => {

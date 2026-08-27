@@ -1,7 +1,10 @@
-// Pure schema dispatch for the viewer app: decides how a structuredContent
-// summary (crates/openbaud/src/run.rs execute_command shape, summarized per
-// output.rs) should be rendered. No DOM, no React — unit-testable as-is.
-import type { OpenbaudSummary, ToolArgs } from '../../mcp/useWidget'
+// Pure schema dispatch for the viewer app: decides how a full result object
+// (crates/openbaud/src/run.rs execute_command shape) should be rendered. The
+// object arrives from the openbaud://result/… resource show_result points at,
+// so arrays are complete; the truncation marker below still exists because a
+// small inline result may have been summarized per output.rs before it was
+// handed to show_result. No DOM, no React — unit-testable as-is.
+import type { OpenbaudSummary } from '../../mcp/useWidget'
 import type { PolarPoint } from '../../render/polar'
 
 export type JsonRecord = Record<string, unknown>
@@ -89,11 +92,11 @@ function findPolarArray(value: JsonRecord, depth: number): PointsHit | undefined
   return undefined
 }
 
-function asString(value: unknown): string | undefined {
+export function asString(value: unknown): string | undefined {
   return typeof value === 'string' ? value : undefined
 }
 
-function asNumber(value: unknown): number | undefined {
+export function asNumber(value: unknown): number | undefined {
   return typeof value === 'number' ? value : undefined
 }
 
@@ -126,19 +129,6 @@ export function dispatchResult(structured: OpenbaudSummary): DispatchedView {
       uptimeMs: asNumber(parsed.uptime_ms),
     },
   }
-}
-
-/**
- * Tool name for re-polling. The host names the originating tool in
- * hostContext.toolInfo.tool; without it, arguments carrying string device +
- * command fields can only be openbaud's run_command.
- */
-export function inferToolName(hostToolName: string | undefined, args: ToolArgs): string | undefined {
-  if (hostToolName !== undefined) return hostToolName
-  if (args !== undefined && typeof args.device === 'string' && typeof args.command === 'string') {
-    return 'run_command'
-  }
-  return undefined
 }
 
 export interface RadarScale {

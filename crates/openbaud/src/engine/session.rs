@@ -485,6 +485,20 @@ impl SessionManager {
         })
     }
 
+    /// (port name, session id) for every live session — lets the port list say
+    /// which ports are already held instead of leaving callers to hit EBUSY.
+    pub fn open_ports(&self) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = self
+            .sessions
+            .lock()
+            .unwrap()
+            .values()
+            .map(|s| (s.port_name.clone(), s.id.clone()))
+            .collect();
+        out.sort();
+        out
+    }
+
     pub fn close(&self, id: &str) -> anyhow::Result<()> {
         let session = self
             .sessions

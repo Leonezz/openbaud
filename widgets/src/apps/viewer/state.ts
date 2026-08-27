@@ -1,60 +1,62 @@
-// Viewer state machine (pure): every tool result — pushed by the host or
-// pulled by the poll loop — goes through ingestResult. Failures never clear
-// the last good radar frame; they surface as an explicit error banner.
-import { openbaudStructured, type OpenbaudSummary, type ToolResult } from '../../mcp/useWidget'
-import { dispatchResult, type PolarScan } from './dispatch'
+// Viewer state (pure). show_result hands the widget a deliberately tiny
+// envelope — { source, path?, uri?, bytes? } — so the model's context never
+// carries the payload. The full result JSON is fetched separately: from the
+// MCP resource named by `uri` (source "file"), or from the tool input's
+// `data` object (source "inline"). Nothing here polls: a saved result has no
+// next frame, so there is no previous frame either.
+import {
+  openbaudStructured,
+  type OpenbaudSummary,
+  type ReadResourceResult,
+  type ToolResult,
+} from '../../mcp/useWidget'
+import { asNumber, asString, dispatchResult, isRecord, type PolarScan } from './dispatch'
 
-export interface RadarState {
-  /** Last good frame (outcome normal); stays on screen through failures. */
-  readonly current: PolarScan | undefined
-  /** The frame before it, drawn as the 30% afterglow. */
-  readonly ghost: PolarScan | undefined
-  readonly error: string | undefined
-}
+/** Where the full result lives, per the show_result envelope. */
+export type ResultRef =
+  | {
+      readonly source: 'file'
+      /** openbaud://result/res-<ms>-<tool>.json — read via MCP resources/read. */
+      readonly uri: string
+      /** Workspace-relative path the server saved it under, when reported. */
+      readonly path: string | undefined
+      readonly bytes: number | undefined
+    }
+  | {
+      readonly source: 'inline'
+      readonly path: string | undefined
+      readonly bytes: number | undefined
+    }
 
-export const INITIAL_RADAR: RadarState = { current: undefined, ghost: undefined, error: undefined }
+export type ViewerState =
+  | { readonly kind: 'idle' }
+  | { readonly kind: 'loading'; readonly ref: ResultRef }
+  | { readonly kind: 'error'; readonly message: string }
+  | { readonly kind: 'generic'; readonly structured: OpenbaudSummary; readonly ref: ResultRef }
+  | { readonly kind: 'polar'; readonly scan: PolarScan; readonly ref: ResultRef }
 
-export function applyScan(state: RadarState, scan: PolarScan): RadarState {
-  return { current: scan, ghost: state.current, error: undefined }
-}
-
-export function applyFailure(state: RadarState, message: string): RadarState {
-  return { ...state, error: message }
-}
+export const INITIAL_VIEWER: ViewerState = { kind: 'idle' }
 
 export interface IntensityRange {
   readonly min: number
   readonly max: number
 }
 
-/** Union range over current+ghost — legend and dot colors must agree. */
-export function intensityRange(state: RadarState): IntensityRange {
-  const scans = [state.current, state.ghost].filter(
-    (scan): scan is PolarScan => scan !== undefined && scan.hasIntensity,
-  )
-  if (scans.length === 0) {
+/** Range behind both the dot colors and the legend — they must agree. */
+export function intensityRange(scan: PolarScan): IntensityRange {
+  if (!scan.hasIntensity) {
     // No intensity data: a symmetric fake range parks every 0-intensity point
     // on the middle ramp bin (the legend is hidden in this case).
     return { min: -2, max: 2 }
   }
   let min = Infinity
   let max = -Infinity
-  for (const scan of scans) {
-    for (const point of scan.points) {
-      if (point.intensity < min) min = point.intensity
-      if (point.intensity > max) max = point.intensity
-    }
+  for (const point of scan.points) {
+    if (point.intensity < min) min = point.intensity
+    if (point.intensity > max) max = point.intensity
   }
   return { min, max }
 }
-
-export type ViewerState =
-  | { readonly kind: 'idle' }
-  | { readonly kind: 'error'; readonly message: string }
-  | { readonly kind: 'generic'; readonly structured: OpenbaudSummary }
-  | { readonly kind: 'polar'; readonly radar: RadarState }
-
-export const INITIAL_VIEWER: ViewerState = { kind: 'idle' }
 
 export function errorText(result: ToolResult): string {
   const texts = result.content.flatMap((block) => (block.type === 'text' ? [block.text] : []))
@@ -62,38 +64,65 @@ export function errorText(result: ToolResult): string {
   return joined !== '' ? joined : 'tool call failed (host returned no error text)'
 }
 
-export function failWith(prev: ViewerState, message: string): ViewerState {
-  if (prev.kind === 'polar') {
-    return { kind: 'polar', radar: applyFailure(prev.radar, message) }
-  }
-  return { kind: 'error', message }
+export type Envelope =
+  | { readonly kind: 'ref'; readonly ref: ResultRef }
+  | { readonly kind: 'failed'; readonly message: string }
+
+function failed(message: string): Envelope {
+  return { kind: 'failed', message }
 }
 
-function describeNonScan(structured: OpenbaudSummary): string {
-  const outcome = typeof structured.outcome === 'string' ? structured.outcome : undefined
-  if (outcome !== undefined && outcome !== 'normal') {
-    return `frame outcome ${outcome} — expected normal; keeping last good frame`
-  }
-  return 'result carried no radar points — keeping last good frame'
-}
-
-export function ingestResult(prev: ViewerState, result: ToolResult): ViewerState {
-  if (result.isError) return failWith(prev, errorText(result))
+/** Reads the show_result envelope out of a tool result. Never guesses. */
+export function readEnvelope(result: ToolResult): Envelope {
+  if (result.isError) return failed(errorText(result))
   const structured = openbaudStructured(result)
   if (structured === undefined) {
-    return failWith(prev, 'tool result carried no structuredContent — nothing to render')
+    return failed('show_result returned no structuredContent — nothing to render')
   }
+  const source = structured.source
+  const path = asString(structured.path)
+  const bytes = asNumber(structured.bytes)
+  if (source === 'inline') return { kind: 'ref', ref: { source, path, bytes } }
+  if (source !== 'file') {
+    return failed(
+      `show_result envelope carries source ${JSON.stringify(source)} — expected "file" or "inline"`,
+    )
+  }
+  const uri = asString(structured.uri)
+  if (uri === undefined) {
+    return failed('show_result reported source "file" but carried no resource uri — nothing to read')
+  }
+  return { kind: 'ref', ref: { source, uri, path, bytes } }
+}
+
+/** contents[0].text of a resources/read result, parsed as the full result JSON. */
+export function parseResourceJson(result: ReadResourceResult, uri: string): OpenbaudSummary {
+  const first = result.contents[0]
+  if (first === undefined) {
+    throw new Error(`resource ${uri} came back with no contents`)
+  }
+  const text = (first as { text?: unknown }).text
+  if (typeof text !== 'string') {
+    throw new Error(`resource ${uri} carries no text content — a binary resource cannot be rendered`)
+  }
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text)
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error)
+    throw new Error(`resource ${uri} is not valid JSON: ${detail}`)
+  }
+  if (!isRecord(parsed)) {
+    throw new Error(
+      `resource ${uri} parsed to ${Array.isArray(parsed) ? 'an array' : typeof parsed} — expected a result object`,
+    )
+  }
+  return parsed as OpenbaudSummary
+}
+
+/** Schema dispatch on the full result: polar scope, or the generic KV card. */
+export function viewFor(structured: OpenbaudSummary, ref: ResultRef): ViewerState {
   const view = dispatchResult(structured)
-  if (view.kind === 'polar') {
-    const { scan } = view
-    if (scan.outcome !== undefined && scan.outcome !== 'normal') {
-      return failWith(prev, `frame outcome ${scan.outcome} — expected normal`)
-    }
-    const radar = prev.kind === 'polar' ? prev.radar : INITIAL_RADAR
-    return { kind: 'polar', radar: applyScan(radar, scan) }
-  }
-  if (prev.kind === 'polar') {
-    return { kind: 'polar', radar: applyFailure(prev.radar, describeNonScan(structured)) }
-  }
-  return { kind: 'generic', structured }
+  if (view.kind === 'polar') return { kind: 'polar', scan: view.scan, ref }
+  return { kind: 'generic', structured, ref }
 }

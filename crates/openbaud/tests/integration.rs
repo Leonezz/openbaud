@@ -332,7 +332,7 @@ async fn broken_command_file_does_not_block_device() {
 #[tokio::test]
 async fn tool_list_includes_mock_and_schemas() {
     let listed = tools::list();
-    assert_eq!(listed.len(), 11);
+    assert_eq!(listed.len(), 13);
     for tool in &listed {
         let annotations = tool["annotations"].as_object().unwrap_or_else(|| {
             panic!("tool {} is missing MCP behavior annotations", tool["name"])
@@ -872,7 +872,7 @@ async fn rpc_resources_read_unknown_uri_is_loud() {
 }
 
 #[tokio::test]
-async fn tools_list_binds_ui_templates_consistently() {
+async fn ui_binds_only_to_show_and_ask_tools() {
     let bound: Vec<(String, String)> = tools::list()
         .into_iter()
         .filter_map(|t| {
@@ -881,13 +881,21 @@ async fn tools_list_binds_ui_templates_consistently() {
         })
         .collect();
 
-    let find = |name: &str| -> Option<&str> {
-        bound.iter().find(|(n, _)| n == name).map(|(_, u)| u.as_str())
-    };
-    assert_eq!(find("list_ports"), Some("ui://openbaud/port-picker.html"));
-    assert_eq!(find("run_command"), Some("ui://openbaud/viewer.html"));
-    assert_eq!(find("request"), Some("ui://openbaud/viewer.html"));
-    assert_eq!(find("read"), Some("ui://openbaud/viewer.html"));
+    // Data tools the agent calls routinely must never drag a UI along:
+    // template binding is per-tool and unconditional, so a bound data tool
+    // would pop a card on every internal call.
+    for data_tool in ["list_ports", "open", "read", "request", "run_command", "run_workflow"] {
+        assert!(
+            !bound.iter().any(|(n, _)| n == data_tool),
+            "data tool {data_tool} must not bind a UI template"
+        );
+    }
+
+    let find =
+        |name: &str| -> Option<&str> { bound.iter().find(|(n, _)| n == name).map(|(_, u)| u.as_str()) };
+    assert_eq!(find("ask_port"), Some("ui://openbaud/port-picker.html"));
+    assert_eq!(find("show_result"), Some("ui://openbaud/viewer.html"));
+    assert_eq!(bound.len(), 2, "only show/ask tools carry UI: {bound:?}");
 
     // Every bound uri must actually be served by resources/list.
     let served = openbaud::mcp::resources::list();
@@ -895,5 +903,107 @@ async fn tools_list_binds_ui_templates_consistently() {
         served["resources"].as_array().unwrap().iter().map(|r| r["uri"].as_str().unwrap()).collect();
     for (name, uri) in &bound {
         assert!(served.contains(&uri.as_str()), "tool {name} binds unserved uri {uri}");
+    }
+}
+
+#[test]
+fn enriched_ports_flag_profile_match_alias_and_use() {
+    use openbaud::engine::transport::{enrich_ports, PortInfo};
+
+    let ports = vec![
+        PortInfo::usb("/dev/cu.usbmodem213101", "303A", "1001", Some("Espressif")),
+        PortInfo::usb("/dev/tty.usbmodem213101", "303A", "1001", Some("Espressif")),
+        PortInfo::usb("/dev/cu.usbserial-0001", "10C4", "EA60", None),
+        PortInfo::mock(),
+    ];
+    let selector: openbaud_core::format::SelectorSpec =
+        serde_json::from_value(json!({ "vid": "303A", "pid": "1001" })).unwrap();
+    let devices = vec![("openbaud-pv-board".to_string(), Some(selector)), ("nosel".to_string(), None)];
+    let open = vec![("/dev/cu.usbserial-0001".to_string(), "s1".to_string())];
+
+    let enriched = serde_json::to_value(enrich_ports(ports, &devices, &open)).unwrap();
+    let by_path = |p: &str| -> Value {
+        enriched.as_array().unwrap().iter().find(|e| e["path"] == p).unwrap().clone()
+    };
+
+    // The selector match is real data, not a guess from the manufacturer string.
+    assert_eq!(by_path("/dev/cu.usbmodem213101")["matches_devices"], json!(["openbaud-pv-board"]));
+    // macOS exposes one physical port twice; the tty twin points at the cu canonical.
+    assert_eq!(by_path("/dev/tty.usbmodem213101")["alias_of"], json!("/dev/cu.usbmodem213101"));
+    assert!(by_path("/dev/cu.usbmodem213101").get("alias_of").is_none());
+    // A port already held by a session must say so — this is the EBUSY case.
+    assert_eq!(by_path("/dev/cu.usbserial-0001")["open_session"], json!("s1"));
+    // Mock never matches a selector and carries no enrichment noise.
+    assert!(by_path("mock:echo").get("matches_devices").is_none());
+}
+
+#[tokio::test]
+async fn ask_port_returns_enriched_candidates_without_opening() {
+    let dir = scaffold_workspace();
+    let ctx = ctx_for(&dir);
+
+    let result = tools::call("ask_port", json!({ "reason": "which board is the radar?" }), &ctx)
+        .await
+        .unwrap();
+
+    assert_eq!(result["reason"], json!("which board is the radar?"));
+    let candidates = result["candidates"].as_array().expect("candidates array");
+    assert!(candidates.iter().any(|c| c["path"] == "mock:echo"), "got: {candidates:?}");
+    // Asking must not touch hardware: no session may exist afterwards.
+    assert!(ctx.sessions.get("s1").is_err(), "ask_port must not open anything");
+}
+
+#[tokio::test]
+async fn show_result_hands_the_widget_a_resource_uri_not_the_payload() {
+    let dir = scaffold_workspace();
+    let ctx = ctx_for(&dir);
+
+    // Stand in for a spilled result from an earlier oversized tool call.
+    let out = dir.path().join(".openbaud/out");
+    std::fs::create_dir_all(&out).unwrap();
+    let big: Vec<Value> = (0..36).map(|i| json!({ "angle_deg": i * 10, "distance_mm": 1000 + i })).collect();
+    let payload = json!({ "outcome": "normal", "parsed": { "points": big } });
+    std::fs::write(out.join("res-42-run_command.json"), serde_json::to_string(&payload).unwrap())
+        .unwrap();
+
+    let result = tools::call(
+        "show_result",
+        json!({ "path": ".openbaud/out/res-42-run_command.json" }),
+        &ctx,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result["source"], json!("file"));
+    assert_eq!(result["uri"], json!("openbaud://result/res-42-run_command.json"));
+    // The pointer must stay small — the payload belongs to the widget, not the model.
+    assert!(
+        serde_json::to_string(&result).unwrap().len() < 400,
+        "show_result must not echo the payload: {result}"
+    );
+
+    // The widget fetches the full 36 points through the resource, bypassing the model.
+    let read = openbaud::mcp::handle(
+        "resources/read",
+        json!({ "uri": "openbaud://result/res-42-run_command.json" }),
+        &ctx,
+    )
+    .await
+    .unwrap();
+    let text = read["contents"][0]["text"].as_str().unwrap();
+    let full: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(full["parsed"]["points"].as_array().unwrap().len(), 36);
+}
+
+#[tokio::test]
+async fn result_resource_rejects_paths_outside_the_spill_dir() {
+    let dir = scaffold_workspace();
+    let ctx = ctx_for(&dir);
+
+    for bad in ["openbaud://result/../../etc/passwd", "openbaud://result/sub/dir.json"] {
+        let err = openbaud::mcp::handle("resources/read", json!({ "uri": bad }), &ctx)
+            .await
+            .expect_err("traversal must be refused");
+        assert_eq!(err.code, -32002, "uri {bad} got: {}", err.message);
     }
 }

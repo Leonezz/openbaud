@@ -100,6 +100,29 @@ and returned as a summary: long strings and arrays are visibly truncated and
 the top-level `full_result` field points at the complete file — read it from
 there when you need every element.
 
+## Showing the user, and asking the user
+
+Two tools exist only to put something in front of the person. Every other tool
+is yours to call freely and silently; these two are deliberate acts, so use
+them when the user is the audience — not as a habit.
+
+- `show_result` renders a saved result (a polar plot for angular scans, a field
+  table otherwise) on hosts that can draw it. Pass the `path` from an earlier
+  `full_result`: the view reads the complete payload itself, so a 36-point scan
+  reaches the user's eyes without any of it entering your context. Reach for it
+  when the shape of the data is the point — scans, waveforms, long field sets —
+  and not for a two-field answer you can simply say.
+- `ask_port` asks which port to use when several could plausibly be the device
+  and the choice is genuinely the user's. It touches no hardware: the answer
+  arrives in your context and **you** then call `open`. For your own discovery
+  use `list_ports`, which already reports which workspace devices each port
+  matches, which ports a session is holding, and which are `/dev/tty.*` twins
+  of a canonical `/dev/cu.*` entry.
+
+On hosts without rendering both degrade to plain text — a candidate list you
+relay yourself, a pointer you can read from disk. Nothing breaks; the user just
+reads instead of looks.
+
 ## Workflows (openbaud/workflow@v0)
 
 A workflow is a *fixed sequence* of this device's commands plus a `finally`

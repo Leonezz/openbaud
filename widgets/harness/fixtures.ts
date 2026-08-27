@@ -1,6 +1,8 @@
 // Canned tool results for the harness host. Shapes mirror the real server:
 // - list_ports:        crates/openbaud/src/engine/transport.rs (PortInfo serde)
 // - run_command:       crates/openbaud/src/run.rs (execute_command result)
+// - show_result:       tiny envelope { source, path?, uri?, bytes? }; the full
+//                      result JSON is served over resources/read instead
 // - tools/call envelope: crates/openbaud/src/mcp/mod.rs
 // radar-scans.json is real ESP32-S3 capture data (media/pv/src/radar-scans.json).
 import radarScans from './radar-scans.json'
@@ -36,45 +38,81 @@ export function wrapToolError(message: string): JsonObject {
   }
 }
 
-// vid/pid are 4-digit uppercase hex strings; absent optionals are omitted
-// (serde skip_serializing_if). serial_number values are synthetic.
+// ask_port candidates: the measured macOS enumeration (9 nodes = 4 physical
+// devices + mock:echo), plus the enrichment ask_port adds on top of PortInfo:
+//   matches_devices — workspace devices whose selector hits this port
+//   open_session    — session already holding it (row cannot be picked)
+//   alias_of        — /dev/tty.X twin of the canonical /dev/cu.X
+// vid/pid are 4-digit uppercase hex; absent optionals are omitted keys
+// (serde skip_serializing_if), so no serial_number is invented here.
+const ASK_PORT_CANDIDATES: readonly JsonObject[] = [
+  {
+    path: '/dev/cu.usbmodem213101',
+    type: 'usb',
+    vid: '303A',
+    pid: '1001',
+    manufacturer: 'Espressif',
+    matches_devices: ['openbaud-pv-board'],
+  },
+  {
+    path: '/dev/tty.usbmodem213101',
+    type: 'usb',
+    vid: '303A',
+    pid: '1001',
+    manufacturer: 'Espressif',
+    matches_devices: ['openbaud-pv-board'],
+    alias_of: '/dev/cu.usbmodem213101',
+  },
+  // Held by another session: both nodes of the device are blocked.
+  {
+    path: '/dev/cu.usbmodem5AF61139901',
+    type: 'usb',
+    vid: '1A86',
+    pid: '55D3',
+    product: 'USB Single Serial',
+    open_session: 's-2',
+  },
+  {
+    path: '/dev/tty.usbmodem5AF61139901',
+    type: 'usb',
+    vid: '1A86',
+    pid: '55D3',
+    product: 'USB Single Serial',
+    open_session: 's-2',
+    alias_of: '/dev/cu.usbmodem5AF61139901',
+  },
+  { path: '/dev/cu.debug-console', type: 'native' },
+  { path: '/dev/tty.debug-console', type: 'native', alias_of: '/dev/cu.debug-console' },
+  { path: '/dev/cu.Bluetooth-Incoming-Port', type: 'bluetooth' },
+  {
+    path: '/dev/tty.Bluetooth-Incoming-Port',
+    type: 'bluetooth',
+    alias_of: '/dev/cu.Bluetooth-Incoming-Port',
+  },
+  {
+    path: 'mock:echo',
+    type: 'mock',
+    product: 'loopback echo (always available, no hardware needed)',
+  },
+]
+
+export const ASK_PORT_RESULT: JsonObject = {
+  reason: 'No serial port is bound to openbaud-pv-board in this workspace yet.',
+  device: 'openbaud-pv-board',
+  candidates: ASK_PORT_CANDIDATES,
+}
+
+export const ASK_PORT_INPUT: JsonObject = {
+  device: 'openbaud-pv-board',
+  reason: 'No serial port is bound to openbaud-pv-board in this workspace yet.',
+}
+
+// list_ports carries no UI binding, but it does carry the same enrichment as
+// ask_port's candidates (tools::enriched_ports in crates/openbaud/src/mcp/tools.rs
+// feeds both). Rescan therefore keeps the match/session/alias information.
 export const LIST_PORTS_RESULT: JsonObject = {
-  ports: [
-    {
-      path: '/dev/tty.usbmodem31101',
-      type: 'usb',
-      vid: '303A',
-      pid: '1001',
-      manufacturer: 'Espressif',
-      product: 'ESP32-S3',
-      serial_number: 'F4:12:FA:00:00:01',
-    },
-    {
-      path: '/dev/tty.usbserial-0001',
-      type: 'usb',
-      vid: '10C4',
-      pid: 'EA60',
-      manufacturer: 'Silicon Labs',
-      product: 'CP2102 USB to UART Bridge Controller',
-      serial_number: '0001',
-    },
-    {
-      path: 'mock:echo',
-      type: 'mock',
-      product: 'loopback echo (always available, no hardware needed)',
-    },
-  ],
+  ports: ASK_PORT_CANDIDATES,
 }
-
-// `framing` is Rust Debug output, as returned by the open tool.
-export const OPEN_OK_RESULT: JsonObject = {
-  session_id: 's-01',
-  port: '/dev/tty.usbmodem31101',
-  baud: 115200,
-  framing: 'Idle { idle_ms: 30 }',
-}
-
-export const OPEN_EBUSY_MESSAGE = 'cannot open /dev/tty.usbmodem31101: Resource busy'
 
 function hexToBytes(hex: string): number[] {
   return hex
@@ -106,12 +144,52 @@ export function radarScanCount(): number {
   return scans.length
 }
 
-/** run_command result for scan `index` (wraps around), shaped like execute_command. */
-export function radarCommandResult(index: number): JsonObject {
+function scanAt(index: number): RadarScan {
   const scan = scans[index % scans.length]
   if (!scan) {
     throw new Error('fixtures: radar-scans.json holds no scans')
   }
+  return scan
+}
+
+const RESULT_URI_PREFIX = 'openbaud://result/'
+
+function resultFileName(scan: RadarScan): string {
+  return `res-${scan.ts}-run_command.json`
+}
+
+/**
+ * The show_result envelope for scan `index`: what the tool actually returns —
+ * small on purpose, so the model context never carries the 36 points.
+ */
+export function showResultEnvelope(index: number): JsonObject {
+  const scan = scanAt(index)
+  const name = resultFileName(scan)
+  const text = resultJsonText(index)
+  return {
+    source: 'file',
+    path: `.openbaud/out/${name}`,
+    uri: `${RESULT_URI_PREFIX}${name}`,
+    bytes: new TextEncoder().encode(text).length,
+  }
+}
+
+/** Envelope for a result small enough to travel in show_result's own input. */
+export const SHOW_RESULT_INLINE: JsonObject = { source: 'inline' }
+
+function resultJsonText(index: number): string {
+  return JSON.stringify(radarCommandResult(index), null, 2)
+}
+
+/** resources/read body: the complete result object, all 36 points, as text. */
+export function resultTextForUri(uri: string): string | undefined {
+  const index = scans.findIndex((scan) => uri === `${RESULT_URI_PREFIX}${resultFileName(scan)}`)
+  return index < 0 ? undefined : resultJsonText(index)
+}
+
+/** run_command result for scan `index` (wraps around), shaped like execute_command. */
+export function radarCommandResult(index: number): JsonObject {
+  const scan = scanAt(index)
   const rx = hexToBytes(scan.rxHex)
   const [m0, m1, version, kind] = rx
   if (m0 === undefined || m1 === undefined || version === undefined || kind === undefined) {

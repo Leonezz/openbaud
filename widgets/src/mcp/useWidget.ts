@@ -13,6 +13,10 @@ import {
 export type ToolArgs = McpUiToolInputNotification['params']['arguments']
 /** Standard MCP CallToolResult as delivered by ui/notifications/tool-result. */
 export type ToolResult = McpUiToolResultNotification['params']
+/** `ui/update-model-context` params: `{ content?, structuredContent? }`. */
+export type ModelContextUpdate = Parameters<App['updateModelContext']>[0]
+/** Standard MCP ReadResourceResult, as typed by the SDK's readServerResource. */
+export type ReadResourceResult = Awaited<ReturnType<App['readServerResource']>>
 
 /**
  * openbaud tool results: structuredContent carries the (possibly summarized)
@@ -57,6 +61,10 @@ export interface WidgetHandle {
   /** Reason string when the host cancelled the running tool. */
   cancelReason: string | undefined
   callTool: (name: string, args?: Record<string, unknown>) => Promise<ToolResult>
+  /** MCP resources/read — how a widget pulls a full result the tool only referenced. */
+  readResource: (uri: string) => Promise<ReadResourceResult>
+  /** ui/update-model-context — how a widget hands a user choice back to the agent. */
+  updateModelContext: (params: ModelContextUpdate) => Promise<void>
   requestDisplayMode: (mode: McpUiDisplayMode) => Promise<McpUiDisplayMode>
 }
 
@@ -139,6 +147,22 @@ export function useWidget({ name, version }: UseWidgetOptions): WidgetHandle {
     [],
   )
 
+  const readResource = useCallback(async (uri: string): Promise<ReadResourceResult> => {
+    const current = appRef.current
+    if (!current) {
+      throw new Error(`cannot read resource ${JSON.stringify(uri)} — host not connected yet`)
+    }
+    return await current.readServerResource({ uri })
+  }, [])
+
+  const updateModelContext = useCallback(async (params: ModelContextUpdate): Promise<void> => {
+    const current = appRef.current
+    if (!current) {
+      throw new Error('cannot update model context — host not connected yet')
+    }
+    await current.updateModelContext(params)
+  }, [])
+
   const requestDisplayMode = useCallback(
     async (mode: McpUiDisplayMode): Promise<McpUiDisplayMode> => {
       const current = appRef.current
@@ -163,6 +187,8 @@ export function useWidget({ name, version }: UseWidgetOptions): WidgetHandle {
     toolResult,
     cancelReason,
     callTool,
+    readResource,
+    updateModelContext,
     requestDisplayMode,
   }
 }

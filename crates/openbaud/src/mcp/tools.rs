@@ -1,4 +1,6 @@
-//! The eleven MCP tools: schemas and dispatch.
+//! The thirteen MCP tools: schemas and dispatch. Eleven are data tools the
+//! agent drives; `ask_port` and `show_result` exist to put something in front
+//! of the user and are the only two that carry a UI template.
 
 use crate::engine::session::Session;
 use crate::engine::transport::{self, open_port, resolve_selector};
@@ -81,7 +83,6 @@ pub fn list() -> Vec<Value> {
             "description": "List serial ports (USB metadata included) plus the always-available mock:echo loopback.",
             "inputSchema": { "type": "object", "properties": {} },
             "annotations": read_only_hardware,
-            "_meta": { "ui": { "resourceUri": resources::PORT_PICKER_URI } },
         }),
         json!({
             "name": "open",
@@ -115,7 +116,6 @@ pub fn list() -> Vec<Value> {
                 "max_inline_bytes": max_inline_bytes_schema()
             }},
             "annotations": read_only_hardware,
-            "_meta": { "ui": { "resourceUri": resources::VIEWER_URI } },
         }),
         json!({
             "name": "send",
@@ -139,7 +139,6 @@ pub fn list() -> Vec<Value> {
                 "max_inline_bytes": max_inline_bytes_schema()
             }},
             "annotations": hardware_write,
-            "_meta": { "ui": { "resourceUri": resources::VIEWER_URI } },
         }),
         json!({
             "name": "run_command",
@@ -154,7 +153,6 @@ pub fn list() -> Vec<Value> {
                 "max_inline_bytes": max_inline_bytes_schema()
             }},
             "annotations": hardware_write,
-            "_meta": { "ui": { "resourceUri": resources::VIEWER_URI } },
         }),
         json!({
             "name": "run_workflow",
@@ -195,12 +193,97 @@ pub fn list() -> Vec<Value> {
             }},
             "annotations": local_mutation,
         }),
+        // The only two tools that carry a UI. Template binding is per-tool and
+        // unconditional, so a bound data tool would pop a card on every call the
+        // agent makes for its own reasoning — showing and asking must be
+        // deliberate acts, not a side effect of reading data.
+        json!({
+            "name": "ask_port",
+            "description": "Ask the user which serial port to use, on hosts that can render it (elsewhere the candidate list comes back as text for you to relay). Use it when several ports could plausibly be the device and the choice is the user's to make — not for your own discovery, which is what list_ports is for. This does not touch hardware: the user's choice arrives in your context, and you then call `open` yourself.",
+            "inputSchema": { "type": "object", "properties": {
+                "device": { "type": "string", "description": "Workspace device you are looking for a port for" },
+                "reason": { "type": "string", "description": "Why you are asking, shown to the user" }
+            }},
+            "annotations": read_only_hardware,
+            "_meta": { "ui": { "resourceUri": resources::PORT_PICKER_URI } },
+        }),
+        json!({
+            "name": "show_result",
+            "description": "Show a saved tool result to the user, rendered (a polar plot for angular scans, a field table otherwise) on hosts that support it. Pass `path` from an earlier result's full_result — the viewer then reads the complete payload directly, so the full data never enters your context. Use it when the user would rather see the data than read it.",
+            "inputSchema": { "type": "object", "properties": {
+                "path": { "type": "string", "description": "full_result path from an earlier tool result, e.g. .openbaud/out/res-….json" },
+                "data": { "type": "object", "description": "The result itself, for small results that were never spilled to disk" }
+            }},
+            "annotations": read_only_local,
+            "_meta": { "ui": { "resourceUri": resources::VIEWER_URI } },
+        }),
     ]
+}
+
+/// Ports plus what the workspace knows about them. Shared by `list_ports` and
+/// `ask_port` so the agent and the user always see the same picture.
+fn enriched_ports(ctx: &Arc<Ctx>) -> anyhow::Result<Vec<transport::EnrichedPort>> {
+    let devices: Vec<(String, Option<openbaud_core::format::SelectorSpec>)> = ctx
+        .workspace
+        .list_devices()
+        .into_iter()
+        .filter_map(|name| {
+            let device = ctx.workspace.load_device(&name).ok()?;
+            Some((name, device.profile.selector.clone()))
+        })
+        .collect();
+    Ok(transport::enrich_ports(transport::list_ports()?, &devices, &ctx.sessions.open_ports()))
+}
+
+/// Resolve a `full_result` path to its spill-directory file name, refusing
+/// anything that reaches outside `.openbaud/out/`.
+fn spill_file_name(path: &str) -> anyhow::Result<&str> {
+    let rest = path
+        .strip_prefix("./")
+        .unwrap_or(path)
+        .strip_prefix(output::SPILL_DIR)
+        .and_then(|r| r.strip_prefix('/'))
+        .ok_or_else(|| anyhow!("path must be a full_result under {}/", output::SPILL_DIR))?;
+    if rest.is_empty() || rest.contains('/') || rest.contains("..") {
+        bail!("{path:?} is not a file directly inside {}/", output::SPILL_DIR);
+    }
+    Ok(rest)
 }
 
 pub async fn call(name: &str, args: Value, ctx: &Arc<Ctx>) -> anyhow::Result<Value> {
     match name {
-        "list_ports" => Ok(json!({ "ports": transport::list_ports()? })),
+        "list_ports" => Ok(json!({ "ports": enriched_ports(ctx)? })),
+        "ask_port" => {
+            let mut out = Map::new();
+            for key in ["reason", "device"] {
+                if let Some(v) = args.get(key).filter(|v| !v.is_null()) {
+                    out.insert(key.to_string(), v.clone());
+                }
+            }
+            out.insert("candidates".into(), serde_json::to_value(enriched_ports(ctx)?)?);
+            Ok(Value::Object(out))
+        }
+        "show_result" => {
+            if let Some(path) = args.get("path").and_then(Value::as_str) {
+                let name = spill_file_name(path)?;
+                let file = ctx.workspace.root.join(output::SPILL_DIR).join(name);
+                let bytes = std::fs::metadata(&file)
+                    .map_err(|e| anyhow!("cannot show {path:?}: {e}"))?
+                    .len();
+                // Deliberately a pointer, not the payload: the viewer fetches the
+                // full data over resources/read, keeping it out of model context.
+                Ok(json!({
+                    "source": "file",
+                    "path": path,
+                    "uri": format!("{}{name}", resources::RESULT_URI_PREFIX),
+                    "bytes": bytes,
+                }))
+            } else if args.get("data").is_some_and(|d| !d.is_null()) {
+                Ok(json!({ "source": "inline" }))
+            } else {
+                bail!("show_result needs either path (a full_result path) or data")
+            }
+        }
         "open" => tool_open(args, ctx).await,
         "close" => {
             let id = arg_str(&args, "session_id")?;

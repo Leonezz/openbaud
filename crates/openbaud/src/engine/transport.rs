@@ -111,6 +111,93 @@ pub struct PortInfo {
     pub serial_number: Option<String>,
 }
 
+impl PortInfo {
+    pub fn usb(path: &str, vid: &str, pid: &str, manufacturer: Option<&str>) -> Self {
+        PortInfo {
+            path: path.to_string(),
+            kind: "usb",
+            vid: Some(vid.to_string()),
+            pid: Some(pid.to_string()),
+            manufacturer: manufacturer.map(str::to_string),
+            product: None,
+            serial_number: None,
+        }
+    }
+
+    pub fn mock() -> Self {
+        PortInfo {
+            path: MOCK_ECHO.to_string(),
+            kind: "mock",
+            vid: None,
+            pid: None,
+            manufacturer: None,
+            product: Some("loopback echo (always available, no hardware needed)".to_string()),
+            serial_number: None,
+        }
+    }
+}
+
+/// A port plus what the workspace knows about it: which device profiles claim
+/// it, whether a session already holds it, and — on macOS — which `/dev/cu.*`
+/// entry a `/dev/tty.*` twin duplicates.
+#[derive(Debug, serde::Serialize)]
+pub struct EnrichedPort {
+    #[serde(flatten)]
+    pub port: PortInfo,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub matches_devices: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub open_session: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alias_of: Option<String>,
+}
+
+/// Pure enrichment over an enumerated port list — the testable core of what
+/// `list_ports` and `ask_port` return.
+pub fn enrich_ports(
+    ports: Vec<PortInfo>,
+    devices: &[(String, Option<SelectorSpec>)],
+    open_sessions: &[(String, String)],
+) -> Vec<EnrichedPort> {
+    let canonical: Vec<&str> = ports.iter().map(|p| p.path.as_str()).collect();
+    let alias_target = |path: &str| -> Option<String> {
+        let suffix = path.strip_prefix("/dev/tty.")?;
+        let cu = format!("/dev/cu.{suffix}");
+        canonical.contains(&cu.as_str()).then_some(cu)
+    };
+
+    ports
+        .iter()
+        .map(|port| EnrichedPort {
+            matches_devices: devices
+                .iter()
+                .filter(|(_, sel)| {
+                    sel.as_ref().is_some_and(|s| port.kind != "mock" && selector_matches(port, s))
+                })
+                .map(|(name, _)| name.clone())
+                .collect(),
+            open_session: open_sessions
+                .iter()
+                .find(|(port_name, _)| *port_name == port.path)
+                .map(|(_, id)| id.clone()),
+            alias_of: alias_target(&port.path),
+            port: PortInfo { ..clone_port(port) },
+        })
+        .collect()
+}
+
+fn clone_port(p: &PortInfo) -> PortInfo {
+    PortInfo {
+        path: p.path.clone(),
+        kind: p.kind,
+        vid: p.vid.clone(),
+        pid: p.pid.clone(),
+        manufacturer: p.manufacturer.clone(),
+        product: p.product.clone(),
+        serial_number: p.serial_number.clone(),
+    }
+}
+
 pub fn list_ports() -> anyhow::Result<Vec<PortInfo>> {
     let mut out: Vec<PortInfo> = tokio_serial::available_ports()
         .map_err(|e| anyhow!("cannot enumerate serial ports: {e}"))?

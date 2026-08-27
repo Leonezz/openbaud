@@ -79,19 +79,28 @@
       <label>
         scenario
         <select id="scenario">
-          <option value="list_ports">list_ports (3 candidates)</option>
-          <option value="radar">obp1 radar frame</option>
+          <option value="ask_port">ask_port (9 candidates)</option>
+          <option value="show_result">show_result (file → resource)</option>
+          <option value="show_result_inline">show_result (inline data)</option>
         </select>
       </label>
       <label>
-        open →
-        <select id="open-mode">
+        update-model-context →
+        <select id="ctx-mode">
+          <option value="ok">accept</option>
+          <option value="reject">reject</option>
+        </select>
+      </label>
+      <label>
+        resources/read →
+        <select id="resource-mode">
           <option value="ok">success</option>
-          <option value="ebusy">EBUSY failure</option>
+          <option value="slow">slow (2.5 s)</option>
+          <option value="fail">not found</option>
         </select>
       </label>
       <button id="send-scenario" type="button">Send tool-input + result</button>
-      <button id="next-frame" type="button">Next radar frame</button>
+      <button id="next-result" type="button">Next saved result</button>
       <button id="toggle-theme" type="button">Toggle theme</button>
     </header>
     <main>
