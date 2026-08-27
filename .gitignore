@@ -10,6 +10,8 @@ node_modules/
 # - root-level workspace artifacts from ad-hoc exploration sessions
 # - testbench/ (local hardware acceptance rig and its device knowledge)
 # - most of docs/ (internal working notes and design drafts)
+# - media/ (PV video production; rendered outputs live in docs/assets/)
+/media/
 **/.openbaud/
 /captures/
 /devices/
