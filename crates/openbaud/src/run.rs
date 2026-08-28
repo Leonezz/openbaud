@@ -96,6 +96,11 @@ pub async fn execute_command(
             if !units.is_empty() {
                 out.insert("units".to_string(), Value::Object(units));
             }
+            // The command's declared encoding travels with the result so a
+            // viewer knows which field feeds which channel — it never guesses.
+            if let Some(view) = cmd.response.as_ref().and_then(|r| r.view.as_ref()) {
+                out.insert("view".to_string(), serde_json::to_value(view)?);
+            }
             met
         }
     };

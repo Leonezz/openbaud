@@ -106,8 +106,14 @@ Two tools exist only to put something in front of the person. Every other tool
 is yours to call freely and silently; these two are deliberate acts, so use
 them when the user is the audience — not as a habit.
 
-- `show_result` renders a saved result (a polar plot for angular scans, a field
-  table otherwise) on hosts that can draw it. Pass the `path` from an earlier
+- `show_result` renders a saved result on hosts that can draw it. A result is
+  charted only when it says how: the command's `response.view` names which
+  parsed field feeds which visual channel (`{kind: polar, data: points, angle:
+  bearing, radius: range_mm}`), so a device keeps its own field names and
+  openbaud never guesses a chart from naming. Declare it once in the command
+  YAML and every result renders; pass `encoding` to `show_result` for the
+  ad-hoc case where you decoded the bytes yourself. No declaration, no chart —
+  the result renders as a field table. Pass the `path` from an earlier
   `full_result`: the view reads the complete payload itself, so a 36-point scan
   reaches the user's eyes without any of it entering your context. Reach for it
   when the shape of the data is the point — scans, waveforms, long field sets —

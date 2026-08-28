@@ -45,7 +45,7 @@ export function ViewerApp() {
         setState({ kind: 'error', message: envelope.message })
         return
       }
-      const { ref } = envelope
+      const { ref, encoding } = envelope
       if (ref.source === 'inline') {
         // Small results never hit disk; show_result echoes them in its own input.
         const data = args?.data
@@ -57,13 +57,13 @@ export function ViewerApp() {
           })
           return
         }
-        setState(viewFor(data as OpenbaudSummary, ref))
+        setState(viewFor(data as OpenbaudSummary, ref, encoding))
         return
       }
       setState({ kind: 'loading', ref })
       try {
         const read = await widget.readResource(ref.uri)
-        setState(viewFor(parseResourceJson(read, ref.uri), ref))
+        setState(viewFor(parseResourceJson(read, ref.uri), ref, encoding))
       } catch (error) {
         const detail = error instanceof Error ? error.message : String(error)
         setState({ kind: 'error', message: `could not read ${ref.uri} — ${detail}` })
@@ -146,6 +146,14 @@ export function ViewerApp() {
             detail={state.message}
             onRetry={widget.toolResult !== undefined ? retry : undefined}
           />
+        </ShellCard>
+      )
+    case 'invalid':
+      // A declared rendering that misses its data is a defect in the
+      // declaration, not a transient failure: retrying reads the same bytes.
+      return (
+        <ShellCard>
+          <ObError title="Declared view does not fit this result" detail={state.reason} />
         </ShellCard>
       )
     case 'generic':

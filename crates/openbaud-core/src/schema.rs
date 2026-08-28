@@ -40,7 +40,13 @@ or an object {type, bits, scale, offset} running the same pipeline — \
 bits only for int/hex_int (a negative value is a runtime error), scale/offset not for string; \
 split only applies to regex parsing, its keys must be named captures, and a capture cannot appear in both types and split; \
 validate.range and validate.at accept negative indices counted from the frame end (-1 = last byte); \
-validate defaults reproduce the classic tail checksum over all preceding bytes.";
+validate defaults reproduce the classic tail checksum over all preceding bytes; \
+response.view declares how a result is drawn by naming which parse field feeds which visual channel — \
+its data must be a record-array field of response.parse.fields, and every channel must name one of that array's elements, \
+so a device keeps its own field names and nothing is ever inferred from naming; \
+kind: polar requires both angle and radius (intensity optional), \
+and a channel whose field declares a unit of the wrong kind (an angle channel on a length field, or the reverse) is rejected; \
+a command with no view is simply never charted.";
 
 const WORKFLOW_RULES: &str = "Semantic rules beyond this schema: \
 steps must not be empty; \

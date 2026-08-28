@@ -2,14 +2,18 @@
 // SDK's AppBridge, so this fixture exercises the wire protocol independently
 // of the library under test. JSON-RPC 2.0 over window.postMessage.
 import {
+  aliasScanResult,
   ASK_PORT_INPUT,
   ASK_PORT_RESULT,
+  brokenViewResult,
   LIST_PORTS_RESULT,
   radarCommandResult,
   radarScanCount,
   resultTextForUri,
   showResultEnvelope,
   SHOW_RESULT_INLINE,
+  SHOW_RESULT_INLINE_ENCODED,
+  undeclaredCommandResult,
   wrapToolError,
   wrapToolResult,
   type JsonObject,
@@ -178,12 +182,26 @@ function handleRequest(msg: JsonRpcMessage): void {
   }
 }
 
+/** The inline show_result scenarios: { data, encoding? } in, envelope out. */
+const INLINE_SCENARIOS: Readonly<
+  Record<string, { readonly data: (index: number) => JsonObject; readonly envelope: JsonObject }>
+> = {
+  // Payload declares its own `view` (angle_deg / distance_mm).
+  show_result_inline: { data: radarCommandResult, envelope: SHOW_RESULT_INLINE },
+  // No `view`; show_result's `encoding` names foreign fields instead.
+  show_result_encoded: { data: aliasScanResult, envelope: SHOW_RESULT_INLINE_ENCODED },
+  // `view.angle` names a field the records do not carry — expect .ob-error.
+  show_result_broken: { data: brokenViewResult, envelope: SHOW_RESULT_INLINE },
+  // Nothing declared anywhere — expect the generic key/value card.
+  show_result_undeclared: { data: undeclaredCommandResult, envelope: SHOW_RESULT_INLINE },
+}
+
 /** show_result for scan `index`: the envelope only — the payload is a resource. */
 function sendShowResult(index: number): void {
-  if (scenarioSel.value === 'show_result_inline') {
-    const full = radarCommandResult(index)
-    notify('ui/notifications/tool-input', { arguments: { data: full } })
-    notify('ui/notifications/tool-result', wrapToolResult(SHOW_RESULT_INLINE))
+  const inline = INLINE_SCENARIOS[scenarioSel.value]
+  if (inline !== undefined) {
+    notify('ui/notifications/tool-input', { arguments: { data: inline.data(index) } })
+    notify('ui/notifications/tool-result', wrapToolResult(inline.envelope))
     return
   }
   const envelope = showResultEnvelope(index)

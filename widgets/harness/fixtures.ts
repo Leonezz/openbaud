@@ -1,8 +1,12 @@
 // Canned tool results for the harness host. Shapes mirror the real server:
 // - list_ports:        crates/openbaud/src/engine/transport.rs (PortInfo serde)
-// - run_command:       crates/openbaud/src/run.rs (execute_command result)
-// - show_result:       tiny envelope { source, path?, uri?, bytes? }; the full
-//                      result JSON is served over resources/read instead
+// - run_command:       crates/openbaud/src/run.rs (execute_command result),
+//                      including the optional top-level `view` declaring how
+//                      the result is drawn
+// - show_result:       tiny envelope { source, path?, uri?, bytes?, encoding? };
+//                      the full result JSON is served over resources/read
+//                      instead, and `encoding` (when the agent decoded the
+//                      bytes itself) overrides the result's own `view`
 // - tools/call envelope: crates/openbaud/src/mcp/mod.rs
 // radar-scans.json is real ESP32-S3 capture data (media/pv/src/radar-scans.json).
 import radarScans from './radar-scans.json'
@@ -177,6 +181,22 @@ export function showResultEnvelope(index: number): JsonObject {
 /** Envelope for a result small enough to travel in show_result's own input. */
 export const SHOW_RESULT_INLINE: JsonObject = { source: 'inline' }
 
+/**
+ * Envelope for the agent-decoded case: the payload carries no `view`, so
+ * show_result declares the mapping itself. The field names below are this
+ * imaginary device's own — nothing in the viewer knows them.
+ */
+export const SHOW_RESULT_INLINE_ENCODED: JsonObject = {
+  source: 'inline',
+  encoding: {
+    kind: 'polar',
+    data: 'returns',
+    angle: 'bearing',
+    radius: 'range_mm',
+    intensity: 'quality',
+  },
+}
+
 function resultJsonText(index: number): string {
   return JSON.stringify(radarCommandResult(index), null, 2)
 }
@@ -185,6 +205,19 @@ function resultJsonText(index: number): string {
 export function resultTextForUri(uri: string): string | undefined {
   const index = scans.findIndex((scan) => uri === `${RESULT_URI_PREFIX}${resultFileName(scan)}`)
   return index < 0 ? undefined : resultJsonText(index)
+}
+
+/**
+ * How obp1_radar_scan declares its rendering: mark kind plus one field name
+ * per visual channel, all of them this device's own parse field names
+ * (examples/pv-demo/devices/openbaud-pv-board/commands/obp1_radar_scan.yaml).
+ */
+const RADAR_VIEW: JsonObject = {
+  kind: 'polar',
+  data: 'points',
+  angle: 'angle_deg',
+  radius: 'distance_mm',
+  intensity: 'intensity',
 }
 
 /** run_command result for scan `index` (wraps around), shaped like execute_command. */
@@ -220,5 +253,50 @@ export function radarCommandResult(index: number): JsonObject {
       })),
     },
     units: { total_len: 'bytes', uptime_ms: 'ms' },
+    view: RADAR_VIEW,
+  }
+}
+
+/** The same result with no `view` at all: the generic key/value card. */
+export function undeclaredCommandResult(index: number): JsonObject {
+  const { view: _view, ...rest } = radarCommandResult(index)
+  return rest
+}
+
+/**
+ * A `view` whose angle channel names a field the records do not carry. The
+ * viewer must say so rather than quietly fall back to the key/value card.
+ */
+export function brokenViewResult(index: number): JsonObject {
+  return {
+    ...radarCommandResult(index),
+    view: { ...RADAR_VIEW, angle: 'bearing' },
+  }
+}
+
+/**
+ * The agent-decoded payload for SHOW_RESULT_INLINE_ENCODED: the same measured
+ * points under a foreign vocabulary (returns/bearing/range_mm/quality) and no
+ * `view` of its own. It renders identically, which is the whole point — the
+ * viewer reads the declaration, never the field names.
+ */
+export function aliasScanResult(index: number): JsonObject {
+  const scan = scanAt(index)
+  return {
+    device: 'thirdparty-lidar',
+    command: 'sweep',
+    outcome: 'normal',
+    parsed: {
+      seq: scan.seq,
+      uptime_ms: scan.uptimeMs,
+      point_count: scan.points.length,
+      simulated_scene: scan.simulatedScene,
+      returns: scan.points.map((p) => ({
+        bearing: p.angleDeg,
+        range_mm: p.distanceMm,
+        quality: p.intensity,
+      })),
+    },
+    units: { uptime_ms: 'ms' },
   }
 }

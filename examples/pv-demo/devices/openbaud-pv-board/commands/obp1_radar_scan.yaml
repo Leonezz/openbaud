@@ -30,6 +30,7 @@ response:
           angle_deg: { at: 0, type: u16le, scale: 0.01, unit: deg }
           distance_mm: { at: 2, type: u16le, unit: mm }
           intensity: { at: 4, type: u8 }
+  view: { kind: polar, data: points, angle: angle_deg, radius: distance_mm, intensity: intensity }
 provenance:
   datasheet: "../../protocol.md"
   verified:

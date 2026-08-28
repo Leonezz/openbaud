@@ -607,6 +607,15 @@ pub fn units(cmd: &Command) -> Map<String, Value> {
             if let Some(unit) = &field.unit {
                 out.insert(name.clone(), Value::from(unit.clone()));
             }
+            // Record-array elements declare units too; report them under a
+            // dotted path so a viewer can label channels without guessing.
+            if let Some(elements) = &field.elements {
+                for (element_name, element) in elements {
+                    if let Some(unit) = &element.unit {
+                        out.insert(format!("{name}.{element_name}"), Value::from(unit.clone()));
+                    }
+                }
+            }
         }
     }
     out

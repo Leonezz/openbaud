@@ -1,9 +1,11 @@
 // Viewer state (pure). show_result hands the widget a deliberately tiny
-// envelope — { source, path?, uri?, bytes? } — so the model's context never
-// carries the payload. The full result JSON is fetched separately: from the
-// MCP resource named by `uri` (source "file"), or from the tool input's
-// `data` object (source "inline"). Nothing here polls: a saved result has no
-// next frame, so there is no previous frame either.
+// envelope — { source, path?, uri?, bytes?, encoding? } — so the model's
+// context never carries the payload. The full result JSON is fetched
+// separately: from the MCP resource named by `uri` (source "file"), or from
+// the tool input's `data` object (source "inline"). `encoding` is the agent's
+// own rendering declaration and travels with the envelope, overriding the
+// `view` the result may carry itself. Nothing here polls: a saved result has
+// no next frame, so there is no previous frame either.
 import {
   openbaudStructured,
   type OpenbaudSummary,
@@ -32,6 +34,8 @@ export type ViewerState =
   | { readonly kind: 'idle' }
   | { readonly kind: 'loading'; readonly ref: ResultRef }
   | { readonly kind: 'error'; readonly message: string }
+  /** A rendering was declared but does not fit the data — reason shown as-is. */
+  | { readonly kind: 'invalid'; readonly reason: string }
   | { readonly kind: 'generic'; readonly structured: OpenbaudSummary; readonly ref: ResultRef }
   | { readonly kind: 'polar'; readonly scan: PolarScan; readonly ref: ResultRef }
 
@@ -65,7 +69,12 @@ export function errorText(result: ToolResult): string {
 }
 
 export type Envelope =
-  | { readonly kind: 'ref'; readonly ref: ResultRef }
+  | {
+      readonly kind: 'ref'
+      readonly ref: ResultRef
+      /** Raw `encoding` from the envelope; validated later, in dispatch. */
+      readonly encoding: unknown
+    }
   | { readonly kind: 'failed'; readonly message: string }
 
 function failed(message: string): Envelope {
@@ -82,7 +91,8 @@ export function readEnvelope(result: ToolResult): Envelope {
   const source = structured.source
   const path = asString(structured.path)
   const bytes = asNumber(structured.bytes)
-  if (source === 'inline') return { kind: 'ref', ref: { source, path, bytes } }
+  const encoding = structured.encoding
+  if (source === 'inline') return { kind: 'ref', ref: { source, path, bytes }, encoding }
   if (source !== 'file') {
     return failed(
       `show_result envelope carries source ${JSON.stringify(source)} — expected "file" or "inline"`,
@@ -92,7 +102,7 @@ export function readEnvelope(result: ToolResult): Envelope {
   if (uri === undefined) {
     return failed('show_result reported source "file" but carried no resource uri — nothing to read')
   }
-  return { kind: 'ref', ref: { source, uri, path, bytes } }
+  return { kind: 'ref', ref: { source, uri, path, bytes }, encoding }
 }
 
 /** contents[0].text of a resources/read result, parsed as the full result JSON. */
@@ -120,9 +130,17 @@ export function parseResourceJson(result: ReadResourceResult, uri: string): Open
   return parsed as OpenbaudSummary
 }
 
-/** Schema dispatch on the full result: polar scope, or the generic KV card. */
-export function viewFor(structured: OpenbaudSummary, ref: ResultRef): ViewerState {
-  const view = dispatchResult(structured)
+/**
+ * Dispatch on the full result: the declared chart, the generic KV card when
+ * nothing was declared, or the reason a declaration did not fit the data.
+ */
+export function viewFor(
+  structured: OpenbaudSummary,
+  ref: ResultRef,
+  encoding: unknown,
+): ViewerState {
+  const view = dispatchResult(structured, encoding)
   if (view.kind === 'polar') return { kind: 'polar', scan: view.scan, ref }
+  if (view.kind === 'invalid') return { kind: 'invalid', reason: view.reason }
   return { kind: 'generic', structured, ref }
 }

@@ -360,6 +360,10 @@ pub struct ResponseSpec {
     /// How to decode the frame into named values.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parse: Option<ParseSpec>,
+    /// Optional rendering encoding: which parsed fields feed which visual
+    /// channel. Absent means "no chart" — never a guess from field names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view: Option<ViewSpec>,
     /// Recognition and decoding of protocol-level exception frames.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exception: Option<ExceptionSpec>,
@@ -518,6 +522,34 @@ pub enum Encoding {
     /// The checksum appears as ASCII hex characters (two per byte),
     /// compared case-insensitively.
     AsciiHex,
+}
+
+/// How a parsed result should be drawn. Declares which parsed field feeds
+/// which visual channel, so every device keeps its own vocabulary — openbaud
+/// never infers a chart from field names. Channel requirements are per kind
+/// and enforced in `parse_command` (see COMMAND_RULES).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ViewSpec {
+    pub kind: ViewKind,
+    /// Parse field holding the record array the channels index into.
+    pub data: String,
+    /// polar: element field carrying the angle. Required for polar.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub angle: Option<String>,
+    /// polar: element field carrying the distance from origin. Required for polar.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub radius: Option<String>,
+    /// polar: element field shading each point. Optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intensity: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ViewKind {
+    /// Angular scan drawn on polar axes.
+    Polar,
 }
 
 /// How to decode a frame into named values. Exactly one of `fields` (binary)
@@ -782,6 +814,9 @@ pub fn parse_command(yaml: &str, path: &str) -> crate::Result<Command> {
         if let Some(parse) = &resp.parse {
             check_parse_spec(parse, path, "parse")?;
         }
+        if let Some(view) = &resp.view {
+            check_view_spec(view, resp.parse.as_ref(), path)?;
+        }
         if let Some(exc) = &resp.exception {
             exc.when
                 .mask_byte()
@@ -819,6 +854,93 @@ fn check_validate_spec(v: &ValidateSpec, path: &str, ctx: &str) -> crate::Result
 
 /// Shared semantic checks for a `parse` block (main response and exception).
 /// `ctx` names the block in error messages ("parse" or "exception.parse").
+/// Units that clearly mark a field as an angle or as a length. Used only to
+/// catch the mistake that actually happens — angle and radius declared the
+/// wrong way round. An undeclared unit is never an error.
+fn unit_class(unit: &str) -> Option<&'static str> {
+    match unit.trim().to_ascii_lowercase().as_str() {
+        "deg" | "degree" | "degrees" | "rad" | "radian" | "radians" => Some("angle"),
+        "mm" | "cm" | "m" | "metre" | "meter" | "metres" | "meters" | "in" | "inch" => {
+            Some("length")
+        }
+        _ => None,
+    }
+}
+
+/// A view declares which parsed field feeds which visual channel. Every channel
+/// must name a real field, so a renaming breaks the build instead of silently
+/// dropping the chart.
+fn check_view_spec(view: &ViewSpec, parse: Option<&ParseSpec>, path: &str) -> crate::Result<()> {
+    let fields = parse.and_then(|p| p.fields.as_ref()).ok_or_else(|| {
+        ferr(path, "response.view needs response.parse.fields to name channels in")
+    })?;
+    let data = fields.get(&view.data).ok_or_else(|| {
+        ferr(path, format!("response.view.data {:?} is not a parse field", view.data))
+    })?;
+    let elements = data.elements.as_ref().ok_or_else(|| {
+        ferr(
+            path,
+            format!(
+                "response.view.data {:?} is not a record array — a view maps channels onto the \
+                 elements of an array field (one with `count` and `elements`)",
+                view.data
+            ),
+        )
+    })?;
+
+    let channel = |name: &str, field: &Option<String>, want: &str| -> crate::Result<()> {
+        let Some(field_name) = field else { return Ok(()) };
+        let spec = elements.get(field_name).ok_or_else(|| {
+            ferr(
+                path,
+                format!(
+                    "response.view.{name} {field_name:?} is not an element of {:?}",
+                    view.data
+                ),
+            )
+        })?;
+        if let Some(class) = spec.unit.as_deref().and_then(unit_class) {
+            if class != want {
+                return Err(ferr(
+                    path,
+                    format!(
+                        "response.view.{name} {field_name:?} has unit {:?} ({class}) but the \
+                         {name} channel takes a {want} — are angle and radius swapped?",
+                        spec.unit.as_deref().unwrap_or_default()
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    };
+
+    match view.kind {
+        ViewKind::Polar => {
+            if view.angle.is_none() || view.radius.is_none() {
+                return Err(ferr(
+                    path,
+                    "response.view kind polar requires both an angle and a radius channel",
+                ));
+            }
+            channel("angle", &view.angle, "angle")?;
+            channel("radius", &view.radius, "length")?;
+            // intensity is a bare magnitude: any unit (or none) is fine.
+            if let Some(name) = &view.intensity {
+                if !elements.contains_key(name) {
+                    return Err(ferr(
+                        path,
+                        format!(
+                            "response.view.intensity {name:?} is not an element of {:?}",
+                            view.data
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn check_parse_spec(parse: &ParseSpec, path: &str, ctx: &str) -> crate::Result<()> {
     match (&parse.fields, &parse.regex) {
         (Some(_), Some(_)) => {
@@ -1177,6 +1299,80 @@ provenance:
         let c = parse_command(COMMAND, "read_voltage.yaml").unwrap();
         assert_eq!(c.risk, Risk::Read);
         assert_eq!(c.response.as_ref().unwrap().timeout_ms, 3000);
+    }
+
+    const SCAN_COMMAND: &str = r#"
+schema: openbaud/command@v0
+name: scan
+frame: { hex: "A5 20" }
+response:
+  match: { length: 20 }
+  parse:
+    fields:
+      point_count: { at: 0, type: u8 }
+      points:
+        at: 1
+        count: { field: point_count }
+        stride: 5
+        elements:
+          bearing: { at: 0, type: u16le, scale: 0.01, unit: deg }
+          range_mm: { at: 2, type: u16le, unit: mm }
+          quality: { at: 4, type: u8 }
+  view: { kind: polar, data: points, angle: bearing, radius: range_mm, intensity: quality }
+"#;
+
+    #[test]
+    fn view_binds_channels_to_the_devices_own_field_names() {
+        // The point of encodings: no field is required to be called angle_deg.
+        let cmd = parse_command(SCAN_COMMAND, "scan.yaml").unwrap();
+        let view = cmd.response.as_ref().unwrap().view.as_ref().expect("view parsed");
+        assert_eq!(view.kind, ViewKind::Polar);
+        assert_eq!(view.data, "points");
+        assert_eq!(view.angle.as_deref(), Some("bearing"));
+        assert_eq!(view.radius.as_deref(), Some("range_mm"));
+        assert_eq!(view.intensity.as_deref(), Some("quality"));
+    }
+
+    #[test]
+    fn view_channel_pointing_at_a_missing_field_is_loud() {
+        let bad = SCAN_COMMAND.replace("angle: bearing", "angle: azimuth");
+        let err = parse_command(&bad, "scan.yaml").unwrap_err().to_string();
+        assert!(err.contains("azimuth"), "got: {err}");
+        assert!(err.contains("points"), "error must name the record array: {err}");
+    }
+
+    #[test]
+    fn view_data_must_name_a_record_array() {
+        let bad = SCAN_COMMAND.replace("data: points", "data: point_count");
+        let err = parse_command(&bad, "scan.yaml").unwrap_err().to_string();
+        assert!(err.contains("point_count"), "got: {err}");
+    }
+
+    #[test]
+    fn polar_view_requires_both_angle_and_radius() {
+        let bad = SCAN_COMMAND.replace(", radius: range_mm", "");
+        let err = parse_command(&bad, "scan.yaml").unwrap_err().to_string();
+        assert!(err.contains("radius"), "got: {err}");
+    }
+
+    #[test]
+    fn swapped_angle_and_radius_channels_are_caught_by_units() {
+        // The failure this actually prevents: declaring the length field as
+        // the angle. Units already carry the semantics — use them.
+        let bad = SCAN_COMMAND
+            .replace("angle: bearing, radius: range_mm", "angle: range_mm, radius: bearing");
+        let err = parse_command(&bad, "scan.yaml").unwrap_err().to_string();
+        assert!(err.contains("mm") || err.contains("unit"), "got: {err}");
+    }
+
+    #[test]
+    fn units_reach_nested_record_elements() {
+        // Element units are declared in YAML; they must survive into results
+        // so a viewer can label axes without guessing.
+        let cmd = parse_command(SCAN_COMMAND, "scan.yaml").unwrap();
+        let units = crate::exec::units(&cmd);
+        assert_eq!(units.get("points.bearing").and_then(|v| v.as_str()), Some("deg"));
+        assert_eq!(units.get("points.range_mm").and_then(|v| v.as_str()), Some("mm"));
     }
 
     #[test]

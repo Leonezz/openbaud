@@ -80,8 +80,11 @@
         scenario
         <select id="scenario">
           <option value="ask_port">ask_port (9 candidates)</option>
-          <option value="show_result">show_result (file → resource)</option>
-          <option value="show_result_inline">show_result (inline data)</option>
+          <option value="show_result">show_result (file → resource, view)</option>
+          <option value="show_result_inline">show_result (inline data, view)</option>
+          <option value="show_result_encoded">show_result (encoding, foreign fields)</option>
+          <option value="show_result_broken">show_result (view misses its field)</option>
+          <option value="show_result_undeclared">show_result (nothing declared → KV)</option>
         </select>
       </label>
       <label>

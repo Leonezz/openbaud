@@ -209,10 +209,11 @@ pub fn list() -> Vec<Value> {
         }),
         json!({
             "name": "show_result",
-            "description": "Show a saved tool result to the user, rendered (a polar plot for angular scans, a field table otherwise) on hosts that support it. Pass `path` from an earlier result's full_result — the viewer then reads the complete payload directly, so the full data never enters your context. Use it when the user would rather see the data than read it.",
+            "description": "Show a saved tool result to the user, rendered (a polar plot for angular scans, a field table otherwise) on hosts that support it. Pass `path` from an earlier result's full_result — the viewer then reads the complete payload directly, so the full data never enters your context. A result is charted only when it declares how (the command's `view`, or an `encoding` you pass here); otherwise it renders as a field table. Use it when the user would rather see the data than read it.",
             "inputSchema": { "type": "object", "properties": {
                 "path": { "type": "string", "description": "full_result path from an earlier tool result, e.g. .openbaud/out/res-….json" },
-                "data": { "type": "object", "description": "The result itself, for small results that were never spilled to disk" }
+                "data": { "type": "object", "description": "The result itself, for small results that were never spilled to disk" },
+                "encoding": { "type": "object", "description": "How to draw it: {kind, data, angle, radius, intensity?} naming the fields that feed each visual channel. Only needed when the result carries no `view` of its own — e.g. you decoded the bytes yourself. Overrides the result's `view` when both are present." }
             }},
             "annotations": read_only_local,
             "_meta": { "ui": { "resourceUri": resources::VIEWER_URI } },
@@ -272,14 +273,22 @@ pub async fn call(name: &str, args: Value, ctx: &Arc<Ctx>) -> anyhow::Result<Val
                     .len();
                 // Deliberately a pointer, not the payload: the viewer fetches the
                 // full data over resources/read, keeping it out of model context.
-                Ok(json!({
+                let mut out = json!({
                     "source": "file",
                     "path": path,
                     "uri": format!("{}{name}", resources::RESULT_URI_PREFIX),
                     "bytes": bytes,
-                }))
+                });
+                if let Some(encoding) = args.get("encoding").filter(|v| !v.is_null()) {
+                    out["encoding"] = encoding.clone();
+                }
+                Ok(out)
             } else if args.get("data").is_some_and(|d| !d.is_null()) {
-                Ok(json!({ "source": "inline" }))
+                let mut out = json!({ "source": "inline" });
+                if let Some(encoding) = args.get("encoding").filter(|v| !v.is_null()) {
+                    out["encoding"] = encoding.clone();
+                }
+                Ok(out)
             } else {
                 bail!("show_result needs either path (a full_result path) or data")
             }
