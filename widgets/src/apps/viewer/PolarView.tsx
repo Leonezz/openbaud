@@ -46,11 +46,16 @@ export function PolarView({ widget, scan, resultRef }: PolarViewProps) {
   // Frozen-frame sweep angle: where the newest data ends (design default).
   const sweepDeg = scan.points.at(-1)?.angleDeg ?? null
 
+  // The render core reads every colour from theme tokens at draw time, so a
+  // host theme switch must redraw — the canvas would otherwise keep the
+  // previous theme's palette.
+  const theme = widget.theme
   const draw = useCallback((): void => {
     const canvas = canvasRef.current
     if (!canvas) return
+    void theme
     drawPolar(canvas, frame, { ...scale, sweepDeg, annotateNearest: true })
-  }, [frame, scale, sweepDeg])
+  }, [frame, scale, sweepDeg, theme])
 
   useEffect(() => {
     draw()

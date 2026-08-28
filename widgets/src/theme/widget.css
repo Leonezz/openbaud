@@ -3,11 +3,13 @@
    openbaud MCP Apps widget design system · v2 neutral · 2026-08-27
    v2 变更:外壳去品牌化——中性灰明暗两套,适配任意 agent 宿主风格;
    移除辉光/品牌点/CRT 默认纹理;accent 收敛为唯一克制绿(主按钮/焦点/回执)。
-   保留(信息即本质):系列色 s1–s4 与两条 ramp(dataviz 验证器于新表面
-   #101214 复检通过,最差相邻对 ΔE 21.0)、披露徽章、hex 双编码、深色数据表面。
+   保留(信息即本质):系列色 s1–s4、披露徽章、hex 双编码。
+   v3 变更(2026-08-28):数据表面改为**跟随宿主主题**——深色仪器屏在浅色对话里
+   像挖了个洞。浅色档的 intensity ramp 方向随之翻转(高强度 = 深色),最浅档对
+   浅表面 2.22:1,过顺序色阶 2:1 底线;深色档沿用 #101214 上验证过的旧值。
    规则:
-   - 卡片外壳(chrome)随宿主明暗主题自适应:[data-theme="light"|"dark"]
-   - 数据表面(.ob-scope)永远深色仪器屏,两主题下不变
+   - 卡片外壳与数据表面均随宿主明暗主题:[data-theme="light"|"dark"]
+   - 渲染核在绘制时经 getComputedStyle 读 token,故换主题必须触发重绘
    - 状态色(ok/warn/danger)保留语义,永不当系列色;必须伴随图标+文字
    - 设备来源字符串只走 textContent(实现期红线,mockup 同样遵守)
    ============================================================ */
@@ -17,19 +19,20 @@
   --font-mono: ui-monospace, "SF Mono", "Cascadia Code", "Roboto Mono", Menlo, monospace;
   --inline-w: 720px;
 
-  /* 数据表面:主题不变量(中性深灰仪器屏) */
-  --scope-bg: #101214;
-  --scope-bg2: #17191c;
-  --scope-grid: rgba(255, 255, 255, 0.05);
-  --scope-line: #2e3236;
-  --scope-ink: #e8eaec;
-  --scope-muted: #9aa0a6;
-  --scope-faint: #565b60;
+  /* 数据表面(浅色档,同时是 :root 默认——渲染核缺 token 会显式抛错) */
+  --scope-bg: #f4f5f7;
+  --scope-bg2: #eceef1;
+  --scope-grid: rgba(0, 0, 0, 0.06);
+  --scope-line: #d5d8dc;
+  --scope-ink: #1a1c1e;
+  --scope-muted: #666b70;
+  --scope-faint: #9aa0a6;
+  --scope-watermark: rgba(0, 0, 0, 0.06);
 
-  /* 品牌痕迹收敛:柔和绿仅用于数据层高亮(扫描线等),无辉光 */
-  --brand: #4cc79a;
-  --brand-glow: rgba(76, 199, 154, 0.18);
-  --brand-lime: #4cc79a;
+  /* 数据层高亮(扫描线、CRC PASS):浅表面上需加深才可读 */
+  --brand: #0c7a55;
+  --brand-glow: rgba(12, 122, 85, 0.18);
+  --brand-lime: #0c7a55;
 
   /* 系列色(仅用于深色数据表面;顺序固定,禁止循环取色) */
   --s1: #17a678; /* green  · 首系列/RX */
@@ -37,12 +40,13 @@
   --s3: #b97f10; /* amber  · 第三系列 */
   --s4: #9257ee; /* violet · 第四系列 */
 
-  /* 绿色顺序渐变(单色相,明度单调;雷达 intensity、信号强度) */
-  --ramp-g1: #0e3a2d;
-  --ramp-g2: #14573f;
-  --ramp-g3: #178a5f;
-  --ramp-g4: #2cc389;
-  --ramp-g5: #61f2b0;
+  /* 绿色顺序渐变(单色相,明度单调;雷达 intensity、信号强度)。
+     浅色档:高强度 = 深色;g1 对 --scope-bg 2.22:1,过顺序色阶 2:1 底线。 */
+  --ramp-g1: #6ab596;
+  --ramp-g2: #3f9a78;
+  --ramp-g3: #1c7f5e;
+  --ramp-g4: #0a6446;
+  --ramp-g5: #054d2c;
 
   /* 琥珀顺序渐变(热力矩阵专用) */
   --ramp-a1: #3a2402;
@@ -98,6 +102,25 @@
   --hairline: #26282b;
   --field: #17191c;
   --field-bg: #17191c;
+
+  /* 数据表面(深色档):#101214 表面上验证过的原值 */
+  --scope-bg: #101214;
+  --scope-bg2: #17191c;
+  --scope-grid: rgba(255, 255, 255, 0.05);
+  --scope-line: #2e3236;
+  --scope-ink: #e8eaec;
+  --scope-muted: #9aa0a6;
+  --scope-faint: #565b60;
+  --scope-watermark: rgba(255, 255, 255, 0.07);
+  --brand: #4cc79a;
+  --brand-glow: rgba(76, 199, 154, 0.18);
+  --brand-lime: #4cc79a;
+  /* 高强度 = 亮色(深底上发光) */
+  --ramp-g1: #0e3a2d;
+  --ramp-g2: #14573f;
+  --ramp-g3: #178a5f;
+  --ramp-g4: #2cc389;
+  --ramp-g5: #61f2b0;
 }
 
 /* ---------- 卡片壳 ---------- */
@@ -183,7 +206,7 @@
 }
 .ob-watermark span {
   font-family: var(--font-mono); font-weight: 700; font-size: 42px;
-  letter-spacing: 12px; color: rgba(255, 255, 255, 0.07);
+  letter-spacing: 12px; color: var(--scope-watermark);
   transform: rotate(-18deg); user-select: none;
 }
 
