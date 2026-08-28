@@ -283,11 +283,15 @@
 
 /* ---------- 键值行 / 表格 ---------- */
 .ob-kv {
-  display: grid; grid-template-columns: max-content 1fr; gap: 4px 16px;
+  display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 4px 16px;
   font-size: 12px;
+  min-width: 0;
 }
 .ob-kv dt { color: var(--muted); }
-.ob-kv dd { margin: 0; font-family: var(--font-mono); }
+/* Values carry device data: long hex runs, escaped text with no spaces in it.
+   Grid items default to min-width:auto, so one unbreakable string would widen
+   the whole grid past the card and silently clip every row. Wrap instead. */
+.ob-kv dd { margin: 0; font-family: var(--font-mono); min-width: 0; overflow-wrap: anywhere; }
 .ob-table { width: 100%; border-collapse: collapse; font-size: 12px; }
 .ob-table th {
   text-align: left; font-weight: 600; color: var(--muted);
