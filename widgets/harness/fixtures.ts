@@ -233,6 +233,10 @@ export function radarCommandResult(index: number): JsonObject {
     command: 'obp1_radar_scan',
     tx_hex: scan.txHex,
     outcome: 'normal',
+    // obp1_radar_scan declares validate: { checksum: crc16_modbus }, so the
+    // server reports the algorithm it ran. A command without `validate` omits
+    // this key and the viewer then claims no verification.
+    checksum: 'crc16_modbus',
     expect: 'normal',
     expect_met: true,
     raw_hex: scan.rxHex,
@@ -286,6 +290,9 @@ export function aliasScanResult(index: number): JsonObject {
     device: 'thirdparty-lidar',
     command: 'sweep',
     outcome: 'normal',
+    // Deliberately no `checksum`: this device declares no validate block, so
+    // nothing was verified and the meta strip must stay silent about it.
+
     parsed: {
       seq: scan.seq,
       uptime_ms: scan.uptimeMs,

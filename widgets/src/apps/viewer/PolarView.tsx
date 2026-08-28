@@ -141,7 +141,12 @@ export function PolarView({ widget, scan, resultRef }: PolarViewProps) {
             </span>
           </div>
           <div className="ob-scope__meta ob-scope__meta--tr">
-            {scan.outcome === 'normal' && <span className="is-pass">CRC PASS ✓</span>}
+            {/* Shown only when the server reports a checksum it actually ran:
+                a `normal` outcome on a command with no `validate` verifies
+                nothing, and claiming otherwise on screen would be a lie. */}
+            {scan.checksum !== undefined && (
+              <span className="is-pass">{scan.checksum} ✓</span>
+            )}
             {scan.seq !== undefined && <span>seq {scan.seq}</span>}
           </div>
           <div className="ob-scope__meta ob-scope__meta--bl">

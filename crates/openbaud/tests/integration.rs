@@ -872,6 +872,61 @@ async fn rpc_resources_read_unknown_uri_is_loud() {
 }
 
 #[tokio::test]
+async fn results_report_a_checksum_only_when_one_was_verified() {
+    let dir = scaffold_workspace();
+    let ctx = ctx_for(&dir);
+
+    // echodev/ping declares no `validate`, so nothing about it was checked —
+    // the result must not imply otherwise.
+    let unchecked = tools::call(
+        "run_command",
+        json!({ "device": "echodev", "command": "ping", "port": "mock:echo" }),
+        &ctx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(unchecked["outcome"], json!("normal"));
+    assert!(
+        unchecked.get("checksum").is_none(),
+        "a command without validate must not claim a checksum: {unchecked}"
+    );
+
+    // A command that does declare one reports the algorithm that passed.
+    let dev = dir.path().join("devices/crcdev");
+    std::fs::create_dir_all(dev.join("commands")).unwrap();
+    std::fs::write(
+        dev.join("profile.yaml"),
+        "schema: openbaud/profile@v0\nname: crcdev\nframing: { idle_ms: 20 }\n",
+    )
+    .unwrap();
+    // mock:echo returns the frame verbatim, so a self-consistent crc frame validates.
+    std::fs::write(
+        dev.join("commands/probe.yaml"),
+        r#"
+schema: openbaud/command@v0
+name: probe
+frame: { hex: "01 04 00 00 00 01 {crc16_modbus}" }
+response:
+  match: { length: 8 }
+  timeout_ms: 1000
+  validate: { checksum: crc16_modbus }
+  parse: { fields: { addr: { at: 0, type: u8 } } }
+"#,
+    )
+    .unwrap();
+
+    let checked = tools::call(
+        "run_command",
+        json!({ "device": "crcdev", "command": "probe", "port": "mock:echo" }),
+        &ctx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(checked["outcome"], json!("normal"), "got: {checked}");
+    assert_eq!(checked["checksum"], json!("crc16_modbus"), "got: {checked}");
+}
+
+#[tokio::test]
 async fn ui_binds_only_to_show_and_ask_tools() {
     let bound: Vec<(String, String)> = tools::list()
         .into_iter()

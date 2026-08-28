@@ -92,6 +92,11 @@ pub async fn execute_command(
             if let Some(detail) = classified.detail {
                 out.insert("detail".to_string(), json!(detail));
             }
+            // Only present when a checksum was actually declared and passed —
+            // a `normal` outcome alone never means anything was verified.
+            if let Some(algorithm) = classified.checksum_verified {
+                out.insert("checksum".to_string(), json!(algorithm));
+            }
             let units = units(cmd);
             if !units.is_empty() {
                 out.insert("units".to_string(), Value::Object(units));

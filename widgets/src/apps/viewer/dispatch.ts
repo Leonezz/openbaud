@@ -68,6 +68,8 @@ export interface PolarScan {
   readonly device: string | undefined
   readonly command: string | undefined
   readonly outcome: string | undefined
+  /** Algorithm the server actually verified, when the command declared one. */
+  readonly checksum: string | undefined
   readonly seq: number | undefined
   readonly uptimeMs: number | undefined
 }
@@ -261,6 +263,7 @@ export function dispatchResult(structured: OpenbaudSummary, override?: unknown):
       device: asString(structured.device),
       command: asString(structured.command),
       outcome: asString(structured.outcome),
+      checksum: asString(structured.checksum),
       seq: asNumber(parsed.seq),
       uptimeMs: asNumber(parsed.uptime_ms),
     },

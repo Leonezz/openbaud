@@ -484,11 +484,23 @@ pub struct ClassifiedResponse {
     pub partial: Option<Vec<u8>>,
     /// Human-readable reason for checksum_error / malformed / timeout.
     pub detail: Option<String>,
+    /// The checksum algorithm that actually ran and passed, when the command
+    /// declared one. `None` means nothing was verified — a caller must not
+    /// infer a passing checksum from a `normal` outcome.
+    pub checksum_verified: Option<String>,
 }
 
 impl ClassifiedResponse {
     fn bare(outcome: Outcome) -> Self {
-        Self { outcome, parsed: None, exception: None, raw: None, partial: None, detail: None }
+        Self {
+            outcome,
+            parsed: None,
+            exception: None,
+            raw: None,
+            partial: None,
+            detail: None,
+            checksum_verified: None,
+        }
     }
 }
 
@@ -536,6 +548,7 @@ fn classify_frame(
     bytes: Vec<u8>,
     as_exception: bool,
 ) -> ClassifiedResponse {
+    let mut checksum_verified = None;
     if let Some(v) = validate {
         if let Err(e) = verify_checksum(v, &bytes) {
             return ClassifiedResponse {
@@ -544,6 +557,7 @@ fn classify_frame(
                 ..ClassifiedResponse::bare(Outcome::ChecksumError)
             };
         }
+        checksum_verified = Some(v.checksum.clone());
     }
     let decoded = match parse {
         Some(p) => match parse_with_spec(p, &bytes) {
@@ -562,12 +576,14 @@ fn classify_frame(
         ClassifiedResponse {
             exception: Some(decoded),
             raw: Some(bytes),
+            checksum_verified,
             ..ClassifiedResponse::bare(Outcome::Exception)
         }
     } else {
         ClassifiedResponse {
             parsed: Some(decoded),
             raw: Some(bytes),
+            checksum_verified,
             ..ClassifiedResponse::bare(Outcome::Normal)
         }
     }
