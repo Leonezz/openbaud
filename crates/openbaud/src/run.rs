@@ -80,6 +80,7 @@ pub async fn execute_command(
                 out.insert("raw_hex".to_string(), json!(hex::to_hex(raw)));
                 out.insert("raw_text".to_string(), json!(hex::to_text_lossy(raw)));
             }
+            let has_parsed = classified.parsed.is_some();
             if let Some(parsed) = classified.parsed {
                 out.insert("parsed".to_string(), parsed);
             }
@@ -103,8 +104,13 @@ pub async fn execute_command(
             }
             // The command's declared encoding travels with the result so a
             // viewer knows which field feeds which channel — it never guesses.
-            if let Some(view) = cmd.response.as_ref().and_then(|r| r.view.as_ref()) {
-                out.insert("view".to_string(), serde_json::to_value(view)?);
+            // It describes how to draw parsed values, so a run that produced
+            // none (silence, timeout, a checksum error) carries no view: the
+            // failure should read as a failure, not as a broken declaration.
+            if has_parsed {
+                if let Some(view) = cmd.response.as_ref().and_then(|r| r.view.as_ref()) {
+                    out.insert("view".to_string(), serde_json::to_value(view)?);
+                }
             }
             met
         }

@@ -40,8 +40,11 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
+// The toggle is the only place aliases are named, and it says what clicking
+// does. A per-row "N aliases hidden" badge was removed: a count the reader
+// cannot act on is not information.
 function aliasLabel(count: number, shown: boolean): string {
-  const noun = count === 1 ? '1 alias' : `${count} aliases`
+  const noun = count === 1 ? '1 duplicate node' : `${count} duplicate nodes`
   return shown ? `Hide ${noun}` : `Show ${noun}`
 }
 
@@ -236,7 +239,6 @@ export function PortPickerApp() {
         )}
         <PortTable
           ports={rows}
-          aliases={aliases}
           showAliases={showAliases}
           selectedPath={selectedPath}
           sentPath={send.kind === 'sent' ? send.path : null}

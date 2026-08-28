@@ -46,3 +46,9 @@ canvas.radar { position: absolute; inset: 0; width: 100%; height: 100%; display:
 
 .jsonkv-index { color: var(--faint); }
 .jsonkv-muted { color: var(--muted); }
+.jsonkv-more {
+  justify-self: start; padding: 0; border: 0; background: none;
+  font-family: var(--font-ui); font-size: 11px; color: var(--accent); cursor: pointer;
+}
+.jsonkv-more:hover { text-decoration: underline; }
+.jsonkv-more:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }

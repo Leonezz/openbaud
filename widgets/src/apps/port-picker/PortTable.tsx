@@ -5,8 +5,6 @@ import { describePort, isBlocked, type EnrichedPort } from './ports'
 
 export interface PortTableProps {
   ports: readonly EnrichedPort[]
-  /** canonical path → folded alias paths, so a canonical row can say it has twins. */
-  aliases: ReadonlyMap<string, readonly string[]>
   /** Alias rows are listed on their own once the toggle is on. */
   showAliases: boolean
   selectedPath: string | null
@@ -15,13 +13,8 @@ export interface PortTableProps {
   onSelect: (path: string) => void
 }
 
-function aliasNote(count: number): string {
-  return count === 1 ? '1 alias hidden' : `${count} aliases hidden`
-}
-
 export function PortTable({
   ports,
-  aliases,
   showAliases,
   selectedPath,
   sentPath,
@@ -37,7 +30,6 @@ export function PortTable({
       {ports.map((port) => {
         const selected = port.path === selectedPath
         const blocked = isBlocked(port)
-        const folded = showAliases ? [] : (aliases.get(port.path) ?? [])
         const matches = port.matches_devices ?? []
         return (
           <ObTableRow
@@ -84,8 +76,7 @@ export function PortTable({
                   </Chip>
                 ))}
                 {blocked && <Chip variant="warn">in use · {port.open_session}</Chip>}
-                {folded.length > 0 && <Chip>{aliasNote(folded.length)}</Chip>}
-                {matches.length === 0 && !blocked && folded.length === 0 && (
+                {matches.length === 0 && !blocked && (
                   <span className="pp-nomatch">no profile match</span>
                 )}
               </div>
