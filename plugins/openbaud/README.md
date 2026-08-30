@@ -34,7 +34,7 @@ codex plugin add openbaud@openbaud-marketplace
 
 An HTTPS or SSH Git URL works as well. Private repositories require the user to
 already have Git access. To pin a reproducible release rather than track the
-default branch, add `--ref v0.1.4` to the marketplace command.
+default branch, add `--ref v0.1.5` to the marketplace command.
 
 To refresh a marketplace that tracks a branch and reinstall its latest plugin:
 
@@ -50,7 +50,7 @@ The extracted directory is a complete local marketplace, so it can be installed
 without Rust, Cargo, or another binary download:
 
 ```sh
-codex plugin marketplace add /absolute/path/to/openbaud-v0.1.4-<platform>
+codex plugin marketplace add /absolute/path/to/openbaud-v0.1.5-<platform>
 codex plugin add openbaud@openbaud-marketplace
 ```
 

@@ -48,6 +48,19 @@ requests = [
     },
     {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}},
     {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+    {"jsonrpc": "2.0", "id": 3, "method": "resources/list", "params": {}},
+    {
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "resources/read",
+        "params": {"uri": "ui://openbaud/port-picker.html"},
+    },
+    {
+        "jsonrpc": "2.0",
+        "id": 5,
+        "method": "resources/read",
+        "params": {"uri": "ui://openbaud/viewer.html"},
+    },
 ]
 pathlib.Path(sys.argv[1]).write_text("\n".join(json.dumps(item) for item in requests) + "\n")
 PY
@@ -67,6 +80,7 @@ by_id = {item.get("id"): item for item in responses}
 
 server = by_id[1]["result"]["serverInfo"]
 tools = by_id[2]["result"]["tools"]
+resources = by_id[3]["result"]["resources"]
 manifest = json.loads(pathlib.Path(sys.argv[3]).read_text())
 mcp_config = json.loads(pathlib.Path(sys.argv[3]).parents[1].joinpath(".mcp.json").read_text())
 names = {tool["name"] for tool in tools}
@@ -82,6 +96,13 @@ required = {
     "schema",
     "capture_start",
     "capture_stop",
+    "session_timeline",
+    "capture_frames",
+    "diagnose_frame",
+    "session_stats",
+    "stream_poll",
+    "ask_port",
+    "show_result",
 }
 
 if server["name"] != "openbaud":
@@ -98,6 +119,34 @@ if server_config.get("command") != sys.argv[4]:
 if names != required:
     raise SystemExit(f"unexpected tools: {sorted(names)}")
 
+by_name = {tool["name"]: tool for tool in tools}
+ui_bindings = {
+    "ask_port": "ui://openbaud/port-picker.html",
+    "show_result": "ui://openbaud/viewer.html",
+}
+for name, uri in ui_bindings.items():
+    actual = by_name[name].get("_meta", {}).get("ui", {}).get("resourceUri")
+    if actual != uri:
+        raise SystemExit(f"{name} UI binding is {actual!r}, expected {uri!r}")
+
+resource_by_uri = {resource["uri"]: resource for resource in resources}
+if set(resource_by_uri) != set(ui_bindings.values()):
+    raise SystemExit(f"unexpected UI resources: {sorted(resource_by_uri)}")
+for uri, resource in resource_by_uri.items():
+    if resource.get("mimeType") != "text/html;profile=mcp-app":
+        raise SystemExit(f"{uri} has unexpected MIME type: {resource.get('mimeType')!r}")
+
+for response_id, uri in ((4, ui_bindings["ask_port"]), (5, ui_bindings["show_result"])):
+    contents = by_id[response_id]["result"].get("contents", [])
+    if len(contents) != 1:
+        raise SystemExit(f"{uri} returned {len(contents)} content blocks, expected 1")
+    content = contents[0]
+    if content.get("uri") != uri or content.get("mimeType") != "text/html;profile=mcp-app":
+        raise SystemExit(f"{uri} returned invalid resource metadata: {content}")
+    html = content.get("text")
+    if not isinstance(html, str) or not html.lower().startswith("<!doctype html>"):
+        raise SystemExit(f"{uri} did not return a self-contained HTML document")
+
 for tool in tools:
     annotations = tool.get("annotations", {})
     missing = {
@@ -108,7 +157,6 @@ for tool in tools:
     if missing:
         raise SystemExit(f"{tool['name']} has invalid annotations: {sorted(missing)}")
 
-by_name = {tool["name"]: tool for tool in tools}
 for name in ("send", "request", "run_command", "run_workflow"):
     if not by_name[name]["annotations"]["destructiveHint"]:
         raise SystemExit(f"{name} must declare destructiveHint=true")
