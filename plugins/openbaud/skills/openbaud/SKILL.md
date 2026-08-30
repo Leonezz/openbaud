@@ -45,7 +45,38 @@ the claim. Use `replay:<capture path>` for hardware-free regression tests.
 - `send`: raw writes only when a response is not expected.
 - `run_command`: execute verified declarative device behavior.
 - `run_workflow`: execute a verified fixed sequence with cleanup.
-- `capture_start`, `capture_stop`: preserve timing and wire evidence.
+- `capture_start`, `capture_stop`: preserve timing and wire evidence. Both
+  return the capture's workspace-relative `path` (`captures/<file>`) — pass
+  it verbatim to `capture_frames`, `session_timeline`, or `replay:<path>`.
+- `session_timeline`: fold a recorded capture plus the audit log into a
+  density-and-events timeline of that session (capture file required; no
+  live-session mode).
+- `capture_frames`: re-frame a capture's bytes into timestamped tx/rx frames,
+  paginated; pass an explicit `framing` or a device whose profile declares one
+  — one of the two is required.
+- `diagnose_frame`: probe one frame against every checksum algorithm and
+  encoding at the tail (each row's `at` is where the stored checksum starts;
+  inapplicable algorithms report only the error), and — with
+  `expected: {device, command}` — against that command's parse at byte
+  offsets -2..=+2. `parsed: true` only means structurally decodable at that
+  offset; the offsets are mutually exclusive hypotheses to judge yourself.
+  Pure computation, no hardware.
+- `session_stats`: live counters for open sessions (buffered, dropped, rx/tx
+  bytes, transport, capture state).
+- `stream_poll`: per-consumer incremental frame subscription on a live
+  session — create with `session_id`, poll with the returned
+  `subscription_id`, acknowledge with `since_seq` set to the last delivered
+  frame's `seq + 1` (unacknowledged frames are redelivered, so a lost
+  response is recoverable; acking frames never delivered is a loud error).
+  Pages stop at `max_frames` and at `max_inline_bytes` (default 4096, bounds
+  512..=262144; metered as rendered hex + text length, whole frames only,
+  actual total reported as `page_bytes`) — except a single first frame beyond
+  the budget, delivered alone with `oversized_frame: true` so delivery always
+  makes progress.
+  Lagging drops the oldest frames into a loud `dropped_frames` count and
+  buffer overflow past the cursor into `dropped_chunks`; a drained poll on a
+  dead port errors loudly; `close: true` releases it. Independent of `read`
+  — the two never steal frames from each other.
 - `schema`: obtain the exact knowledge-format contract.
 
 Prefer verified commands over repeated raw byte construction.
@@ -61,6 +92,24 @@ deliberately and not by habit:
   choice is the user's. It opens nothing — the answer returns to you and you
   call `open`. For your own discovery use `list_ports`, which reports device
   matches, ports held by a session, and `/dev/tty.*` twins.
+
+## Declarative rendering
+
+Results are drawn only from declared encodings — never guessed from field
+names:
+
+- A command result charts only when its YAML declares `response.view`, naming
+  which parsed field feeds which visual channel, e.g.
+  `view: { kind: polar, data: points, angle: bearing, radius: range_mm }`.
+  Declare it once and every `run_command` result renders through
+  `show_result`.
+- For bytes you decoded yourself, pass the same channel mapping as the
+  `encoding` argument of `show_result`.
+- `session_timeline`, `capture_frames` and `diagnose_frame` results carry
+  their own `view` declaration (`timeline`, `capture`, `diagnostics`): hand
+  the result, or its `full_result` path, to `show_result` and it renders — no
+  extra encoding needed.
+- No declaration means no chart: the result renders as an honest field table.
 
 ## Safety boundary
 
