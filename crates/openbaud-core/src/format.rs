@@ -329,8 +329,9 @@ pub struct ParamSpec {
 #[serde(deny_unknown_fields)]
 pub struct FrameSpec {
     /// Whitespace-separated hex bytes with `{param}` and checksum
-    /// placeholders ({crc16_modbus}, {xor8}, {sum8}, {sum16be}); checksum
-    /// placeholders are computed over every byte built before them.
+    /// placeholders ({crc16_modbus}, {crc16_ccitt}, {crc8}, {crc32}, {xor8},
+    /// {sum8}, {sum16be}); checksum placeholders are computed over every byte
+    /// built before them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hex: Option<String>,
     /// Literal text with `{param}` interpolation; `{{`/`}}` escape braces.
@@ -483,7 +484,8 @@ impl MatchSpec {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ValidateSpec {
-    /// Checksum algorithm: crc16_modbus, xor8, sum8 or sum16be.
+    /// Checksum algorithm: crc16_modbus, crc16_ccitt, crc8, crc32, xor8,
+    /// sum8 or sum16be.
     pub checksum: String,
     /// Byte range the checksum is computed over, both ends inclusive.
     /// Negative indices count from the frame end (-1 = last byte).
@@ -548,8 +550,27 @@ pub struct ViewSpec {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ViewKind {
-    /// Angular scan drawn on polar axes.
+    /// Angular scan drawn on polar axes. The only kind a command YAML may
+    /// declare.
     Polar,
+    /// Session timeline produced by the `session_timeline` tool.
+    Timeline,
+    /// Frame diagnosis produced by the `diagnose_frame` tool.
+    Diagnostics,
+    /// Captured traffic produced by the `capture_frames` tool.
+    Capture,
+}
+
+impl ViewKind {
+    /// The snake_case name used on the wire and in error messages.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Polar => "polar",
+            Self::Timeline => "timeline",
+            Self::Diagnostics => "diagnostics",
+            Self::Capture => "capture",
+        }
+    }
 }
 
 /// How to decode a frame into named values. Exactly one of `fields` (binary)
@@ -871,6 +892,22 @@ fn unit_class(unit: &str) -> Option<&'static str> {
 /// must name a real field, so a renaming breaks the build instead of silently
 /// dropping the chart.
 fn check_view_spec(view: &ViewSpec, parse: Option<&ParseSpec>, path: &str) -> crate::Result<()> {
+    // Kind gate first, so a tool-produced kind gets this message and not a
+    // complaint about its channels.
+    match view.kind {
+        ViewKind::Polar => {}
+        ViewKind::Timeline | ViewKind::Diagnostics | ViewKind::Capture => {
+            return Err(ferr(
+                path,
+                format!(
+                    "response.view.kind {}: this view kind is produced by tools \
+                     (session_timeline / diagnose_frame / capture_frames), not declared in \
+                     command YAML — polar is the only declarable kind",
+                    view.kind.name()
+                ),
+            ));
+        }
+    }
     let fields = parse.and_then(|p| p.fields.as_ref()).ok_or_else(|| {
         ferr(path, "response.view needs response.parse.fields to name channels in")
     })?;
@@ -914,28 +951,26 @@ fn check_view_spec(view: &ViewSpec, parse: Option<&ParseSpec>, path: &str) -> cr
         Ok(())
     };
 
-    match view.kind {
-        ViewKind::Polar => {
-            if view.angle.is_none() || view.radius.is_none() {
-                return Err(ferr(
-                    path,
-                    "response.view kind polar requires both an angle and a radius channel",
-                ));
-            }
-            channel("angle", &view.angle, "angle")?;
-            channel("radius", &view.radius, "length")?;
-            // intensity is a bare magnitude: any unit (or none) is fine.
-            if let Some(name) = &view.intensity {
-                if !elements.contains_key(name) {
-                    return Err(ferr(
-                        path,
-                        format!(
-                            "response.view.intensity {name:?} is not an element of {:?}",
-                            view.data
-                        ),
-                    ));
-                }
-            }
+    // Only polar reaches this point (the kind gate above returned for the
+    // tool-produced kinds).
+    if view.angle.is_none() || view.radius.is_none() {
+        return Err(ferr(
+            path,
+            "response.view kind polar requires both an angle and a radius channel",
+        ));
+    }
+    channel("angle", &view.angle, "angle")?;
+    channel("radius", &view.radius, "length")?;
+    // intensity is a bare magnitude: any unit (or none) is fine.
+    if let Some(name) = &view.intensity {
+        if !elements.contains_key(name) {
+            return Err(ferr(
+                path,
+                format!(
+                    "response.view.intensity {name:?} is not an element of {:?}",
+                    view.data
+                ),
+            ));
         }
     }
     Ok(())
@@ -1366,6 +1401,39 @@ response:
     }
 
     #[test]
+    fn tool_produced_view_kinds_are_rejected_in_yaml() {
+        for kind in ["timeline", "diagnostics", "capture"] {
+            let bad = SCAN_COMMAND.replace("kind: polar", &format!("kind: {kind}"));
+            assert_ne!(bad, SCAN_COMMAND, "replacement did not apply");
+            let err = parse_command(&bad, "scan.yaml").unwrap_err().to_string();
+            assert!(err.contains("produced by tools"), "{kind}: {err}");
+            assert!(
+                err.contains("session_timeline")
+                    && err.contains("diagnose_frame")
+                    && err.contains("capture_frames"),
+                "error must name the producing tools: {err}"
+            );
+            assert!(err.contains(kind), "error must name the rejected kind: {err}");
+        }
+    }
+
+    #[test]
+    fn view_kind_names_are_snake_case() {
+        assert_eq!(serde_json::to_string(&ViewKind::Timeline).unwrap(), "\"timeline\"");
+        assert_eq!(serde_json::to_string(&ViewKind::Diagnostics).unwrap(), "\"diagnostics\"");
+        assert_eq!(serde_json::to_string(&ViewKind::Capture).unwrap(), "\"capture\"");
+        assert_eq!(serde_json::from_str::<ViewKind>("\"polar\"").unwrap(), ViewKind::Polar);
+        for (kind, name) in [
+            (ViewKind::Polar, "polar"),
+            (ViewKind::Timeline, "timeline"),
+            (ViewKind::Diagnostics, "diagnostics"),
+            (ViewKind::Capture, "capture"),
+        ] {
+            assert_eq!(kind.name(), name);
+        }
+    }
+
+    #[test]
     fn units_reach_nested_record_elements() {
         // Element units are declared in YAML; they must survive into results
         // so a viewer can label axes without guessing.
@@ -1483,7 +1551,7 @@ response:
         assert!(parse_command(&bad, "c.yaml").is_err());
 
         // exception.parse checksum name must be known
-        let bad = EXCEPTION_CMD.replace("checksum: crc16_modbus", "checksum: crc32");
+        let bad = EXCEPTION_CMD.replace("checksum: crc16_modbus", "checksum: crc999");
         let err = parse_command(&bad, "c.yaml").unwrap_err();
         assert!(err.to_string().contains("exception.validate"));
 

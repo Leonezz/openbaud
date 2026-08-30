@@ -27,7 +27,10 @@ response.match sets exactly one of length / delimiter / idle_ms and is required 
 expect: exception requires a response.exception block; \
 parse sets exactly one of fields (binary) / regex (text); \
 every {param} placeholder in the frame must be declared in params, and hex frames need binary param types; \
-hex-frame checksum placeholders ({crc16_modbus}, {xor8}, {sum8}, {sum16be}) cover every byte built before them; \
+a string param interpolated into a text frame must not contain any control character \
+(0x00-0x1F, 0x7F) — framing bytes like \\r\\n belong in the template, never in a value; \
+hex-frame checksum placeholders ({crc16_modbus}, {crc16_ccitt}, {crc8}, {crc32}, {xor8}, {sum8}, {sum16be}) \
+cover every byte built before them, and validate.checksum takes the same names; \
 a parse field sets exactly one of type / elements — elements makes a one-level record array and requires count and stride; \
 type ascii_int requires len; \
 count: {field: name} must reference a scalar field of the same parse block; \
@@ -46,6 +49,8 @@ its data must be a record-array field of response.parse.fields, and every channe
 so a device keeps its own field names and nothing is ever inferred from naming; \
 kind: polar requires both angle and radius (intensity optional), \
 and a channel whose field declares a unit of the wrong kind (an angle channel on a length field, or the reverse) is rejected; \
+polar is the only kind a command YAML may declare — the timeline / diagnostics / capture kinds are \
+produced by tools (session_timeline / diagnose_frame / capture_frames) and are rejected here; \
 a command with no view is simply never charted.";
 
 const WORKFLOW_RULES: &str = "Semantic rules beyond this schema: \
@@ -122,7 +127,7 @@ response:
   match: { length: 26 }        # exactly one of: length, delimiter, idle_ms
   timeout_ms: 2000
   validate:
-    checksum: sum8             # crc16_modbus | xor8 | sum8 | sum16be
+    checksum: sum8             # crc16_modbus | crc16_ccitt | crc8 | crc32 | xor8 | sum8 | sum16be
     range: { from: 2, to: -3 } # bytes covered, inclusive; negative = from frame end
     at: -2                     # checksum position; default is the frame tail
   parse:
@@ -241,6 +246,22 @@ mod tests {
             assert!(union.contains("anyOf") || union.contains("oneOf"), "{def}: {union}");
             assert!(!union.contains("\"Fixed\"") && !union.contains("\"Name\""), "{def}: {union}");
         }
+    }
+
+    #[test]
+    fn command_rules_list_all_checksums_and_tool_produced_view_kinds() {
+        let schema = json_schema(SchemaKind::Command);
+        let desc = schema["description"].as_str().unwrap();
+        for name in ["crc16_modbus", "crc16_ccitt", "crc8", "crc32", "xor8", "sum8", "sum16be"] {
+            assert!(desc.contains(name), "rules miss checksum {name:?}");
+        }
+        for tool in ["session_timeline", "diagnose_frame", "capture_frames"] {
+            assert!(desc.contains(tool), "rules miss producing tool {tool:?}");
+        }
+        assert!(
+            desc.contains("control character"),
+            "rules must state that text-frame string params reject control characters: {desc}"
+        );
     }
 
     #[test]

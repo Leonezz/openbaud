@@ -15,7 +15,9 @@ use thiserror::Error;
 pub enum CoreError {
     #[error("invalid hex string {input:?}: {reason}")]
     InvalidHex { input: String, reason: String },
-    #[error("unknown checksum {0:?} (expected crc16_modbus, xor8, sum8 or sum16be)")]
+    #[error(
+        "unknown checksum {0:?} (expected crc16_modbus, crc16_ccitt, crc8, crc32, xor8, sum8 or sum16be)"
+    )]
     UnknownChecksum(String),
     #[error("unknown field type {0:?}")]
     UnknownFieldType(String),

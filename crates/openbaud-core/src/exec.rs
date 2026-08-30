@@ -193,7 +193,12 @@ pub fn verify_checksum(spec: &ValidateSpec, frame: &[u8]) -> crate::Result<()> {
 // Response parsing
 // ---------------------------------------------------------------------------
 
-fn parse_with_spec(parse: &ParseSpec, raw: &[u8]) -> crate::Result<Value> {
+/// Decode a raw byte slice per a bare `ParseSpec`, without a `Command`
+/// wrapper. Public so `diagnose_frame` can probe a captured frame by trying
+/// candidate specs at shifted offsets; `parse_response` goes through here too,
+/// so both paths decode identically. Errors are loud: a spec that does not fit
+/// the bytes returns the reason, never a partial object.
+pub fn parse_with_spec(parse: &ParseSpec, raw: &[u8]) -> crate::Result<Value> {
     let mut out = Map::new();
     if let Some(fields) = &parse.fields {
         // Scalars first, so field-driven array counts can reference them.
@@ -967,6 +972,78 @@ response:
         junk[n - 1] = b'z';
         let err = parse_response(&cmd, &junk).unwrap_err();
         assert!(err.to_string().contains("not a hex byte"), "{err}");
+    }
+
+    const CRC32_CMD: &str = r#"
+schema: openbaud/command@v0
+name: read_blob
+frame: { hex: "01 02" }
+response:
+  match: { idle_ms: 20 }
+  validate: { checksum: crc32 }
+  parse:
+    fields:
+      value: { at: 0, type: u16be }
+"#;
+
+    #[test]
+    fn validate_spec_with_new_checksum_variants() {
+        // crc32: 4-byte little-endian tail through the generic verify path.
+        let cmd = parse_command(CRC32_CMD, "c.yaml").unwrap();
+        let body = [0x08, 0x9B, 0x00];
+        let mut frame = body.to_vec();
+        frame.extend(ChecksumKind::Crc32.compute(&body));
+        let parsed = parse_response(&cmd, &frame).unwrap();
+        assert_eq!(parsed, json!({"value": 0x089B}));
+        frame[0] ^= 0xFF;
+        assert!(matches!(
+            parse_response(&cmd, &frame).unwrap_err(),
+            CoreError::ChecksumMismatch { .. }
+        ));
+
+        // crc16_ccitt: 2-byte big-endian tail, same generic path.
+        let ccitt_yaml = CRC32_CMD.replace("checksum: crc32", "checksum: crc16_ccitt");
+        assert_ne!(ccitt_yaml, CRC32_CMD);
+        let cmd = parse_command(&ccitt_yaml, "c.yaml").unwrap();
+        let mut frame = body.to_vec();
+        frame.extend(ChecksumKind::Crc16Ccitt.compute(&body));
+        let parsed = parse_response(&cmd, &frame).unwrap();
+        assert_eq!(parsed, json!({"value": 0x089B}));
+        frame[1] ^= 0x01;
+        assert!(matches!(
+            parse_response(&cmd, &frame).unwrap_err(),
+            CoreError::ChecksumMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn parse_with_spec_direct_call() {
+        // diagnose_frame builds a ParseSpec in code and probes a byte slice
+        // directly — no Command wrapper involved.
+        let spec = ParseSpec {
+            fields: Some(BTreeMap::from([(
+                "value".to_string(),
+                FieldSpec {
+                    at: 1,
+                    type_name: Some("u16be".to_string()),
+                    len: None,
+                    scale: Some(0.1),
+                    offset: None,
+                    bits: None,
+                    unit: None,
+                    count: None,
+                    stride: None,
+                    elements: None,
+                },
+            )])),
+            regex: None,
+            types: None,
+            split: None,
+        };
+        let parsed = parse_with_spec(&spec, &[0xAA, 0x08, 0x9B]).unwrap();
+        assert_eq!(parsed, json!({"value": 220.3}));
+        // A frame too short for the declared offset is loud, not silent.
+        assert!(parse_with_spec(&spec, &[0xAA]).is_err());
     }
 
     #[test]

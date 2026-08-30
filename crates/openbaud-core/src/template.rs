@@ -2,8 +2,8 @@
 //!
 //! Hex templates are whitespace-separated tokens: even-length hex literals,
 //! `{param}` references encoded by the parameter's declared type, and checksum
-//! placeholders (`{crc16_modbus}`, `{xor8}`, `{sum8}`) computed over every byte
-//! built before them.
+//! placeholders (any [`ChecksumKind`] name in braces, e.g. `{crc16_modbus}`)
+//! computed over every byte built before them.
 //!
 //! Text templates interpolate `{param}` as strings; `{{` and `}}` escape
 //! literal braces.
@@ -121,7 +121,26 @@ pub fn render_text(template: &str, values: &Map<String, Value>) -> crate::Result
                     reason: "no value provided and no default declared".to_string(),
                 })?;
                 match value {
-                    Value::String(s) => out.push_str(s),
+                    Value::String(s) => {
+                        // A control character in a *value* would fabricate
+                        // wire framing the template never declared (e.g. a
+                        // "\n" smuggling a second command line) — rejected
+                        // loudly, naming the parameter and the character.
+                        // Control characters in the template itself remain
+                        // the author's business.
+                        if let Some(c) = s.chars().find(|c| c.is_ascii_control()) {
+                            return Err(CoreError::Param {
+                                name,
+                                reason: format!(
+                                    "value contains the control character {:?} (U+{:04X}) — \
+                                     control characters cannot be interpolated into a text frame; \
+                                     declare framing bytes in the template instead",
+                                    c, c as u32
+                                ),
+                            });
+                        }
+                        out.push_str(s);
+                    }
                     Value::Number(n) => out.push_str(&n.to_string()),
                     Value::Bool(b) => out.push_str(if *b { "1" } else { "0" }),
                     other => {
@@ -180,6 +199,39 @@ mod tests {
     fn param_names_extraction() {
         let t = HexTemplate::parse("{a} 01 {b} {sum8}").unwrap();
         assert_eq!(t.param_names(), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn control_characters_in_string_params_are_rejected_loudly() {
+        // A newline in a parameter value would fabricate extra protocol lines
+        // ("MODE=ECHO\nINJECTED=1" goes on the wire as two commands).
+        for bad in ["ECHO\nINJECTED=1", "a\rb", "nul\0", "del\x7fchar", "tab\tsplit"] {
+            let err = render_text("MODE={mode}\r\n", &values(&[("mode", json!(bad))]))
+                .expect_err("control characters must be rejected");
+            let msg = err.to_string();
+            assert!(msg.contains("mode"), "error must name the parameter, got: {msg}");
+            assert!(msg.contains("control character"), "got: {msg}");
+        }
+        // The error names the offending character.
+        let err = render_text("M={m}", &values(&[("m", json!("x\ny"))])).unwrap_err();
+        assert!(err.to_string().contains("\\n"), "got: {err}");
+
+        // Normal strings pass, and a literal backslash-n (two characters) is
+        // data, not a control character.
+        assert_eq!(
+            render_text("M={m}", &values(&[("m", json!("plain ok"))])).unwrap(),
+            "M=plain ok"
+        );
+        assert_eq!(
+            render_text("M={m}", &values(&[("m", json!("back\\nslash"))])).unwrap(),
+            "M=back\\nslash"
+        );
+        // Control characters in the template itself stay allowed — they are
+        // the author's declared framing, not injected data.
+        assert_eq!(
+            render_text("AT+X={m}\r\n", &values(&[("m", json!("ok"))])).unwrap(),
+            "AT+X=ok\r\n"
+        );
     }
 
     #[test]
