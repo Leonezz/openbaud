@@ -3,6 +3,7 @@
 //! it independently. Buffer overflow is reported, never silent.
 
 use crate::engine::capture::{CaptureStats, CaptureWriter};
+use crate::engine::stream::SubscriptionSet;
 use crate::engine::transport::BoxedPort;
 use crate::engine::now_ms;
 use anyhow::{anyhow, bail, Context};
@@ -54,8 +55,11 @@ impl ChunkBuf {
         self.base_seq + self.chunks.len() as u64
     }
 
-    /// Chunks with seq >= cursor; returns (chunks, new_cursor).
-    fn since(&self, cursor: u64) -> (Vec<(u64, Vec<u8>)>, u64) {
+    /// Chunks with seq >= cursor; returns (chunks, new_cursor, skipped) where
+    /// `skipped` is how many chunks were dropped to overflow past this
+    /// cursor — data this consumer can never see. Non-zero skipped is loss
+    /// the caller must attribute, never swallow.
+    fn since(&self, cursor: u64) -> (Vec<(u64, Vec<u8>)>, u64, u64) {
         let start = cursor.max(self.base_seq);
         let out = self
             .chunks
@@ -63,7 +67,7 @@ impl ChunkBuf {
             .skip((start - self.base_seq) as usize)
             .map(|c| (c.ts_ms, c.bytes.clone()))
             .collect();
-        (out, self.next_seq())
+        (out, self.next_seq(), start - cursor)
     }
 }
 
@@ -71,6 +75,9 @@ struct Shared {
     buf: StdMutex<ChunkBuf>,
     notify: Notify,
     last_rx_ms: AtomicU64,
+    /// Lifetime rx/tx byte totals, for `session_stats`.
+    rx_bytes: AtomicU64,
+    tx_bytes: AtomicU64,
     error: StdMutex<Option<String>>,
     capture: StdMutex<Option<CaptureWriter>>,
 }
@@ -103,10 +110,24 @@ struct ReadState {
 pub struct Session {
     pub id: String,
     pub port_name: String,
+    /// The framing the read cursor deframes with (a copy of what the deframer
+    /// was built from), readable without touching the read-state lock.
+    framing: Framing,
+    /// Wall-clock ms when the session was spawned.
+    opened_ms: u64,
+    /// Transport settings the port was opened with, set by the opener once the
+    /// open succeeded. `None` until then (e.g. CLI sessions that never set it).
+    transport: StdMutex<Option<serde_json::Value>>,
     writer: Mutex<WriteHalf<BoxedPort>>,
     shared: Arc<Shared>,
     read_state: Mutex<ReadState>,
     request_lock: Mutex<()>,
+    /// Per-consumer `stream_poll` subscriptions (engine in `stream.rs`).
+    /// Deliberately disjoint from `read_state` — each subscription owns its
+    /// own cursor, deframer and retention queue, so the `read` tool and the
+    /// subscriptions can never steal frames from each other (risk ①). Living
+    /// inside the session, they are all released when it closes (risk ③).
+    pub(crate) subs: StdMutex<SubscriptionSet>,
     reader: JoinHandle<()>,
 }
 
@@ -137,6 +158,8 @@ impl Session {
             buf: StdMutex::new(ChunkBuf::default()),
             notify: Notify::new(),
             last_rx_ms: AtomicU64::new(0),
+            rx_bytes: AtomicU64::new(0),
+            tx_bytes: AtomicU64::new(0),
             error: StdMutex::new(None),
             capture: StdMutex::new(None),
         });
@@ -144,6 +167,9 @@ impl Session {
         Arc::new(Self {
             id,
             port_name,
+            framing: framing.clone(),
+            opened_ms: now_ms(),
+            transport: StdMutex::new(None),
             writer: Mutex::new(write_half),
             shared,
             read_state: Mutex::new(ReadState {
@@ -154,8 +180,106 @@ impl Session {
                 queued: Vec::new(),
             }),
             request_lock: Mutex::new(()),
+            subs: StdMutex::new(SubscriptionSet::default()),
             reader,
         })
+    }
+
+    /// The framing this session deframes with; each stream subscription
+    /// builds its own `Deframer` from it.
+    pub(crate) fn framing(&self) -> &Framing {
+        &self.framing
+    }
+
+    /// Snapshot of buffered chunks with seq >= `cursor` plus the new cursor
+    /// and how many chunks overflow already dropped past that cursor — the
+    /// non-destructive multi-cursor read every consumer (read state, request
+    /// matcher, stream subscriptions) drains through.
+    pub(crate) fn chunks_since(&self, cursor: u64) -> (Vec<(u64, Vec<u8>)>, u64, u64) {
+        self.shared.buf.lock().unwrap().since(cursor)
+    }
+
+    /// Loud check that the port behind this session is still alive; the seam
+    /// `stream_poll` uses to mirror `read_frames`' dead-port rule.
+    pub(crate) fn check_alive(&self) -> anyhow::Result<()> {
+        self.shared.check_alive()
+    }
+
+    pub(crate) fn last_rx(&self) -> u64 {
+        self.shared.last_rx_ms.load(Ordering::Relaxed)
+    }
+
+    /// The instantaneous session counters every `stream_poll` result folds in
+    /// (`stream_stats` merged into `stream_poll` per roadmap §1.0): a strict
+    /// subset of `stats()`, taken from the same short locks and atomics.
+    pub fn stream_stats(&self) -> serde_json::Value {
+        use serde_json::json;
+        let (buffered, dropped_bytes) = {
+            let buf = self.shared.buf.lock().unwrap();
+            (buf.buffered, buf.dropped_bytes)
+        };
+        let last_rx = self.shared.last_rx_ms.load(Ordering::Relaxed);
+        json!({
+            "buffered": buffered,
+            "dropped_bytes": dropped_bytes,
+            "rx_bytes": self.shared.rx_bytes.load(Ordering::Relaxed),
+            "tx_bytes": self.shared.tx_bytes.load(Ordering::Relaxed),
+            // null, not 0, when nothing was ever received — same rule as stats().
+            "last_rx_ms": if last_rx > 0 { json!(last_rx) } else { serde_json::Value::Null },
+        })
+    }
+
+    /// Record the transport settings the port was opened with (for
+    /// `session_stats`); called by the opener after a successful open.
+    pub fn set_transport(&self, transport: serde_json::Value) {
+        *self.transport.lock().unwrap() = Some(transport);
+    }
+
+    /// Live counters for `session_stats`: everything comes from short
+    /// std-mutex locks or atomics, so a stats call can never block behind a
+    /// long-running read.
+    pub fn stats(&self) -> serde_json::Value {
+        use serde_json::json;
+        let (buffered, dropped_bytes, chunks_seen) = {
+            let buf = self.shared.buf.lock().unwrap();
+            (buf.buffered, buf.dropped_bytes, buf.next_seq())
+        };
+        let last_rx = self.shared.last_rx_ms.load(Ordering::Relaxed);
+        let capture = match self.shared.capture.lock().unwrap().as_ref() {
+            Some(writer) => {
+                let (chunks, bytes) = writer.snapshot();
+                json!({
+                    "active": true,
+                    "path": writer.path().display().to_string(),
+                    "chunks": chunks,
+                    "bytes": bytes,
+                })
+            }
+            None => json!({ "active": false }),
+        };
+        let mut out = json!({
+            "session_id": self.id,
+            "port": self.port_name,
+            "framing": format!("{:?}", self.framing),
+            "opened_ms": self.opened_ms,
+            "buffered": buffered,
+            "dropped_bytes": dropped_bytes,
+            "chunks_seen": chunks_seen,
+            // null, not 0, when nothing was ever received: a zero epoch
+            // timestamp would read as a real (1970) instant.
+            "last_rx_ms": if last_rx > 0 { json!(last_rx) } else { serde_json::Value::Null },
+            "rx_bytes": self.shared.rx_bytes.load(Ordering::Relaxed),
+            "tx_bytes": self.shared.tx_bytes.load(Ordering::Relaxed),
+            "capture": capture,
+        });
+        let obj = out.as_object_mut().expect("stats is an object");
+        if let Some(e) = self.shared.error.lock().unwrap().as_ref() {
+            obj.insert("error".to_string(), json!(e));
+        }
+        if let Some(t) = self.transport.lock().unwrap().as_ref() {
+            obj.insert("transport".to_string(), t.clone());
+        }
+        out
     }
 
     pub async fn write_raw(&self, data: &[u8]) -> anyhow::Result<usize> {
@@ -166,6 +290,7 @@ impl Session {
             .await
             .with_context(|| format!("write to {} failed", self.port_name))?;
         writer.flush().await.ok();
+        self.shared.tx_bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
         self.shared.capture_record("tx", now_ms(), data)?;
         Ok(data.len())
     }
@@ -186,7 +311,10 @@ impl Session {
                     dropped += delta;
                     state.seen_dropped = buf.dropped_bytes;
                 }
-                let (chunks, new_cursor) = buf.since(state.cursor);
+                // Byte loss for this cursor is already reported through the
+                // `seen_dropped` delta above, so the skipped-chunk count is
+                // redundant here.
+                let (chunks, new_cursor, _skipped) = buf.since(state.cursor);
                 state.cursor = new_cursor;
                 drop(buf);
                 for (ts, bytes) in chunks {
@@ -250,7 +378,9 @@ impl Session {
         loop {
             {
                 let buf = self.shared.buf.lock().unwrap();
-                let (chunks, new_cursor) = buf.since(cursor);
+                // Cursor starts at next_seq, so nothing can have been dropped
+                // past it within one request.
+                let (chunks, new_cursor, _skipped) = buf.since(cursor);
                 cursor = new_cursor;
                 drop(buf);
                 for (_ts, bytes) in chunks {
@@ -325,7 +455,9 @@ impl Session {
         loop {
             {
                 let shared_buf = self.shared.buf.lock().unwrap();
-                let (chunks, new_cursor) = shared_buf.since(cursor);
+                // Cursor starts at next_seq, so nothing can have been dropped
+                // past it within one request.
+                let (chunks, new_cursor, _skipped) = shared_buf.since(cursor);
                 cursor = new_cursor;
                 drop(shared_buf);
                 for (_ts, bytes) in chunks {
@@ -441,6 +573,7 @@ async fn reader_loop(mut read_half: ReadHalf<BoxedPort>, shared: Arc<Shared>) {
             Ok(n) => {
                 let ts = now_ms();
                 shared.last_rx_ms.store(ts, Ordering::Relaxed);
+                shared.rx_bytes.fetch_add(n as u64, Ordering::Relaxed);
                 if let Err(e) = shared.capture_record("rx", ts, &buf[..n]) {
                     *shared.error.lock().unwrap() = Some(format!("capture write failed: {e}"));
                     shared.notify.notify_waiters();
@@ -483,6 +616,16 @@ impl SessionManager {
             open.sort();
             anyhow!("no session {id:?}; open sessions: [{}]", open.join(", "))
         })
+    }
+
+    /// Every live session, snapshotted under a short lock and handed out as
+    /// clones — callers inspect them lock-free. Sorted by id (numeric suffix
+    /// order: s1, s2, … s10) for stable output.
+    pub fn all(&self) -> Vec<Arc<Session>> {
+        let mut out: Vec<Arc<Session>> =
+            self.sessions.lock().unwrap().values().map(Arc::clone).collect();
+        out.sort_by(|a, b| (a.id.len(), &a.id).cmp(&(b.id.len(), &b.id)));
+        out
     }
 
     /// (port name, session id) for every live session — lets the port list say

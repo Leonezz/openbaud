@@ -74,4 +74,10 @@ impl CaptureWriter {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// (chunks, bytes) recorded so far — live stats without finishing the
+    /// capture.
+    pub fn snapshot(&self) -> (u64, u64) {
+        (self.chunks, self.bytes)
+    }
 }

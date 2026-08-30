@@ -2,7 +2,10 @@
 //! initialize / ping / tools/list / tools/call. Hand-rolled on purpose — four
 //! methods, zero protocol-SDK drift.
 
+mod capture;
+mod data;
 pub mod resources;
+mod stream;
 pub mod tools;
 
 use crate::engine::audit::Audit;
@@ -96,6 +99,7 @@ pub async fn handle(method: &str, params: Value, ctx: &Arc<Ctx>) -> Result<Value
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({ "tools": tools::list() })),
         "resources/list" => Ok(resources::list()),
+        "resources/templates/list" => Ok(resources::templates()),
         "resources/read" => {
             let uri = params
                 .get("uri")

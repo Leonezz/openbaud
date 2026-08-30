@@ -2,6 +2,7 @@ pub mod audit;
 pub mod capture;
 pub mod replay;
 pub mod session;
+pub mod stream;
 pub mod transport;
 
 use std::time::{SystemTime, UNIX_EPOCH};

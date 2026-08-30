@@ -4,7 +4,8 @@
 //! bindings and keep the text results — zero regression by construction.
 
 use crate::output::SPILL_DIR;
-use anyhow::{bail, Context};
+use crate::workspace::flat_file_name;
+use anyhow::Context;
 use serde_json::{json, Value};
 use std::path::Path;
 
@@ -59,6 +60,22 @@ pub fn list() -> Value {
     json!({ "resources": resources })
 }
 
+/// resources/templates/list payload: the one parameterized resource this
+/// server serves — saved tool results addressed by spill-file name. Field
+/// names (uriTemplate/name/description/mimeType) follow the MCP resource
+/// template spec.
+pub fn templates() -> Value {
+    json!({
+        "resourceTemplates": [{
+            "uriTemplate": format!("{RESULT_URI_PREFIX}{{name}}"),
+            "name": "Saved tool result",
+            "description": "Full JSON of a spilled tool result in .openbaud/out/, addressed by \
+                            its file name — the same payload a full_result path points at.",
+            "mimeType": "application/json",
+        }]
+    })
+}
+
 /// Read a resource. `Ok(None)` means the uri is not ours; `Err` means it is
 /// ours but unusable (missing file, or a name trying to escape the spill dir).
 pub fn read(uri: &str, workspace_root: &Path) -> anyhow::Result<Option<Value>> {
@@ -69,9 +86,7 @@ pub fn read(uri: &str, workspace_root: &Path) -> anyhow::Result<Option<Value>> {
 }
 
 fn read_result(name: &str, workspace_root: &Path) -> anyhow::Result<Value> {
-    if name.is_empty() || name.contains('/') || name.contains("..") {
-        bail!("{name:?} is not a file directly inside {SPILL_DIR}/");
-    }
+    let name = flat_file_name(name, SPILL_DIR)?;
     let path = workspace_root.join(SPILL_DIR).join(name);
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("cannot read {SPILL_DIR}/{name}"))?;

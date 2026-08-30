@@ -39,6 +39,9 @@ pub async fn execute_command(
     let mut out = Map::new();
     out.insert("device".to_string(), json!(device.name));
     out.insert("command".to_string(), json!(cmd.name));
+    // The port the bytes actually went through, `replay:` prefix included —
+    // a viewer needs it to watermark replayed results as replayed.
+    out.insert("port".to_string(), json!(session.port_name));
     out.insert("tx_hex".to_string(), json!(hex::to_hex(&tx)));
 
     let met = match &cmd.response {

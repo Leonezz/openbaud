@@ -137,7 +137,7 @@ async fn classified_short_normal_frame_wins_while_exception_undecided() {
 /// Drive mock:echo with two request/response exchanges under an active
 /// capture; returns the .obcap path.
 async fn record_echo_capture(dir: &tempfile::TempDir) -> String {
-    let port = open_port("mock:echo", &Transport::default()).await.unwrap();
+    let port = open_port("mock:echo", &Transport::default(), None).await.unwrap();
     let session = spawn_session(port);
     let path = session
         .capture_start(&dir.path().join("echo.obcap"), Some("replay test"))
@@ -156,7 +156,7 @@ async fn replay_reproduces_recorded_exchange() {
     let dir = tempfile::tempdir().unwrap();
     let path = record_echo_capture(&dir).await;
 
-    let port = open_port(&format!("replay:{path}"), &Transport::default()).await.unwrap();
+    let port = open_port(&format!("replay:{path}"), &Transport::default(), None).await.unwrap();
     let session = spawn_session(port);
     for (payload, hex) in [(&[0x01u8, 0x02][..], "01 02"), (&[0x03, 0x04][..], "03 04")] {
         session.write_raw(payload).await.unwrap();
@@ -171,7 +171,7 @@ async fn replay_rejects_diverging_tx() {
     let dir = tempfile::tempdir().unwrap();
     let path = record_echo_capture(&dir).await;
 
-    let port = open_port(&format!("replay:{path}"), &Transport::default()).await.unwrap();
+    let port = open_port(&format!("replay:{path}"), &Transport::default(), None).await.unwrap();
     let session = spawn_session(port);
     session.write_raw(&[0xFF]).await.unwrap(); // capture expects 01 02
     let err = session.read_frames(1000, 8).await.unwrap_err();
@@ -186,7 +186,7 @@ async fn replay_errors_when_capture_is_exhausted() {
     let dir = tempfile::tempdir().unwrap();
     let path = record_echo_capture(&dir).await;
 
-    let port = open_port(&format!("replay:{path}"), &Transport::default()).await.unwrap();
+    let port = open_port(&format!("replay:{path}"), &Transport::default(), None).await.unwrap();
     let session = spawn_session(port);
     for payload in [&[0x01u8, 0x02][..], &[0x03, 0x04][..]] {
         session.write_raw(payload).await.unwrap();
@@ -208,14 +208,14 @@ fn expect_open_error(result: anyhow::Result<BoxedPort>) -> anyhow::Error {
 #[tokio::test]
 async fn replay_open_fails_loudly_on_bad_files() {
     let err =
-        expect_open_error(open_port("replay:/nonexistent/no.obcap", &Transport::default()).await);
+        expect_open_error(open_port("replay:/nonexistent/no.obcap", &Transport::default(), None).await);
     assert!(err.to_string().contains("cannot open capture file"), "got: {err:#}");
 
     let dir = tempfile::tempdir().unwrap();
     let bogus = dir.path().join("not-a-capture.obcap");
     std::fs::write(&bogus, "{\"foo\": 1}\n").unwrap();
     let err = expect_open_error(
-        open_port(&format!("replay:{}", bogus.display()), &Transport::default()).await,
+        open_port(&format!("replay:{}", bogus.display()), &Transport::default(), None).await,
     );
     assert!(err.to_string().contains("obcap"), "got: {err:#}");
 }

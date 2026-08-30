@@ -33,6 +33,18 @@ fn resolve_mcp_workspace_root_from(cwd: &Path, inherited_pwd: Option<&Path>) -> 
     cwd.to_path_buf()
 }
 
+/// Validate that `name` is a bare file name — no directories, no traversal.
+/// `dir` names the directory being addressed, for the error message. Shared by
+/// every place that resolves a caller-supplied name inside a workspace
+/// directory (the spill dir in tools and resources, captures/ in the data
+/// tools), so the checks cannot drift apart.
+pub fn flat_file_name<'a>(name: &'a str, dir: &str) -> anyhow::Result<&'a str> {
+    if name.is_empty() || name.contains('/') || name.contains("..") {
+        bail!("{name:?} is not a file directly inside {dir}/");
+    }
+    Ok(name)
+}
+
 #[derive(Debug, Clone)]
 pub struct Workspace {
     pub root: PathBuf,

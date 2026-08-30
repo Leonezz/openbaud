@@ -1,6 +1,8 @@
-//! The thirteen MCP tools: schemas and dispatch. Eleven are data tools the
-//! agent drives; `ask_port` and `show_result` exist to put something in front
-//! of the user and are the only two that carry a UI template.
+//! The eighteen MCP tools: schemas and dispatch. Sixteen are data tools the
+//! agent drives (the capture/audit/session analysis ones live in `data.rs`,
+//! the per-consumer subscription tool in `stream.rs`); `ask_port` and
+//! `show_result` exist to put something in front of the user and are the only
+//! two that carry a UI template.
 
 use crate::engine::session::Session;
 use crate::engine::transport::{self, open_port, resolve_selector};
@@ -43,7 +45,7 @@ fn max_inline_bytes_schema() -> Value {
     })
 }
 
-fn arg_max_inline(args: &Value) -> anyhow::Result<usize> {
+pub(crate) fn arg_max_inline(args: &Value) -> anyhow::Result<usize> {
     Ok(arg_u64_or(args, "max_inline_bytes", output::DEFAULT_MAX_INLINE_BYTES as u64)? as usize)
 }
 
@@ -178,7 +180,7 @@ pub fn list() -> Vec<Value> {
         }),
         json!({
             "name": "capture_start",
-            "description": "Start lossless timestamped capture of all rx/tx on a session into captures/*.obcap (JSONL).",
+            "description": "Start lossless timestamped capture of all rx/tx on a session into captures/*.obcap (JSONL). Returns the workspace-relative path (captures/<file> — pass it verbatim to capture_frames, session_timeline, or replay:<path>) plus abs_path.",
             "inputSchema": { "type": "object", "required": ["session_id"], "properties": {
                 "session_id": { "type": "string" },
                 "note": { "type": "string" }
@@ -187,12 +189,57 @@ pub fn list() -> Vec<Value> {
         }),
         json!({
             "name": "capture_stop",
-            "description": "Stop the active capture on a session; returns path and stats.",
+            "description": "Stop the active capture on a session; returns stats plus the workspace-relative path (captures/<file> — directly usable with capture_frames, session_timeline, and replay:<path>) and abs_path.",
             "inputSchema": { "type": "object", "required": ["session_id"], "properties": {
                 "session_id": { "type": "string" }
             }},
             "annotations": local_mutation,
         }),
+        json!({
+            "name": "session_timeline",
+            "description": "Lay a recorded capture out as a session timeline: rx/tx byte density folded into buckets, plus the capture session's audited operations (commands, raw writes, workflow steps, denials) as events. Reads captures/<file>.obcap and .openbaud/audit.jsonl — no hardware. The result declares view:{kind:\"timeline\"}, so its full_result path (or the result itself) renders via show_result.",
+            "inputSchema": { "type": "object", "required": ["path"], "properties": {
+                "path": { "type": "string", "description": "Capture file directly under captures/, e.g. captures/cap-….obcap" },
+                "from_ms": { "type": "integer", "description": "Window start (wall-clock ms, the clock record ts_ms uses); default: everything known" },
+                "to_ms": { "type": "integer", "description": "Window end; default: the last record or event" },
+                "buckets": { "type": "integer", "default": 200, "description": "How many density buckets the window folds into (empty buckets are omitted)" },
+                "max_inline_bytes": max_inline_bytes_schema()
+            }},
+            "annotations": read_only_local,
+        }),
+        json!({
+            "name": "capture_frames",
+            "description": "Re-frame a recorded capture's byte stream: tx and rx each run through a deframer and come back as timestamped frames, paginated by cursor/max_frames. Framing comes from the explicit `framing` object or the named device's profile — one of the two is required, nothing is assumed. Idle-gap framing is driven by the recorded timestamps, so boundaries match what a live session would have produced. Reads captures/<file>.obcap — no hardware. The result declares view:{kind:\"capture\"} for show_result.",
+            "inputSchema": { "type": "object", "required": ["path"], "properties": {
+                "path": { "type": "string", "description": "Capture file directly under captures/" },
+                "device": { "type": "string", "description": "Workspace device whose profile framing to deframe with" },
+                "framing": { "type": "object", "description": "One of {delimiter}|{idle_ms}|{length_prefix:{header_len,len_at,len_size,endian,extra}}; overrides device" },
+                "from_ms": { "type": "integer", "description": "Only frames at or after this wall-clock ms" },
+                "to_ms": { "type": "integer", "description": "Only frames at or before this wall-clock ms" },
+                "cursor": { "type": "integer", "default": 0, "description": "Continue a previous page: the next_cursor it returned" },
+                "max_frames": { "type": "integer", "default": 256 },
+                "max_inline_bytes": max_inline_bytes_schema()
+            }},
+            "annotations": read_only_local,
+        }),
+        json!({
+            "name": "diagnose_frame",
+            "description": "Diagnose one raw frame, pure computation — no hardware, no audit entry. Every checksum algorithm x value encoding is verified at the default tail position (checksum_matrix); each row's `at` is the byte offset where the stored checksum starts (frame_len - stored_len; stored_len is the algorithm's byte count for raw, twice that for ascii_hex), and a row whose algorithm cannot apply to this frame carries only kind/encoding/error, no at. With expected:{device,command} the command's response.parse is also attempted at byte offsets -2..=+2 (parse_attempts) to expose off-by-N framing — `parsed: true` only means the bytes are structurally decodable at that offset; the offsets are mutually exclusive hypotheses, so judge which (if any) is the real alignment yourself. The result declares view:{kind:\"diagnostics\"} for show_result.",
+            "inputSchema": { "type": "object", "required": ["hex"], "properties": {
+                "hex": { "type": "string", "description": "The frame bytes, e.g. \"01 04 02 08 9B FA 8D\"" },
+                "expected": { "type": "object", "description": "{device, command}: the workspace command whose response.parse the frame was expected to satisfy" }
+            }},
+            "annotations": read_only_local,
+        }),
+        json!({
+            "name": "session_stats",
+            "description": "Live counters for open sessions: port, framing, opened_ms, buffered/dropped bytes, chunks seen, rx/tx byte totals, last_rx_ms, the transport settings the port was opened with, the active capture (path and live counters), and the session error when the port died. Pass session_id for one session; default is all.",
+            "inputSchema": { "type": "object", "properties": {
+                "session_id": { "type": "string" }
+            }},
+            "annotations": read_only_hardware,
+        }),
+        super::stream::spec(),
         // The only two tools that carry a UI. Template binding is per-tool and
         // unconditional, so a bound data tool would pop a card on every call the
         // agent makes for its own reasoning — showing and asking must be
@@ -245,10 +292,7 @@ fn spill_file_name(path: &str) -> anyhow::Result<&str> {
         .strip_prefix(output::SPILL_DIR)
         .and_then(|r| r.strip_prefix('/'))
         .ok_or_else(|| anyhow!("path must be a full_result under {}/", output::SPILL_DIR))?;
-    if rest.is_empty() || rest.contains('/') || rest.contains("..") {
-        bail!("{path:?} is not a file directly inside {}/", output::SPILL_DIR);
-    }
-    Ok(rest)
+    crate::workspace::flat_file_name(rest, output::SPILL_DIR)
 }
 
 pub async fn call(name: &str, args: Value, ctx: &Arc<Ctx>) -> anyhow::Result<Value> {
@@ -311,17 +355,13 @@ pub async fn call(name: &str, args: Value, ctx: &Arc<Ctx>) -> anyhow::Result<Val
         "request" => tool_request(args, ctx).await,
         "run_command" => tool_run_command(args, ctx).await,
         "run_workflow" => tool_run_workflow(args, ctx).await,
-        "capture_start" => {
-            let session = ctx.sessions.get(arg_str(&args, "session_id")?)?;
-            let note = args.get("note").and_then(Value::as_str);
-            let path = ctx.workspace.capture_path(&session.id);
-            let path = session.capture_start(&path, note)?;
-            Ok(json!({ "path": path }))
-        }
-        "capture_stop" => {
-            let session = ctx.sessions.get(arg_str(&args, "session_id")?)?;
-            Ok(serde_json::to_value(session.capture_stop()?)?)
-        }
+        "capture_start" => super::capture::capture_start(&args, ctx),
+        "capture_stop" => super::capture::capture_stop(&args, ctx),
+        "session_timeline" => super::data::session_timeline(&args, ctx),
+        "capture_frames" => super::data::capture_frames(&args, ctx),
+        "diagnose_frame" => super::data::diagnose_frame(&args, ctx),
+        "session_stats" => super::data::session_stats(&args, ctx),
+        "stream_poll" => super::stream::stream_poll(&args, ctx),
         "schema" => tool_schema(&args),
         other => bail!("unknown tool {other:?}"),
     }
@@ -374,8 +414,10 @@ async fn tool_open(args: Value, ctx: &Arc<Ctx>) -> anyhow::Result<Value> {
     }
     let framing = resolve_framing(args.get("framing"), device.as_ref().map(|d| &d.profile))?;
 
-    let boxed = open_port(port, &cfg).await?;
+    let boxed = open_port(port, &cfg, Some(&framing)).await?;
     let session = ctx.sessions.open(port, framing.clone(), boxed);
+    // Remembered for session_stats: what the port was actually opened with.
+    session.set_transport(serde_json::to_value(&cfg)?);
     Ok(json!({
         "session_id": session.id,
         "port": port,
@@ -514,7 +556,7 @@ async fn resolve_session(
                 &ctx.workspace.root,
             )?;
             let framing = resolve_framing(None, Some(&device.profile))?;
-            let boxed = open_port(&port, &device.profile.transport).await?;
+            let boxed = open_port(&port, &device.profile.transport, Some(&framing)).await?;
             Ok((ctx.sessions.open(&port, framing, boxed), true))
         }
     }
@@ -734,13 +776,13 @@ async fn tool_run_workflow(args: Value, ctx: &Arc<Ctx>) -> anyhow::Result<Value>
     Ok(result)
 }
 
-fn arg_str<'a>(args: &'a Value, key: &str) -> anyhow::Result<&'a str> {
+pub(crate) fn arg_str<'a>(args: &'a Value, key: &str) -> anyhow::Result<&'a str> {
     args.get(key)
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("missing required string argument {key:?}"))
 }
 
-fn arg_u64_or(args: &Value, key: &str, default: u64) -> anyhow::Result<u64> {
+pub(crate) fn arg_u64_or(args: &Value, key: &str, default: u64) -> anyhow::Result<u64> {
     match args.get(key) {
         None | Some(Value::Null) => Ok(default),
         Some(v) => v.as_u64().ok_or_else(|| anyhow!("argument {key:?} must be a non-negative integer")),

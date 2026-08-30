@@ -21,6 +21,26 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream
 /// framing depends on while compressing long real-world waits.
 const MAX_GAP: Duration = Duration::from_millis(100);
 
+/// Margin added on top of the session's idle-framing threshold when a
+/// recorded gap that threshold would split on gets compressed: replayed at
+/// exactly `idle_ms`, the 10 ms read poll makes the frame boundary a race.
+const IDLE_MARGIN: Duration = Duration::from_millis(50);
+
+/// The sleep for one recorded inter-record gap. Long gaps compress to
+/// `MAX_GAP`, but a gap the session's idle framing splits on (an original
+/// gap of at least `idle_ms`) must stay at least `idle_ms + IDLE_MARGIN`
+/// after compression, so the replayed boundary is as deterministic as the
+/// recorded one. Without idle framing the plain compression stands.
+fn replay_gap(original_ms: u64, idle_ms: Option<u64>) -> Duration {
+    let compressed = Duration::from_millis(original_ms).min(MAX_GAP);
+    match idle_ms {
+        Some(idle) if original_ms >= idle => {
+            compressed.max(Duration::from_millis(idle) + IDLE_MARGIN)
+        }
+        _ => compressed,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Dir {
     Tx,
@@ -36,15 +56,18 @@ struct Record {
     bytes: Vec<u8>,
 }
 
-/// Open a `.obcap` capture file as a replayable port.
-pub fn open_replay(path: &Path) -> anyhow::Result<BoxedPort> {
+/// Open a `.obcap` capture file as a replayable port. `idle_ms` is the
+/// session's idle-framing threshold when it has one: recorded gaps at or
+/// above it keep a clear margin above it after compression (see
+/// [`replay_gap`]).
+pub fn open_replay(path: &Path, idle_ms: Option<u64>) -> anyhow::Result<BoxedPort> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("cannot open capture file {path:?} for replay"))?;
     let records = parse_obcap(&content, path)?;
 
     let (client, server) = tokio::io::duplex(64 * 1024);
     let error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    tokio::spawn(replay_task(server, records, Arc::clone(&error)));
+    tokio::spawn(replay_task(server, records, idle_ms, Arc::clone(&error)));
     Ok(Box::new(ReplayTransport { inner: client, error }))
 }
 
@@ -150,6 +173,7 @@ impl AsyncWrite for ReplayTransport {
 async fn replay_task(
     server: DuplexStream,
     records: Vec<Record>,
+    idle_ms: Option<u64>,
     error: Arc<Mutex<Option<String>>>,
 ) {
     let (mut read, mut write) = tokio::io::split(server);
@@ -157,7 +181,7 @@ async fn replay_task(
 
     let mut idx = 0usize;
     // rx records before any tx play as soon as the port opens.
-    if play_rx_run(&mut write, &records, &mut idx).await.is_err() {
+    if play_rx_run(&mut write, &records, &mut idx, idle_ms).await.is_err() {
         return; // engine side gone
     }
 
@@ -196,7 +220,7 @@ async fn replay_task(
             if tx_off == rec.bytes.len() {
                 idx += 1;
                 tx_off = 0;
-                if play_rx_run(&mut write, &records, &mut idx).await.is_err() {
+                if play_rx_run(&mut write, &records, &mut idx, idle_ms).await.is_err() {
                     return;
                 }
             }
@@ -205,12 +229,13 @@ async fn replay_task(
 }
 
 /// Play the run of consecutive rx records at the cursor, sleeping
-/// min(original gap, `MAX_GAP`) between adjacent records. Leaves the cursor
-/// on the next non-rx record (or the end).
+/// [`replay_gap`] between adjacent records. Leaves the cursor on the next
+/// non-rx record (or the end).
 async fn play_rx_run(
     write: &mut tokio::io::WriteHalf<DuplexStream>,
     records: &[Record],
     idx: &mut usize,
+    idle_ms: Option<u64>,
 ) -> std::io::Result<()> {
     while let Some(rec) = records.get(*idx) {
         if rec.dir != Dir::Rx {
@@ -221,10 +246,40 @@ async fn play_rx_run(
         *idx += 1;
         if let Some(next) = records.get(*idx) {
             if next.dir == Dir::Rx {
-                let gap = Duration::from_millis(next.ts_ms.saturating_sub(rec.ts_ms));
-                tokio::time::sleep(gap.min(MAX_GAP)).await;
+                let gap = next.ts_ms.saturating_sub(rec.ts_ms);
+                tokio::time::sleep(replay_gap(gap, idle_ms)).await;
             }
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{replay_gap, IDLE_MARGIN, MAX_GAP};
+    use std::time::Duration;
+
+    #[test]
+    fn replay_gap_keeps_idle_boundaries_above_the_threshold() {
+        // Without idle framing: plain compression to MAX_GAP.
+        assert_eq!(replay_gap(30, None), Duration::from_millis(30));
+        assert_eq!(replay_gap(5000, None), MAX_GAP);
+
+        // A gap the idle framing splits on never compresses to the threshold
+        // itself — it keeps the margin, even when compression lands exactly
+        // on idle_ms.
+        let idle = 100u64;
+        for original in [100, 150, 5000] {
+            assert_eq!(
+                replay_gap(original, Some(idle)),
+                Duration::from_millis(idle) + IDLE_MARGIN,
+                "original gap {original} ms"
+            );
+        }
+        // A gap below the threshold never split live and is not inflated.
+        assert_eq!(replay_gap(40, Some(idle)), Duration::from_millis(40));
+        // A small idle threshold leaves sub-cap gaps that already clear the
+        // margin untouched.
+        assert_eq!(replay_gap(90, Some(20)), Duration::from_millis(90));
+    }
 }

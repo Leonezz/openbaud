@@ -70,7 +70,7 @@ async fn open_session(
         Some(spec) => spec.to_framing(&format!("devices/{}/profile.yaml", device.name))?,
         None => Framing::Idle { idle_ms: 30 },
     };
-    let boxed = open_port(&port, &device.profile.transport).await?;
+    let boxed = open_port(&port, &device.profile.transport, Some(&framing)).await?;
     Ok(Session::spawn("cli".to_string(), port, framing, boxed))
 }
 

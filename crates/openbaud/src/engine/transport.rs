@@ -30,9 +30,20 @@ fn is_busy_error(err: &tokio_serial::Error) -> bool {
     desc.contains("busy") || desc.contains("os error 16")
 }
 
-pub async fn open_port(name: &str, cfg: &TransportCfg) -> anyhow::Result<BoxedPort> {
+/// Open a port. `framing` is the framing the session will deframe with — a
+/// replay port uses its idle threshold to keep replayed idle-gap boundaries
+/// deterministic; real ports and mocks ignore it.
+pub async fn open_port(
+    name: &str,
+    cfg: &TransportCfg,
+    framing: Option<&openbaud_core::framing::Framing>,
+) -> anyhow::Result<BoxedPort> {
     if let Some(path) = name.strip_prefix(REPLAY_PREFIX) {
-        return crate::engine::replay::open_replay(std::path::Path::new(path));
+        let idle_ms = match framing {
+            Some(openbaud_core::framing::Framing::Idle { idle_ms }) => Some(*idle_ms),
+            _ => None,
+        };
+        return crate::engine::replay::open_replay(std::path::Path::new(path), idle_ms);
     }
     if name == MOCK_ECHO {
         let (client, server) = tokio::io::duplex(64 * 1024);

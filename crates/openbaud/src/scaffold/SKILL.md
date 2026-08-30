@@ -28,7 +28,9 @@ next session (or the next person) starts where you finished.
    frame structure, checksum algorithm, baud rate. Record page references.
 3. **Hypothesize → verify in small steps**: `open` the port, use `request`
    with an explicit `match` rule. Start a capture (`capture_start`) before
-   longer experiments so evidence is preserved.
+   longer experiments so evidence is preserved. `capture_start`/`capture_stop`
+   return the capture's workspace-relative `path` (`captures/<file>`) — pass
+   it verbatim to `capture_frames`, `session_timeline`, or `replay:<path>`.
 4. **Record as you go** in `devices/<name>/notes.md`: what you sent, what came
    back, what it means, what surprised you.
 5. **Sediment**: once a behavior is confirmed, write it as a command YAML (see
@@ -128,6 +130,62 @@ them when the user is the audience — not as a habit.
 On hosts without rendering both degrade to plain text — a candidate list you
 relay yourself, a pointer you can read from disk. Nothing breaks; the user just
 reads instead of looks.
+
+## Reading back what happened: the data tools
+
+Five read-only tools analyze what is already on disk or in memory. They never
+touch the wire and are yours to call freely:
+
+- `session_timeline` reads a capture (`path: captures/….obcap`) plus the audit
+  log and lays the capture's session out as a timeline: rx/tx byte density
+  folded into buckets, and the audited operations (commands, raw writes,
+  workflow steps, denials) as events. Window with `from_ms`/`to_ms`. It needs
+  a capture file — there is no live-session mode.
+- `capture_frames` re-frames a capture's byte stream — an explicit `framing`
+  object or a `device` whose profile declares one; one of the two is required,
+  nothing is assumed — into timestamped tx/rx frames, paginated with
+  `cursor`/`max_frames`. Idle-gap framing is driven by the recorded
+  timestamps, so the boundaries match what a live session would have produced.
+- `diagnose_frame` takes one frame as `hex` and verifies every checksum
+  algorithm x encoding at the tail (`checksum_matrix`; each row's `at` is the
+  byte offset where the stored checksum starts, and a row whose algorithm
+  cannot fit the frame carries only the error, no position); with
+  `expected: {device, command}` it also attempts that command's declared parse
+  at byte offsets -2..=+2 (`parse_attempts`) to expose off-by-N framing.
+  `parsed: true` only means the bytes decode structurally at that offset —
+  the offsets are mutually exclusive hypotheses, so judge which one is the
+  real alignment yourself. Pure computation.
+- `session_stats` reports live counters for open sessions: buffered/dropped
+  bytes, rx/tx totals, transport settings, and the active capture.
+- `stream_poll` gives you a private incremental cursor over a live session's
+  frames, fully independent of `read` — the two never steal frames from each
+  other. First call with `session_id` creates a subscription and returns its
+  `subscription_id`; later calls with that id return the frames received
+  since, each carrying a monotonic `seq`. Pass `since_seq` to acknowledge
+  delivery (frames with `seq < since_seq` are released) — ack with the last
+  delivered frame's `seq + 1`, not `next_seq`, which can run ahead of a
+  capped page; acking frames never delivered is a loud error. Each page is
+  capped by `max_frames` and by `max_inline_bytes` (default 4096, bounds
+  512..=262144), a budget metered as each frame's rendered hex length + text
+  length — pages hold whole frames only, in `seq` order, and `page_bytes`
+  reports the page's actual total. A first frame alone beyond the budget is
+  still delivered — alone, with `oversized_frame: true` — so delivery always
+  makes progress even through idle-merged megabyte frames.
+  Omit `since_seq` and the unacknowledged frames come back unchanged, so a
+  lost response costs nothing. A consumer that lags loses the oldest retained
+  frames, counted in `dropped_frames`; session-buffer overflow past the
+  subscription's cursor is counted in `dropped_chunks` — never silently. A
+  poll with nothing left to deliver on a dead port errors loudly instead of
+  looking healthy. `close: true` releases the subscription; ones idle beyond
+  120 s are swept by a later `stream_poll` call against the session (there is
+  no background sweeper), at most 8 exist per session, and every result folds
+  in the session's live counters as `stats`. It never waits — poll again when
+  you expect more.
+
+`session_timeline`, `capture_frames` and `diagnose_frame` results carry their
+own `view` declaration (`timeline`, `capture`, `diagnostics`) — hand the
+result, or its `full_result` path, to `show_result` and it renders; no extra
+`encoding` needed.
 
 ## Workflows (openbaud/workflow@v0)
 

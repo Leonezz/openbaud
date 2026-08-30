@@ -3,18 +3,22 @@
 
 use openbaud::engine::audit::Audit;
 use openbaud::engine::session::{Session, SessionManager};
+use openbaud::engine::stream::{
+    DEFAULT_POLL_INLINE_BYTES, MAX_POLL_INLINE_BYTES, MAX_RETAINED_FRAMES,
+    MAX_SUBSCRIPTIONS_PER_SESSION, SUBSCRIPTION_IDLE_TTL_MS,
+};
 use openbaud::engine::transport::{open_port, BoxedPort};
 use openbaud::mcp::{tools, Ctx};
 use openbaud::workspace::Workspace;
 use openbaud_core::exec::{build_frame, parse_response};
 use openbaud_core::format::{parse_command, Transport};
-use openbaud_core::framing::{Framing, MatchRule};
+use openbaud_core::framing::{Deframer, Framing, MatchRule};
 use serde_json::{json, Map, Value};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 async fn echo_port() -> BoxedPort {
-    open_port("mock:echo", &Transport::default()).await.expect("mock:echo always opens")
+    open_port("mock:echo", &Transport::default(), None).await.expect("mock:echo always opens")
 }
 
 /// A port that answers one exact request with a canned reply, then stays
@@ -160,6 +164,8 @@ async fn tool_run_command_ephemeral_over_echo() {
     // Echo returns the frame verbatim: AB 42 ED, so y = 0x42 = 66.
     assert_eq!(result["parsed"]["y"], json!(66));
     assert_eq!(result["tx_hex"], json!("AB 42 ED"));
+    // The result names the port it actually used (viewer replay watermark).
+    assert_eq!(result["port"], json!("mock:echo"));
 
     let audit = std::fs::read_to_string(dir.path().join(".openbaud/audit.jsonl")).unwrap();
     assert!(audit.contains("\"run_command\""));
@@ -248,10 +254,71 @@ async fn tool_capture_records_both_directions() {
     assert!(stats["chunks"].as_u64().unwrap() >= 2, "tx + rx chunk records expected");
     assert!(stats.get("frames").is_none(), "stats field is named chunks, not frames");
 
-    let content = std::fs::read_to_string(started["path"].as_str().unwrap()).unwrap();
+    // Both results carry the workspace-relative path (directly composable with
+    // the data tools) plus the absolute one.
+    for result in [&started, &stats] {
+        let rel = result["path"].as_str().unwrap();
+        assert!(rel.starts_with("captures/"), "workspace-relative path expected, got: {rel}");
+        let abs = result["abs_path"].as_str().unwrap();
+        assert!(std::path::Path::new(abs).is_absolute(), "got: {abs}");
+    }
+    assert_eq!(started["path"], stats["path"]);
+
+    let content = std::fs::read_to_string(started["abs_path"].as_str().unwrap()).unwrap();
     assert!(content.contains("\"tx\""));
     assert!(content.contains("\"rx\""));
     assert!(content.lines().next().unwrap().contains("\"obcap\":1"));
+}
+
+#[tokio::test]
+async fn capture_paths_compose_with_the_data_tools() {
+    let dir = scaffold_workspace();
+    let ctx = ctx_for(&dir);
+
+    let opened = tools::call("open", json!({ "port": "mock:echo" }), &ctx).await.unwrap();
+    let sid = opened["session_id"].as_str().unwrap().to_string();
+    let started = tools::call("capture_start", json!({ "session_id": sid }), &ctx).await.unwrap();
+    tools::call("send", json!({ "session_id": sid, "hex": "01 02" }), &ctx).await.unwrap();
+    tools::call("read", json!({ "session_id": sid, "timeout_ms": 1000 }), &ctx).await.unwrap();
+    let stopped = tools::call("capture_stop", json!({ "session_id": sid }), &ctx).await.unwrap();
+
+    // The returned relative path feeds capture_frames and session_timeline verbatim.
+    for path in [started["path"].as_str().unwrap(), stopped["path"].as_str().unwrap()] {
+        let frames = tools::call(
+            "capture_frames",
+            json!({ "path": path, "framing": { "idle_ms": 30 } }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(frames["total_in_window"].as_u64().unwrap() >= 1, "got: {frames}");
+        let timeline =
+            tools::call("session_timeline", json!({ "path": path }), &ctx).await.unwrap();
+        assert_eq!(timeline["view"]["kind"], json!("timeline"));
+    }
+
+    // The absolute path is accepted too — it canonicalizes into captures/.
+    let abs = started["abs_path"].as_str().unwrap();
+    let frames = tools::call(
+        "capture_frames",
+        json!({ "path": abs, "framing": { "idle_ms": 30 } }),
+        &ctx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(frames["source"]["path"], started["path"], "absolute input normalizes to relative");
+
+    // An absolute path outside captures/ is still refused loudly.
+    let outside = dir.path().join("outside.obcap");
+    std::fs::write(&outside, "{\"obcap\":1}\n").unwrap();
+    let err = tools::call(
+        "session_timeline",
+        json!({ "path": outside.display().to_string() }),
+        &ctx,
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("captures"), "got: {err:#}");
 }
 
 #[tokio::test]
@@ -259,7 +326,7 @@ async fn open_port_missing_device_fails_fast_without_retry() {
     // The busy-retry loop must only engage for busy-class errors; a missing
     // device errors immediately, with no retry note in the message.
     let started = std::time::Instant::now();
-    let err = match open_port("/dev/tty.openbaud-test-does-not-exist", &Transport::default()).await
+    let err = match open_port("/dev/tty.openbaud-test-does-not-exist", &Transport::default(), None).await
     {
         Ok(_) => panic!("opening a nonexistent port must fail"),
         Err(e) => e,
@@ -332,7 +399,7 @@ async fn broken_command_file_does_not_block_device() {
 #[tokio::test]
 async fn tool_list_includes_mock_and_schemas() {
     let listed = tools::list();
-    assert_eq!(listed.len(), 13);
+    assert_eq!(listed.len(), 18);
     for tool in &listed {
         let annotations = tool["annotations"].as_object().unwrap_or_else(|| {
             panic!("tool {} is missing MCP behavior annotations", tool["name"])
@@ -349,11 +416,36 @@ async fn tool_list_includes_mock_and_schemas() {
         let tool = listed.iter().find(|tool| tool["name"] == name).unwrap();
         assert_eq!(tool["annotations"]["destructiveHint"], json!(true), "tool {name}");
     }
-    for name in ["list_ports", "read", "schema"] {
+    for name in [
+        "list_ports",
+        "read",
+        "schema",
+        "session_timeline",
+        "capture_frames",
+        "diagnose_frame",
+        "session_stats",
+        "stream_poll",
+    ] {
         let tool = listed.iter().find(|tool| tool["name"] == name).unwrap();
         assert_eq!(tool["annotations"]["readOnlyHint"], json!(true), "tool {name}");
     }
-    for name in ["list_ports", "open", "close", "read", "send", "request", "run_command", "run_workflow"] {
+    // The capture/audit analysis tools are local: they never touch hardware.
+    for name in ["session_timeline", "capture_frames", "diagnose_frame"] {
+        let tool = listed.iter().find(|tool| tool["name"] == name).unwrap();
+        assert_eq!(tool["annotations"]["openWorldHint"], json!(false), "tool {name}");
+    }
+    for name in [
+        "list_ports",
+        "open",
+        "close",
+        "read",
+        "send",
+        "request",
+        "run_command",
+        "run_workflow",
+        "session_stats",
+        "stream_poll",
+    ] {
         let tool = listed.iter().find(|tool| tool["name"] == name).unwrap();
         assert_eq!(tool["annotations"]["openWorldHint"], json!(true), "tool {name}");
     }
@@ -605,15 +697,15 @@ async fn replay_relative_path_resolves_against_workspace() {
     tools::call("capture_stop", json!({ "session_id": sid }), &ctx).await.unwrap();
     tools::call("close", json!({ "session_id": sid }), &ctx).await.unwrap();
 
-    // Replay via a workspace-relative capture path.
-    let abs = std::path::PathBuf::from(started["path"].as_str().unwrap());
-    let rel = abs.strip_prefix(dir.path()).expect("capture lives inside the workspace");
+    // Replay via the workspace-relative capture path capture_start returned.
+    let rel = started["path"].as_str().unwrap();
+    assert!(rel.starts_with("captures/"), "got: {rel}");
     let replayed = tools::call(
         "run_command",
         json!({
             "device": "echodev",
             "command": "ping",
-            "port": format!("replay:{}", rel.display()),
+            "port": format!("replay:{rel}"),
         }),
         &ctx,
     )
@@ -623,6 +715,81 @@ async fn replay_relative_path_resolves_against_workspace() {
     assert_eq!(replayed["expect_met"], json!(true));
     assert_eq!(replayed["parsed"]["y"], json!(66));
     assert_eq!(replayed["parsed"], live["parsed"], "replay must reproduce the live result");
+    // The port field discloses the replay transport so a viewer can watermark it.
+    let replay_port = replayed["port"].as_str().unwrap();
+    assert!(replay_port.starts_with("replay:"), "got: {replay_port}");
+    assert_eq!(live["port"], json!("mock:echo"));
+}
+
+#[tokio::test]
+async fn replay_keeps_idle_framed_boundaries_deterministic() {
+    // Recorded gaps of 200 ms with idle_ms: 100 framing: the offline deframe
+    // yields three rx frames. Replay compresses long gaps, but a gap the
+    // session's idle framing splits on must stay clearly above the threshold —
+    // compressing it to exactly idle_ms makes live framing nondeterministic
+    // under the 10 ms poll.
+    let dir = scaffold_workspace();
+    let captures = dir.path().join("captures");
+    std::fs::create_dir_all(&captures).unwrap();
+    std::fs::write(
+        captures.join("gap.obcap"),
+        concat!(
+            r#"{"obcap":1,"session":"sg","port":"mock:echo","note":null,"started_ms":1000}"#,
+            "\n",
+            r#"{"ts_ms":1000,"dir":"tx","hex":"AA"}"#,
+            "\n",
+            r#"{"ts_ms":1010,"dir":"rx","hex":"01"}"#,
+            "\n",
+            r#"{"ts_ms":1210,"dir":"rx","hex":"02"}"#,
+            "\n",
+            r#"{"ts_ms":1410,"dir":"rx","hex":"03"}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+    let ctx = ctx_for(&dir);
+
+    let offline = tools::call(
+        "capture_frames",
+        json!({ "path": "captures/gap.obcap", "framing": { "idle_ms": 100 } }),
+        &ctx,
+    )
+    .await
+    .unwrap();
+    let offline_rx: Vec<&str> = offline["frames"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["dir"] == json!("rx"))
+        .map(|f| f["hex"].as_str().unwrap())
+        .collect();
+    assert_eq!(offline_rx, vec!["01", "02", "03"], "got: {offline}");
+
+    let opened = tools::call(
+        "open",
+        json!({ "port": "replay:captures/gap.obcap", "framing": { "idle_ms": 100 } }),
+        &ctx,
+    )
+    .await
+    .unwrap();
+    let sid = opened["session_id"].as_str().unwrap().to_string();
+    tools::call("send", json!({ "session_id": sid, "hex": "AA" }), &ctx).await.unwrap();
+
+    let mut live: Vec<String> = Vec::new();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(2500);
+    while live.len() < offline_rx.len() && tokio::time::Instant::now() < deadline {
+        let read = tools::call("read", json!({ "session_id": sid, "timeout_ms": 200 }), &ctx)
+            .await
+            .unwrap();
+        for f in read["frames"].as_array().unwrap() {
+            live.push(f["hex"].as_str().unwrap().to_string());
+        }
+    }
+    assert_eq!(
+        live, offline_rx,
+        "a live replay read must reproduce the offline frame boundaries"
+    );
+    tools::call("close", json!({ "session_id": sid }), &ctx).await.unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -835,6 +1002,20 @@ async fn rpc_resources_list_serves_ui_templates() {
 }
 
 #[tokio::test]
+async fn rpc_resources_templates_list_declares_the_result_template() {
+    let dir = scaffold_workspace();
+    let ctx = ctx_for(&dir);
+
+    let result = openbaud::mcp::handle("resources/templates/list", json!({}), &ctx).await.unwrap();
+    let templates = result["resourceTemplates"].as_array().expect("resourceTemplates array");
+    assert_eq!(templates.len(), 1, "got: {templates:?}");
+    let t = &templates[0];
+    assert_eq!(t["uriTemplate"], json!("openbaud://result/{name}"));
+    assert_eq!(t["mimeType"], json!("application/json"));
+    assert!(t["name"].is_string() && t["description"].is_string(), "got: {t}");
+}
+
+#[tokio::test]
 async fn rpc_resources_read_returns_embedded_html() {
     let dir = scaffold_workspace();
     let ctx = ctx_for(&dir);
@@ -939,7 +1120,9 @@ async fn ui_binds_only_to_show_and_ask_tools() {
     // Data tools the agent calls routinely must never drag a UI along:
     // template binding is per-tool and unconditional, so a bound data tool
     // would pop a card on every internal call.
-    for data_tool in ["list_ports", "open", "read", "request", "run_command", "run_workflow"] {
+    for data_tool in
+        ["list_ports", "open", "read", "request", "run_command", "run_workflow", "stream_poll"]
+    {
         assert!(
             !bound.iter().any(|(n, _)| n == data_tool),
             "data tool {data_tool} must not bind a UI template"
@@ -1061,4 +1244,1174 @@ async fn result_resource_rejects_paths_outside_the_spill_dir() {
             .expect_err("traversal must be refused");
         assert_eq!(err.code, -32002, "uri {bad} got: {}", err.message);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Data tools: session_timeline, capture_frames, diagnose_frame, session_stats
+// ---------------------------------------------------------------------------
+
+fn write_obcap(dir: &std::path::Path, name: &str, lines: &[&str]) {
+    let captures = dir.join("captures");
+    std::fs::create_dir_all(&captures).unwrap();
+    std::fs::write(captures.join(name), lines.join("\n") + "\n").unwrap();
+}
+
+#[tokio::test]
+async fn session_timeline_folds_capture_and_audit_into_buckets_and_events() {
+    let dir = scaffold_workspace();
+    write_obcap(
+        dir.path(),
+        "t.obcap",
+        &[
+            r#"{"obcap":1,"session":"s7","port":"mock:echo","note":null,"started_ms":1000}"#,
+            r#"{"ts_ms":1000,"dir":"tx","hex":"01 02"}"#,
+            r#"{"ts_ms":1050,"dir":"rx","hex":"AA BB CC"}"#,
+            r#"{"ts_ms":1900,"dir":"rx","hex":"DD"}"#,
+        ],
+    );
+    std::fs::create_dir_all(dir.path().join(".openbaud")).unwrap();
+    std::fs::write(
+        dir.path().join(".openbaud/audit.jsonl"),
+        concat!(
+            r#"{"tool":"send","session":"s7","port":"mock:echo","tx_hex":"01 02","ok":true,"ts_ms":1005}"#,
+            "\n",
+            r#"{"tool":"run_command","device":"echodev","command":"ping","risk":"read","session":"s7","port":"mock:echo","outcome":"normal","ok":true,"ts_ms":1500}"#,
+            "\n",
+            r#"{"tool":"send","session":"OTHER","ok":true,"ts_ms":1600}"#,
+            "\n",
+            r#"{"tool":"run_workflow.step","device":"d","workflow":"w","phase":"step","session":"s7","port":"mock:echo","command":"c","ok":false,"detail":"boom","ts_ms":1800}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+    let ctx = ctx_for(&dir);
+
+    let result = tools::call(
+        "session_timeline",
+        json!({ "path": "captures/t.obcap", "buckets": 9 }),
+        &ctx,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result["view"]["kind"], json!("timeline"));
+    assert_eq!(result["port"], json!("mock:echo"));
+    assert_eq!(result["source"]["path"], json!("captures/t.obcap"));
+    assert_eq!(result["span"], json!({ "from_ms": 1000, "to_ms": 1900 }));
+    assert_eq!(result["bucket_ms"], json!(100));
+    assert_eq!(
+        result["density"],
+        json!([
+            { "t0": 1000, "tx_bytes": 2, "rx_bytes": 3 },
+            { "t0": 1900, "tx_bytes": 0, "rx_bytes": 1 },
+        ])
+    );
+    let kinds: Vec<&str> = result["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, vec!["write", "cmd", "workflow_step"], "other sessions are filtered out");
+    assert_eq!(result["events"][1]["command"], json!("ping"));
+    assert_eq!(result["events"][1]["outcome"], json!("normal"));
+    assert_eq!(result["events"][2]["ok"], json!(false));
+    assert_eq!(result["events"][2]["detail"], json!("boom"));
+
+    // Explicit window narrows both density and events.
+    let windowed = tools::call(
+        "session_timeline",
+        json!({ "path": "captures/t.obcap", "from_ms": 1400, "to_ms": 1600 }),
+        &ctx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(windowed["density"], json!([]));
+    let kinds: Vec<&str> = windowed["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, vec!["cmd"]);
+}
+
+#[tokio::test]
+async fn session_timeline_span_is_never_derived_from_audit_events() {
+    // Session ids restart at s1 every process, so the audit log accumulates
+    // same-named events from other days. The natural span must come from the
+    // capture alone; audit events are clipped to it, never allowed to widen it.
+    let dir = scaffold_workspace();
+    write_obcap(
+        dir.path(),
+        "t.obcap",
+        &[
+            r#"{"obcap":1,"session":"s6","port":"mock:echo","note":null,"started_ms":1000}"#,
+            r#"{"ts_ms":1100,"dir":"tx","hex":"01"}"#,
+            r#"{"ts_ms":1900,"dir":"rx","hex":"AA"}"#,
+        ],
+    );
+    let three_days = 3 * 24 * 3600 * 1000u64;
+    // Same session id, days after this capture — a different process's s6.
+    let stale_future = format!(
+        r#"{{"tool":"send","session":"s6","port":"mock:echo","ok":true,"ts_ms":{}}}"#,
+        1000 + three_days
+    );
+    std::fs::create_dir_all(dir.path().join(".openbaud")).unwrap();
+    std::fs::write(
+        dir.path().join(".openbaud/audit.jsonl"),
+        format!(
+            "{}\n{}\n{stale_future}\n",
+            // Same session id, recorded before this capture's epoch.
+            r#"{"tool":"send","session":"s6","port":"mock:echo","ok":true,"ts_ms":500}"#,
+            r#"{"tool":"send","session":"s6","port":"mock:echo","ok":true,"ts_ms":1200}"#,
+        ),
+    )
+    .unwrap();
+    let ctx = ctx_for(&dir);
+
+    let result =
+        tools::call("session_timeline", json!({ "path": "captures/t.obcap" }), &ctx).await.unwrap();
+    assert_eq!(
+        result["span"],
+        json!({ "from_ms": 1000, "to_ms": 1900 }),
+        "span must be the capture's own range, not stretched by stale audit epochs"
+    );
+    assert!(result["bucket_ms"].as_u64().unwrap() <= 5, "900 ms over 200 buckets");
+    // Only the in-span event survives; the stale epochs are clipped out.
+    let events = result["events"].as_array().unwrap();
+    assert_eq!(events.len(), 1, "got: {events:?}");
+    assert_eq!(events[0]["ts_ms"], json!(1200));
+
+    // An explicit window still overrides the capture-derived span.
+    let windowed = tools::call(
+        "session_timeline",
+        json!({ "path": "captures/t.obcap", "from_ms": 400, "to_ms": 600 }),
+        &ctx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(windowed["span"], json!({ "from_ms": 400, "to_ms": 600 }));
+    assert_eq!(windowed["events"].as_array().unwrap().len(), 1);
+    assert_eq!(windowed["events"][0]["ts_ms"], json!(500));
+}
+
+#[tokio::test]
+async fn session_timeline_rejects_session_ids_and_bad_paths() {
+    let dir = scaffold_workspace();
+    let ctx = ctx_for(&dir);
+
+    // v1 deliberately has no live-session mode; the refusal is loud.
+    let err = tools::call("session_timeline", json!({ "session_id": "s1" }), &ctx)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("record a capture first"), "got: {err:#}");
+
+    for bad in [
+        "captures/../../etc/passwd",
+        "captures/sub/x.obcap",
+        ".openbaud/out/res.json",
+        "/etc/passwd",
+    ] {
+        let err = tools::call("session_timeline", json!({ "path": bad }), &ctx)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("captures"), "path {bad} got: {err:#}");
+    }
+
+    // A file that is not an obcap capture is refused by its header, not guessed at.
+    write_obcap(dir.path(), "bogus.obcap", &[r#"{"nope":true}"#]);
+    let err = tools::call("session_timeline", json!({ "path": "captures/bogus.obcap" }), &ctx)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("obcap"), "got: {err:#}");
+}
+
+#[tokio::test]
+async fn capture_frames_reframes_idle_gaps_and_paginates() {
+    let dir = scaffold_workspace();
+    write_obcap(
+        dir.path(),
+        "f.obcap",
+        &[
+            r#"{"obcap":1,"session":"s1","port":"/dev/x","note":null,"started_ms":900}"#,
+            r#"{"ts_ms":1000,"dir":"rx","hex":"01 02"}"#,
+            r#"{"ts_ms":1005,"dir":"rx","hex":"03"}"#,
+            r#"{"ts_ms":1100,"dir":"rx","hex":"AA BB"}"#,
+            r#"{"ts_ms":1150,"dir":"tx","hex":"FF"}"#,
+            r#"{"ts_ms":1200,"dir":"rx","hex":"CC"}"#,
+        ],
+    );
+    let ctx = ctx_for(&dir);
+
+    let page1 = tools::call(
+        "capture_frames",
+        json!({ "path": "captures/f.obcap", "framing": { "idle_ms": 30 }, "max_frames": 2 }),
+        &ctx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(page1["view"]["kind"], json!("capture"));
+    assert_eq!(page1["header"], json!({ "port": "/dev/x", "started_ms": 900 }));
+    assert_eq!(page1["source"]["path"], json!("captures/f.obcap"));
+    assert_eq!(page1["total_in_window"], json!(4));
+    assert_eq!(page1["next_cursor"], json!(2));
+    assert_eq!(
+        page1["frames"],
+        json!([
+            { "seq": 0, "ts_ms": 1000, "dir": "rx", "hex": "01 02 03", "len": 3 },
+            { "seq": 1, "ts_ms": 1100, "dir": "rx", "hex": "AA BB", "len": 2 },
+        ])
+    );
+
+    let page2 = tools::call(
+        "capture_frames",
+        json!({
+            "path": "captures/f.obcap",
+            "framing": { "idle_ms": 30 },
+            "max_frames": 2,
+            "cursor": 2,
+        }),
+        &ctx,
+    )
+    .await
+    .unwrap();
+    assert!(page2.get("next_cursor").is_none(), "last page carries no cursor: {page2}");
+    assert_eq!(
+        page2["frames"],
+        json!([
+            { "seq": 2, "ts_ms": 1150, "dir": "tx", "hex": "FF", "len": 1 },
+            { "seq": 3, "ts_ms": 1200, "dir": "rx", "hex": "CC", "len": 1 },
+        ])
+    );
+
+    // The rx boundaries must equal a hand-driven Deframer replay of the same
+    // records under the same gap rule.
+    let mut deframer = Deframer::new(Framing::Idle { idle_ms: 30 });
+    let mut manual: Vec<String> = Vec::new();
+    let mut last: Option<u64> = None;
+    let rx_records: [(u64, Vec<u8>); 4] = [
+        (1000, vec![0x01, 0x02]),
+        (1005, vec![0x03]),
+        (1100, vec![0xAA, 0xBB]),
+        (1200, vec![0xCC]),
+    ];
+    for (ts, bytes) in rx_records {
+        if let Some(prev) = last {
+            if ts - prev >= 30 {
+                if let Some(f) = deframer.flush_pending() {
+                    manual.push(openbaud_core::hex::to_hex(&f));
+                }
+            }
+        }
+        for f in deframer.push(&bytes) {
+            manual.push(openbaud_core::hex::to_hex(&f));
+        }
+        last = Some(ts);
+    }
+    if let Some(f) = deframer.flush_pending() {
+        manual.push(openbaud_core::hex::to_hex(&f));
+    }
+    let tool_rx: Vec<String> = [&page1, &page2]
+        .iter()
+        .flat_map(|p| p["frames"].as_array().unwrap().clone())
+        .filter(|f| f["dir"] == json!("rx"))
+        .map(|f| f["hex"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(tool_rx, manual, "tool framing must match a direct Deframer replay");
+
+    // Window filter counts only in-window frames.
+    let windowed = tools::call(
+        "capture_frames",
+        json!({
+            "path": "captures/f.obcap",
+            "framing": { "idle_ms": 30 },
+            "from_ms": 1100,
+            "to_ms": 1150,
+        }),
+        &ctx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(windowed["total_in_window"], json!(2));
+}
+
+#[tokio::test]
+async fn capture_frames_requires_a_framing_and_a_known_device() {
+    let dir = scaffold_workspace();
+    write_obcap(
+        dir.path(),
+        "f.obcap",
+        &[
+            r#"{"obcap":1,"session":"s1","port":"p","note":null,"started_ms":1}"#,
+            r#"{"ts_ms":2,"dir":"rx","hex":"41 0A"}"#,
+        ],
+    );
+    let ctx = ctx_for(&dir);
+
+    // Neither framing nor device: loud, never a silent default.
+    let err = tools::call("capture_frames", json!({ "path": "captures/f.obcap" }), &ctx)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("framing"), "got: {err:#}");
+
+    // Unknown device is the workspace's loud lookup error.
+    let err = tools::call(
+        "capture_frames",
+        json!({ "path": "captures/f.obcap", "device": "nope" }),
+        &ctx,
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("no device"), "got: {err:#}");
+
+    // An explicit delimiter framing frames without any idle logic.
+    let framed = tools::call(
+        "capture_frames",
+        json!({ "path": "captures/f.obcap", "framing": { "delimiter": "\n" } }),
+        &ctx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        framed["frames"],
+        json!([{ "seq": 0, "ts_ms": 2, "dir": "rx", "hex": "41", "len": 1 }])
+    );
+    assert_eq!(framed["total_in_window"], json!(1));
+}
+
+#[tokio::test]
+async fn diagnose_frame_checksum_matrix_reports_hits_and_misses() {
+    let dir = scaffold_workspace();
+    let ctx = ctx_for(&dir);
+
+    // "123456789" + its CRC-16/MODBUS tail (little-endian 37 4B).
+    let mut frame = b"123456789".to_vec();
+    frame.extend(openbaud_core::checksum::ChecksumKind::Crc16Modbus.compute(b"123456789"));
+    let result = tools::call(
+        "diagnose_frame",
+        json!({ "hex": openbaud_core::hex::to_hex(&frame) }),
+        &ctx,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result["view"]["kind"], json!("diagnostics"));
+    assert_eq!(result["frame_len"], json!(11));
+    assert_eq!(result["hex"], json!(openbaud_core::hex::to_hex(&frame)));
+    let matrix = result["checksum_matrix"].as_array().unwrap();
+    assert_eq!(matrix.len(), 14, "7 algorithms x 2 encodings");
+
+    let row = |kind: &str, encoding: &str| -> &Value {
+        matrix
+            .iter()
+            .find(|r| r["kind"] == json!(kind) && r["encoding"] == json!(encoding))
+            .unwrap()
+    };
+    let hit = row("crc16_modbus", "raw");
+    assert_eq!(hit["ok"], json!(true));
+    assert_eq!(hit["computed"], json!("37 4B"));
+    // `at` is the byte offset where the stored checksum starts:
+    // frame_len - stored_len (11 - 2 raw crc16 bytes).
+    assert_eq!(hit["at"], json!(9));
+
+    let miss = row("xor8", "raw");
+    assert_eq!(miss["ok"], json!(false));
+    assert_eq!(miss["at"], json!(10), "1 raw xor8 byte at the tail of 11");
+    assert!(miss["expected"].is_string() && miss["actual"].is_string(), "got: {miss}");
+
+    // ascii_hex doubles the stored length: on "AB12" (4 ASCII bytes) a 1-byte
+    // xor8 stored as 2 hex characters starts at byte 2.
+    let ascii_result = tools::call("diagnose_frame", json!({ "hex": "41 42 31 32" }), &ctx)
+        .await
+        .unwrap();
+    let ascii = ascii_result["checksum_matrix"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["kind"] == json!("xor8") && r["encoding"] == json!("ascii_hex"))
+        .unwrap();
+    assert_eq!(ascii["at"], json!(2), "got: {ascii}");
+    assert_eq!(ascii["ok"], json!(false), "xor8(\"AB\") is 03, stored says 12: {ascii}");
+
+    // Invalid hex is a loud caller error, not an empty matrix.
+    let err = tools::call("diagnose_frame", json!({ "hex": "ZZ" }), &ctx).await.unwrap_err();
+    assert!(err.to_string().contains("hex"), "got: {err:#}");
+}
+
+#[tokio::test]
+async fn diagnose_frame_omits_at_when_the_algorithm_cannot_fit() {
+    let dir = scaffold_workspace();
+    let ctx = ctx_for(&dir);
+
+    // A 1-byte frame cannot carry a crc32 (4 raw bytes): the row explains why
+    // and carries no fabricated position.
+    let result = tools::call("diagnose_frame", json!({ "hex": "01" }), &ctx).await.unwrap();
+    let matrix = result["checksum_matrix"].as_array().unwrap();
+    let row = |kind: &str, encoding: &str| -> &Value {
+        matrix
+            .iter()
+            .find(|r| r["kind"] == json!(kind) && r["encoding"] == json!(encoding))
+            .unwrap()
+    };
+    for (kind, encoding) in [("crc32", "raw"), ("crc16_modbus", "raw"), ("crc32", "ascii_hex")] {
+        let r = row(kind, encoding);
+        assert!(r["error"].is_string(), "got: {r}");
+        assert!(r.get("at").is_none(), "an inapplicable row carries no at: {r}");
+        assert!(r.get("ok").is_none(), "an inapplicable row carries no verdict: {r}");
+    }
+}
+
+#[tokio::test]
+async fn diagnose_frame_probes_expected_command_parse_at_offsets() {
+    let dir = scaffold_workspace();
+    let ctx = ctx_for(&dir);
+
+    // echodev/ping parses { y: { at: 1, type: u8 } }; "AB 42 ED" fits at offset 0.
+    let result = tools::call(
+        "diagnose_frame",
+        json!({ "hex": "AB 42 ED", "expected": { "device": "echodev", "command": "ping" } }),
+        &ctx,
+    )
+    .await
+    .unwrap();
+
+    let attempts = result["parse_attempts"].as_array().unwrap();
+    assert_eq!(attempts.len(), 5, "offsets -2..=+2");
+    let at = |off: i64| -> &Value {
+        attempts.iter().find(|a| a["offset"] == json!(off)).unwrap()
+    };
+    // The verdict field is named `parsed`: structurally decodable at that
+    // offset, deliberately not `ok` — the offsets are mutually exclusive
+    // hypotheses, so a parsed row is not "the right answer".
+    assert_eq!(at(0)["parsed"], json!(true));
+    assert!(at(0).get("ok").is_none(), "the verdict field is parsed, not ok: {}", at(0));
+    assert_eq!(at(0)["fields"]["y"], json!(0x42));
+    assert_eq!(at(-2)["parsed"], json!(false), "field would sit before byte 0: {}", at(-2));
+    assert_eq!(at(2)["parsed"], json!(false), "field would sit past the frame: {}", at(2));
+    assert!(at(2)["error"].is_string());
+
+    // Unknown device / command are the workspace's loud lookup errors.
+    let err = tools::call(
+        "diagnose_frame",
+        json!({ "hex": "AB", "expected": { "device": "ghost", "command": "ping" } }),
+        &ctx,
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("no device"), "got: {err:#}");
+}
+
+#[tokio::test]
+async fn session_stats_reports_live_counters_and_capture_state() {
+    let dir = scaffold_workspace();
+    let ctx = ctx_for(&dir);
+
+    let opened = tools::call("open", json!({ "port": "mock:echo", "baud": 9600 }), &ctx)
+        .await
+        .unwrap();
+    let sid = opened["session_id"].as_str().unwrap().to_string();
+    tools::call("send", json!({ "session_id": sid, "hex": "01 02 03" }), &ctx).await.unwrap();
+    tools::call("read", json!({ "session_id": sid, "timeout_ms": 1000 }), &ctx).await.unwrap();
+
+    let stats = tools::call("session_stats", json!({}), &ctx).await.unwrap();
+    let sessions = stats["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 1);
+    let s = &sessions[0];
+    assert_eq!(s["session_id"], json!(sid));
+    assert_eq!(s["port"], json!("mock:echo"));
+    assert_eq!(s["tx_bytes"], json!(3));
+    assert_eq!(s["rx_bytes"], json!(3), "echo returns every byte");
+    assert!(s["opened_ms"].as_u64().unwrap() > 0);
+    assert!(s["framing"].as_str().unwrap().contains("Idle"), "got: {s}");
+    assert_eq!(s["transport"]["baud"], json!(9600));
+    assert_eq!(s["dropped_bytes"], json!(0));
+    assert!(s["chunks_seen"].as_u64().unwrap() >= 1);
+    assert!(s["last_rx_ms"].as_u64().unwrap() > 0);
+    assert_eq!(s["capture"], json!({ "active": false }));
+
+    // With a capture running the entry names the file and its live counters.
+    let started = tools::call("capture_start", json!({ "session_id": sid }), &ctx).await.unwrap();
+    tools::call("send", json!({ "session_id": sid, "hex": "AA" }), &ctx).await.unwrap();
+    let stats = tools::call("session_stats", json!({ "session_id": sid }), &ctx).await.unwrap();
+    let s = &stats["sessions"][0];
+    assert_eq!(s["capture"]["active"], json!(true));
+    assert_eq!(s["capture"]["path"], started["abs_path"]);
+    assert!(s["capture"]["chunks"].as_u64().unwrap() >= 1);
+    assert_eq!(s["tx_bytes"], json!(4));
+
+    // Unknown ids and closed sessions are loud / absent, not guessed.
+    let err = tools::call("session_stats", json!({ "session_id": "zzz" }), &ctx).await.unwrap_err();
+    assert!(err.to_string().contains("no session"), "got: {err:#}");
+    tools::call("close", json!({ "session_id": sid }), &ctx).await.unwrap();
+    let stats = tools::call("session_stats", json!({}), &ctx).await.unwrap();
+    assert_eq!(stats["sessions"], json!([]));
+}
+
+// ---------------------------------------------------------------------------
+// stream_poll: per-consumer frame subscriptions (R-07)
+// ---------------------------------------------------------------------------
+
+async fn open_echo_lines(ctx: &Arc<Ctx>) -> String {
+    let opened = tools::call(
+        "open",
+        json!({ "port": "mock:echo", "framing": { "delimiter": "\n" } }),
+        ctx,
+    )
+    .await
+    .unwrap();
+    opened["session_id"].as_str().unwrap().to_string()
+}
+
+/// stream_poll never waits, so tests poll (without acking) until the echo has
+/// been deframed up to `want` frames — loudly failing after a deadline.
+async fn poll_until_next_seq(ctx: &Arc<Ctx>, sub_id: &str, want: u64, max_frames: u64) -> Value {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let result = tools::call(
+            "stream_poll",
+            json!({ "subscription_id": sub_id, "max_frames": max_frames }),
+            ctx,
+        )
+        .await
+        .unwrap();
+        if result["next_seq"].as_u64().unwrap() >= want {
+            return result;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "subscription {sub_id} never reached seq {want}: {result}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+fn frame_texts(result: &Value) -> Vec<&str> {
+    result["frames"].as_array().unwrap().iter().map(|f| f["text"].as_str().unwrap()).collect()
+}
+
+fn frame_seqs(result: &Value) -> Vec<u64> {
+    result["frames"].as_array().unwrap().iter().map(|f| f["seq"].as_u64().unwrap()).collect()
+}
+
+#[tokio::test]
+async fn stream_poll_subscribes_and_pulls_echo_frames_via_rpc() {
+    let dir = scaffold_workspace();
+    let ctx = ctx_for(&dir);
+    let sid = open_echo_lines(&ctx).await;
+    tools::call("send", json!({ "session_id": sid, "text": "a\nb\n" }), &ctx).await.unwrap();
+
+    // Creation goes through the full JSON-RPC layer, like an MCP host would.
+    let created = openbaud::mcp::handle(
+        "tools/call",
+        json!({ "name": "stream_poll", "arguments": { "session_id": sid } }),
+        &ctx,
+    )
+    .await
+    .unwrap();
+    assert!(created.get("isError").is_none(), "got: {created}");
+    let structured = &created["structuredContent"];
+    let sub_id = structured["subscription_id"].as_str().expect("subscription_id").to_string();
+    assert_eq!(structured["session_id"], json!(sid));
+
+    let result = poll_until_next_seq(&ctx, &sub_id, 2, 64).await;
+    assert_eq!(frame_texts(&result), vec!["a", "b"]);
+    assert_eq!(frame_seqs(&result), vec![0, 1], "seq starts at 0 and is monotonic");
+    assert_eq!(result["next_seq"], json!(2));
+    assert_eq!(result["dropped_frames"], json!(0));
+    // Every result folds in the session's live counters.
+    let stats = &result["stats"];
+    assert!(stats["rx_bytes"].as_u64().unwrap() >= 4, "got: {stats}");
+    assert!(stats["tx_bytes"].as_u64().unwrap() >= 4, "got: {stats}");
+    assert!(stats["last_rx_ms"].as_u64().unwrap() > 0, "got: {stats}");
+    assert!(stats["buffered"].is_number() && stats["dropped_bytes"].is_number(), "got: {stats}");
+    // ts_ms/hex/text carry the same shape read frames do.
+    assert_eq!(result["frames"][0]["hex"], json!("61"));
+    assert!(result["frames"][0]["ts_ms"].as_u64().unwrap() > 0);
+}
+
+#[tokio::test]
+async fn stream_subscriptions_and_read_do_not_steal_frames() {
+    let dir = scaffold_workspace();
+    let ctx = ctx_for(&dir);
+    let sid = open_echo_lines(&ctx).await;
+    tools::call("send", json!({ "session_id": sid, "text": "x\ny\n" }), &ctx).await.unwrap();
+
+    let a = tools::call("stream_poll", json!({ "session_id": sid }), &ctx).await.unwrap();
+    let b = tools::call("stream_poll", json!({ "session_id": sid }), &ctx).await.unwrap();
+    let a = a["subscription_id"].as_str().unwrap().to_string();
+    let b = b["subscription_id"].as_str().unwrap().to_string();
+    assert_ne!(a, b);
+
+    // Risk ①: both subscriptions and the shared read cursor each see every
+    // frame — nobody steals from anybody.
+    let ra = poll_until_next_seq(&ctx, &a, 2, 64).await;
+    let rb = poll_until_next_seq(&ctx, &b, 2, 64).await;
+    assert_eq!(frame_texts(&ra), vec!["x", "y"]);
+    assert_eq!(frame_texts(&rb), vec!["x", "y"]);
+    assert_eq!(frame_seqs(&ra), vec![0, 1]);
+    assert_eq!(frame_seqs(&rb), vec![0, 1]);
+
+    let read = tools::call("read", json!({ "session_id": sid, "timeout_ms": 1000 }), &ctx)
+        .await
+        .unwrap();
+    let read_texts: Vec<&str> =
+        read["frames"].as_array().unwrap().iter().map(|f| f["text"].as_str().unwrap()).collect();
+    assert_eq!(read_texts, vec!["x", "y"], "read gets its own copy of every frame");
+
+    // And the read did not consume the subscriptions' unacked frames.
+    let again = tools::call("stream_poll", json!({ "subscription_id": a }), &ctx).await.unwrap();
+    assert_eq!(frame_texts(&again), vec!["x", "y"]);
+}
+
+#[tokio::test]
+async fn stream_poll_ack_releases_and_redelivers() {
+    let dir = scaffold_workspace();
+    let ctx = ctx_for(&dir);
+    let sid = open_echo_lines(&ctx).await;
+    tools::call("send", json!({ "session_id": sid, "text": "a\nb\n" }), &ctx).await.unwrap();
+    let created = tools::call("stream_poll", json!({ "session_id": sid }), &ctx).await.unwrap();
+    let sub = created["subscription_id"].as_str().unwrap().to_string();
+
+    let first = poll_until_next_seq(&ctx, &sub, 2, 64).await;
+    // No since_seq: idempotent re-read — the same unacked frames come back.
+    let second = tools::call("stream_poll", json!({ "subscription_id": sub }), &ctx).await.unwrap();
+    assert_eq!(second["frames"], first["frames"], "unacked frames are redelivered unchanged");
+
+    // since_seq releases everything below it.
+    let acked = tools::call(
+        "stream_poll",
+        json!({ "subscription_id": sub, "since_seq": 1 }),
+        &ctx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(frame_seqs(&acked), vec![1]);
+    assert_eq!(acked["next_seq"], json!(2));
+
+    let done = tools::call(
+        "stream_poll",
+        json!({ "subscription_id": sub, "since_seq": 2 }),
+        &ctx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(done["frames"], json!([]));
+    assert_eq!(done["next_seq"], json!(2));
+
+    // Acking frames that were never delivered is a loud caller error.
+    let err = tools::call(
+        "stream_poll",
+        json!({ "subscription_id": sub, "since_seq": 99 }),
+        &ctx,
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("never delivered"), "got: {err:#}");
+}
+
+#[tokio::test]
+async fn stream_poll_overflow_drops_oldest_and_counts() {
+    let dir = scaffold_workspace();
+    let ctx = ctx_for(&dir);
+    let sid = open_echo_lines(&ctx).await;
+    let created = tools::call("stream_poll", json!({ "session_id": sid }), &ctx).await.unwrap();
+    let sub = created["subscription_id"].as_str().unwrap().to_string();
+
+    // More frames than one subscription retains: the oldest are dropped and
+    // counted (risk ②), never silently.
+    let total = (MAX_RETAINED_FRAMES + 76) as u64;
+    let payload: String = (0..total).map(|i| format!("{i}\n")).collect();
+    tools::call("send", json!({ "session_id": sid, "text": payload }), &ctx).await.unwrap();
+
+    let result = poll_until_next_seq(&ctx, &sub, total, 256).await;
+    assert_eq!(result["dropped_frames"], json!(76));
+    assert_eq!(result["next_seq"], json!(total));
+    assert_eq!(result["frames"].as_array().unwrap().len(), 256, "max_frames caps the page");
+    assert_eq!(result["frames"][0]["seq"], json!(76), "oldest retained frame comes first");
+    assert_eq!(result["frames"][0]["text"], json!("76"));
+
+    // since_seq pointing into the dropped range releases nothing and delivery
+    // starts from the oldest retained frame — the drop is never papered over.
+    let replay = tools::call(
+        "stream_poll",
+        json!({ "subscription_id": sub, "since_seq": 10 }),
+        &ctx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(replay["frames"][0]["seq"], json!(76));
+    assert_eq!(replay["dropped_frames"], json!(76));
+}
+
+#[tokio::test]
+async fn stream_poll_over_ack_beyond_delivered_page_is_loud() {
+    let dir = scaffold_workspace();
+    let ctx = ctx_for(&dir);
+    let sid = open_echo_lines(&ctx).await;
+    let created = tools::call("stream_poll", json!({ "session_id": sid }), &ctx).await.unwrap();
+    let sub = created["subscription_id"].as_str().unwrap().to_string();
+    tools::call("send", json!({ "session_id": sid, "text": "a\nb\nc\nd\ne\n" }), &ctx)
+        .await
+        .unwrap();
+
+    // A max_frames-capped page: all 5 frames drained (next_seq = 5), but only
+    // seqs 0 and 1 were ever delivered.
+    let page = poll_until_next_seq(&ctx, &sub, 5, 2).await;
+    assert_eq!(frame_seqs(&page), vec![0, 1]);
+    assert_eq!(page["next_seq"], json!(5));
+
+    // Acking with next_seq would silently destroy seqs 2..4, which the
+    // consumer never saw — that must be a loud error, not a release.
+    let err = tools::call(
+        "stream_poll",
+        json!({ "subscription_id": sub, "since_seq": 5 }),
+        &ctx,
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("never delivered"), "got: {err:#}");
+
+    // The correct ack — last delivered seq + 1 — releases only the page, and
+    // the undelivered frames are still there.
+    let rest = tools::call(
+        "stream_poll",
+        json!({ "subscription_id": sub, "since_seq": 2, "max_frames": 64 }),
+        &ctx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(frame_seqs(&rest), vec![2, 3, 4], "undelivered frames must survive the ack");
+    assert_eq!(frame_texts(&rest), vec!["c", "d", "e"]);
+}
+
+#[tokio::test]
+async fn stream_poll_surfaces_dead_port_once_drained() {
+    // A port that delivers two lines and then dies (EOF).
+    let (client, server) = tokio::io::duplex(4096);
+    let session = Session::spawn(
+        "dead1".into(),
+        "mock:dying".into(),
+        Framing::Delimiter { delimiter: vec![b'\n'] },
+        Box::new(client),
+    );
+    let (_sread, mut swrite) = tokio::io::split(server);
+    swrite.write_all(b"hello\nworld\n").await.unwrap();
+    drop(swrite);
+    drop(_sread);
+
+    // Wait until the reader has seen the EOF and recorded the port error.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while session.stats().get("error").is_none() {
+        assert!(tokio::time::Instant::now() < deadline, "port error never surfaced");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    // Buffered frames are still delivered after death — same rule as read.
+    let now = openbaud::engine::now_ms();
+    let sub = session.stream_subscribe(now).unwrap();
+    let result = session.stream_pull(&sub, None, 64, DEFAULT_POLL_INLINE_BYTES, now).unwrap();
+    let texts: Vec<&str> = result["frames"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(texts, vec!["hello", "world"]);
+
+    // Once nothing retained is left to deliver, a poll on the dead port is a
+    // loud error, never an endless stream of healthy-looking empty results.
+    let err = session.stream_pull(&sub, Some(2), 64, DEFAULT_POLL_INLINE_BYTES, now).unwrap_err();
+    assert!(err.to_string().contains("port failed"), "got: {err:#}");
+}
+
+#[tokio::test]
+async fn stream_poll_counts_buffer_overflow_gap_per_subscription() {
+    // Flood the session's shared byte buffer (1 MiB cap) past an unpolled
+    // subscription's cursor: the loss must be attributed to the subscription
+    // as dropped_chunks — dropped_frames == 0 alone must never mean "no loss".
+    let (client, server) = tokio::io::duplex(256 * 1024);
+    let session = Session::spawn(
+        "ovf1".into(),
+        "mock:flood".into(),
+        Framing::Delimiter { delimiter: vec![b'\n'] },
+        Box::new(client),
+    );
+    let now = openbaud::engine::now_ms();
+    let sub = session.stream_subscribe(now).unwrap();
+
+    // ~1.13 MiB of 64-byte lines, never polled while they arrive.
+    let line = {
+        let mut l = vec![b'x'; 63];
+        l.push(b'\n');
+        l
+    };
+    let (_sread, mut swrite) = tokio::io::split(server);
+    for _ in 0..(1024 * 1024 / 64 + 2048) {
+        swrite.write_all(&line).await.unwrap();
+    }
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while session.stream_stats()["dropped_bytes"].as_u64().unwrap() == 0 {
+        assert!(tokio::time::Instant::now() < deadline, "byte overflow never happened");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    // 256 63-byte frames render past the default budget, so give this page
+    // the maximum inline budget — the assertion below is about max_frames.
+    let result = session
+        .stream_pull(&sub, None, 256, MAX_POLL_INLINE_BYTES, openbaud::engine::now_ms())
+        .unwrap();
+    assert!(
+        result["dropped_chunks"].as_u64().unwrap() > 0,
+        "chunk-buffer overflow past the cursor must be counted per subscription: {result}"
+    );
+    assert!(
+        result["stats"]["dropped_bytes"].as_u64().unwrap() > 0,
+        "session stats must also carry the byte loss: {result}"
+    );
+    // The post-gap bytes overran the retention queue too — also counted.
+    assert!(result["dropped_frames"].as_u64().unwrap() > 0, "got: {result}");
+    assert_eq!(result["frames"].as_array().unwrap().len(), 256);
+}
+
+#[tokio::test]
+async fn stream_poll_close_and_session_close_invalidate_ids() {
+    let dir = scaffold_workspace();
+    let ctx = ctx_for(&dir);
+    let sid = open_echo_lines(&ctx).await;
+
+    let created = tools::call("stream_poll", json!({ "session_id": sid }), &ctx).await.unwrap();
+    let sub = created["subscription_id"].as_str().unwrap().to_string();
+    let closed = tools::call(
+        "stream_poll",
+        json!({ "subscription_id": sub, "close": true }),
+        &ctx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(closed["closed"], json!(true));
+    assert_eq!(closed["subscription_id"], json!(sub));
+    assert!(closed.get("frames").is_none(), "a close result returns no frames: {closed}");
+    assert!(
+        closed["stats"]["rx_bytes"].is_u64(),
+        "every result, close included, folds in the session stats: {closed}"
+    );
+
+    let err = tools::call("stream_poll", json!({ "subscription_id": sub }), &ctx)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("no stream subscription"), "got: {err:#}");
+
+    // Closing the session releases every subscription with it (risk ③).
+    let created = tools::call("stream_poll", json!({ "session_id": sid }), &ctx).await.unwrap();
+    let sub = created["subscription_id"].as_str().unwrap().to_string();
+    tools::call("close", json!({ "session_id": sid }), &ctx).await.unwrap();
+    let err = tools::call("stream_poll", json!({ "subscription_id": sub }), &ctx)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("no stream subscription"), "got: {err:#}");
+}
+
+#[tokio::test]
+async fn stream_poll_subscription_cap_is_loud() {
+    let dir = scaffold_workspace();
+    let ctx = ctx_for(&dir);
+    let sid = open_echo_lines(&ctx).await;
+
+    for i in 0..MAX_SUBSCRIPTIONS_PER_SESSION {
+        tools::call("stream_poll", json!({ "session_id": sid }), &ctx)
+            .await
+            .unwrap_or_else(|e| panic!("subscription {i} should fit under the cap: {e:#}"));
+    }
+    let err = tools::call("stream_poll", json!({ "session_id": sid }), &ctx).await.unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains(&MAX_SUBSCRIPTIONS_PER_SESSION.to_string()) && msg.contains("close"),
+        "got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn stream_subscription_ttl_sweeps_idle_subscribers() {
+    let dir = scaffold_workspace();
+    let ctx = ctx_for(&dir);
+    let sid = open_echo_lines(&ctx).await;
+    let session = ctx.sessions.get(&sid).unwrap();
+    let now = openbaud::engine::now_ms();
+
+    // Any later stream call on the session sweeps subscriptions idle past the
+    // TTL — driven here with a fabricated clock instead of a 120 s sleep.
+    let stale = session.stream_subscribe(now).unwrap();
+    let fresh = session.stream_subscribe(now + SUBSCRIPTION_IDLE_TTL_MS + 1).unwrap();
+    assert!(!session.has_stream_subscription(&stale), "stale subscription must be swept");
+    assert!(session.has_stream_subscription(&fresh));
+    let err = tools::call("stream_poll", json!({ "subscription_id": stale }), &ctx)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("no stream subscription"), "got: {err:#}");
+
+    // Pulling a subscription that itself sat idle past the TTL expires it loudly.
+    let err = session
+        .stream_pull(
+            &fresh,
+            None,
+            64,
+            DEFAULT_POLL_INLINE_BYTES,
+            now + 2 * (SUBSCRIPTION_IDLE_TTL_MS + 1),
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("expired"), "got: {err:#}");
+    assert!(!session.has_stream_subscription(&fresh));
+
+    // The explicit sweep seam reports what it removed.
+    let third = session.stream_subscribe(now).unwrap();
+    let swept = session.sweep_stream_subscriptions_at(now + SUBSCRIPTION_IDLE_TTL_MS + 1);
+    assert_eq!(swept, vec![third]);
+}
+
+#[tokio::test]
+async fn stream_poll_parameter_errors_are_loud() {
+    let dir = scaffold_workspace();
+    let ctx = ctx_for(&dir);
+    let sid = open_echo_lines(&ctx).await;
+    let sid2 = open_echo_lines(&ctx).await;
+
+    // Neither id: nothing to create and nothing to poll.
+    let err = tools::call("stream_poll", json!({}), &ctx).await.unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("session_id") && msg.contains("subscription_id"), "got: {msg}");
+
+    let err = tools::call("stream_poll", json!({ "session_id": "zzz" }), &ctx).await.unwrap_err();
+    assert!(err.to_string().contains("no session"), "got: {err:#}");
+    let err = tools::call("stream_poll", json!({ "subscription_id": "zzz" }), &ctx)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("no stream subscription"), "got: {err:#}");
+
+    // A fresh subscription on an untouched session: nothing received yet, so
+    // last_rx_ms is null (never 0), and the retention is empty.
+    let created = tools::call("stream_poll", json!({ "session_id": sid }), &ctx).await.unwrap();
+    assert!(created["stats"]["last_rx_ms"].is_null(), "got: {created}");
+    assert_eq!(created["frames"], json!([]));
+    let sub = created["subscription_id"].as_str().unwrap().to_string();
+
+    // since_seq / close only make sense against an existing subscription.
+    let err = tools::call("stream_poll", json!({ "session_id": sid, "since_seq": 0 }), &ctx)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("since_seq"), "got: {err:#}");
+    let err = tools::call("stream_poll", json!({ "session_id": sid, "close": true }), &ctx)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("close"), "got: {err:#}");
+
+    // max_frames beyond the cap, and a session/subscription mismatch.
+    let err = tools::call(
+        "stream_poll",
+        json!({ "subscription_id": sub, "max_frames": 300 }),
+        &ctx,
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("256"), "got: {err:#}");
+    let err = tools::call(
+        "stream_poll",
+        json!({ "subscription_id": sub, "max_frames": 0 }),
+        &ctx,
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("1..=256"), "got: {err:#}");
+    // Out-of-range u64 is rejected as the value sent, never truncated first.
+    let err = tools::call(
+        "stream_poll",
+        json!({ "subscription_id": sub, "max_frames": 4_294_967_301u64 }),
+        &ctx,
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("4294967301"), "got: {err:#}");
+    // Ack and close contradict each other: closing releases everything anyway.
+    let err = tools::call(
+        "stream_poll",
+        json!({ "subscription_id": sub, "close": true, "since_seq": 0 }),
+        &ctx,
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("since_seq"), "got: {err:#}");
+    let err = tools::call(
+        "stream_poll",
+        json!({ "session_id": sid2, "subscription_id": sub }),
+        &ctx,
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("belongs"), "got: {err:#}");
+}
+
+// ---------------------------------------------------------------------------
+// stream_poll: inline byte budget (max_inline_bytes)
+// ---------------------------------------------------------------------------
+
+/// Byte-budgeted flavor of `poll_until_next_seq`: poll with a fixed
+/// `max_inline_bytes` (never acking) until the subscription has deframed up to
+/// `want` frames — loudly failing after a deadline.
+async fn poll_budget_until_next_seq(ctx: &Arc<Ctx>, sub_id: &str, want: u64, budget: u64) -> Value {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let result = tools::call(
+            "stream_poll",
+            json!({ "subscription_id": sub_id, "max_inline_bytes": budget }),
+            ctx,
+        )
+        .await
+        .unwrap();
+        if result["next_seq"].as_u64().unwrap() >= want {
+            return result;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "subscription {sub_id} never reached seq {want}: {result}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn stream_poll_inline_byte_budget_paginates_whole_frames() {
+    let dir = scaffold_workspace();
+    let ctx = ctx_for(&dir);
+    let sid = open_echo_lines(&ctx).await;
+    let created = tools::call("stream_poll", json!({ "session_id": sid }), &ctx).await.unwrap();
+    let sub = created["subscription_id"].as_str().unwrap().to_string();
+
+    // Four 100-byte frames. Each renders as 299 hex chars ("XX " joined) plus
+    // 100 text chars = 399 metered bytes; the budget counts hex+text only.
+    let payload = format!("{}\n", "x".repeat(100)).repeat(4);
+    tools::call("send", json!({ "session_id": sid, "text": payload }), &ctx).await.unwrap();
+
+    // Budget 900: exactly two whole frames fit (798); the third (1197) would
+    // overflow, so the page stops at a frame boundary — never a partial frame.
+    let page = poll_budget_until_next_seq(&ctx, &sub, 4, 900).await;
+    assert_eq!(frame_seqs(&page), vec![0, 1], "page holds only whole frames within budget");
+    assert_eq!(page["page_bytes"], json!(798));
+    assert_eq!(page["oversized_frame"], json!(false));
+    assert_eq!(page["next_seq"], json!(4), "draining is not capped by the page budget");
+
+    // Ack the delivered page: the remaining frames arrive on the next page.
+    let rest = tools::call(
+        "stream_poll",
+        json!({ "subscription_id": sub, "since_seq": 2, "max_inline_bytes": 900 }),
+        &ctx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(frame_seqs(&rest), vec![2, 3]);
+    assert_eq!(rest["page_bytes"], json!(798));
+    assert_eq!(rest["oversized_frame"], json!(false));
+}
+
+#[tokio::test]
+async fn stream_poll_oversized_frame_still_delivers_one_and_marks_it() {
+    let dir = scaffold_workspace();
+    let ctx = ctx_for(&dir);
+    let sid = open_echo_lines(&ctx).await;
+    let created = tools::call("stream_poll", json!({ "session_id": sid }), &ctx).await.unwrap();
+    let sub = created["subscription_id"].as_str().unwrap().to_string();
+
+    // Two 300-byte frames, each rendering as 899 hex + 300 text = 1199 bytes —
+    // far beyond the minimum 512-byte budget. Forward progress requires the
+    // first frame to be delivered anyway, alone and marked.
+    let payload = format!("{}\n", "y".repeat(300)).repeat(2);
+    tools::call("send", json!({ "session_id": sid, "text": payload }), &ctx).await.unwrap();
+
+    let page = poll_budget_until_next_seq(&ctx, &sub, 2, 512).await;
+    assert_eq!(frame_seqs(&page), vec![0], "an oversized frame is delivered alone");
+    assert_eq!(page["oversized_frame"], json!(true));
+    assert_eq!(page["page_bytes"], json!(1199));
+
+    // Ack it: the second oversized frame gets its own marked page.
+    let next = tools::call(
+        "stream_poll",
+        json!({ "subscription_id": sub, "since_seq": 1, "max_inline_bytes": 512 }),
+        &ctx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(frame_seqs(&next), vec![1]);
+    assert_eq!(next["oversized_frame"], json!(true));
+    assert_eq!(next["page_bytes"], json!(1199));
+}
+
+#[tokio::test]
+async fn stream_poll_watermark_advances_only_with_inline_delivery() {
+    let dir = scaffold_workspace();
+    let ctx = ctx_for(&dir);
+    let sid = open_echo_lines(&ctx).await;
+    let created = tools::call("stream_poll", json!({ "session_id": sid }), &ctx).await.unwrap();
+    let sub = created["subscription_id"].as_str().unwrap().to_string();
+
+    // Four 100-byte frames (399 metered bytes each); a 512-byte budget caps
+    // every page at one frame, so only seq 0 has ever been delivered even
+    // though all four were drained (next_seq = 4).
+    let payload = format!("{}\n", "x".repeat(100)).repeat(4);
+    tools::call("send", json!({ "session_id": sid, "text": payload }), &ctx).await.unwrap();
+    let page = poll_budget_until_next_seq(&ctx, &sub, 4, 512).await;
+    assert_eq!(frame_seqs(&page), vec![0]);
+    assert_eq!(page["next_seq"], json!(4));
+
+    // Acking past the byte-budget-capped delivery watermark is loud: frames
+    // the budget held back were never delivered, so they must not be released.
+    let err = tools::call(
+        "stream_poll",
+        json!({ "subscription_id": sub, "since_seq": 4 }),
+        &ctx,
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("never delivered"), "got: {err:#}");
+
+    // The correct ack — last delivered seq + 1 — releases only that frame, and
+    // the held-back frames are still redelivered in order.
+    let rest = tools::call(
+        "stream_poll",
+        json!({ "subscription_id": sub, "since_seq": 1, "max_inline_bytes": 512 }),
+        &ctx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(frame_seqs(&rest), vec![1], "held-back frames survive the ack");
+}
+
+#[tokio::test]
+async fn stream_poll_max_inline_bytes_range_is_loud() {
+    let dir = scaffold_workspace();
+    let ctx = ctx_for(&dir);
+    let sid = open_echo_lines(&ctx).await;
+    let created = tools::call("stream_poll", json!({ "session_id": sid }), &ctx).await.unwrap();
+    let sub = created["subscription_id"].as_str().unwrap().to_string();
+
+    for bad in [0u64, 511, 262_145, 4_294_967_301] {
+        let err = tools::call(
+            "stream_poll",
+            json!({ "subscription_id": sub, "max_inline_bytes": bad }),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("512..=262144") && msg.contains(&bad.to_string()),
+            "max_inline_bytes {bad} must be rejected with the range and the value, got: {msg}"
+        );
+    }
+    let err = tools::call(
+        "stream_poll",
+        json!({ "subscription_id": sub, "max_inline_bytes": "lots" }),
+        &ctx,
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("max_inline_bytes"), "got: {err:#}");
 }
