@@ -33,6 +33,111 @@ canvas.radar { position: absolute; inset: 0; width: 100%; height: 100%; display:
 
 .ob-scope__meta .is-pass { color: var(--brand); }
 
+/* ===== W11 session timeline (uPlot host surface) ===== */
+
+/* Top padding clears the corner meta row; uPlot draws inside .tl-plot. */
+.ob-scope--timeline { padding: 26px 0 4px; }
+.tl-plot { width: 100%; }
+
+/* uPlot vendor CSS hardcodes its cursor/selection colors; re-key them to the
+   scope tokens so the surface stays theme-correct. */
+.ob-scope--timeline .u-cursor-x { border-right-color: var(--scope-faint); }
+.ob-scope--timeline .u-select { background: var(--brand-glow); }
+
+.tl-legend i {
+  display: inline-block; width: 8px; height: 3px; border-radius: 1px;
+  margin: 0 4px 1px 0; font-style: normal;
+}
+.tl-actions {
+  margin-top: 10px;
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+}
+.tl-note { font: 11px var(--font-mono); color: var(--faint); }
+
+/* ===== W12 frame diagnostics (tokens only) ===== */
+
+/* Byte highlights driven by matrix-row / offset selection. Never color-alone:
+   the caption row under the hex names the selection in text. */
+.diag-hex i.is-ck-ok {
+  border-bottom: 2px solid var(--accent);
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+}
+.diag-hex i.is-ck-fail {
+  border-bottom: 2px solid var(--danger);
+  background: var(--danger-weak);
+}
+.diag-hex i.is-skip { color: var(--faint); }
+.diag-hex i.is-start {
+  border-bottom: 2px solid var(--accent);
+  background: var(--accent-weak);
+}
+
+.diag-label {
+  margin: 14px 0 6px;
+  font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.6px;
+  color: var(--muted); text-transform: uppercase;
+}
+.diag-win { color: var(--accent); font-weight: 600; }
+.diag-x { color: var(--danger); font-weight: 600; }
+.diag-detail { font-size: 11px; color: var(--muted); }
+.diag-none { font: 11px var(--font-mono); color: var(--faint); margin: 4px 0; }
+.diag-actions {
+  margin-top: 12px;
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+}
+
+/* ===== W3 capture workbench v1 (tokens only) ===== */
+
+.ob-scope--capture { padding: 26px 0 4px; }
+.cap-plot { width: 100%; }
+.ob-scope--capture .u-cursor-x { border-right-color: var(--scope-faint); }
+.ob-scope--capture .u-select { background: var(--brand-glow); }
+
+.dir {
+  font-family: var(--font-mono); font-size: 12px; font-weight: 600;
+  letter-spacing: 0.3px;
+}
+.dir--tx { color: var(--s2); }
+.dir--rx { color: var(--s1); }
+
+/* Scroll container, not truncation: every delivered frame stays reachable. */
+.cap-table-wrap {
+  margin-top: 10px; max-height: 242px; overflow: auto;
+  border: 1px solid var(--hairline); border-radius: 7px;
+}
+.cap-table-wrap .ob-table th {
+  position: sticky; top: 0; background: var(--card); z-index: 1;
+}
+.cap-hex-label {
+  margin: 12px 0 6px;
+  font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.6px;
+  color: var(--muted); text-transform: uppercase;
+}
+
+/* ===== shared chart tooltip (render/tooltip.ts host, tokens only) ===== */
+
+/* Tooltip hosts must be positioned: the scope is already relative; the uPlot
+   mount divs become the offset parent for their own tooltip. */
+.tl-plot, .cap-plot { position: relative; }
+
+/* pointer-events none: the tip may never steal clicks (A/B cursors) or drags
+   (zoom) from the surface beneath it. Content is textContent-only rows. */
+.ob-tooltip {
+  position: absolute; z-index: 5; pointer-events: none;
+  max-width: 280px;
+  background: var(--card); border: 1px solid var(--card-border);
+  border-radius: 6px; box-shadow: var(--card-shadow);
+  padding: 6px 9px;
+  font-family: var(--font-mono); font-size: 11px; line-height: 1.55;
+  color: var(--ink);
+}
+.ob-tooltip__row { display: flex; gap: 10px; justify-content: space-between; }
+.ob-tooltip__label { color: var(--muted); }
+.ob-tooltip__value {
+  color: var(--ink); font-weight: 600;
+  text-align: right; overflow-wrap: anywhere;
+}
+
 /* ===== viewer additions (tokens only) ===== */
 
 /* Scope values stay readable as text next to the canvas — never

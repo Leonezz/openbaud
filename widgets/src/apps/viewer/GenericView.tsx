@@ -1,6 +1,8 @@
+import { BadgeReplay } from '../../components/Badges'
 import { Card, CardSpacer } from '../../components/Card'
 import { Chip } from '../../components/Chip'
 import type { OpenbaudSummary } from '../../mcp/useWidget'
+import { isReplayResult } from './dispatch'
 import { JsonKv } from './JsonKv'
 import type { ResultRef } from './state'
 
@@ -15,6 +17,9 @@ export function GenericView({ structured, resultRef }: GenericViewProps) {
   const outcome = typeof structured.outcome === 'string' ? structured.outcome : undefined
   const title = command !== undefined ? `Result — ${command}` : 'Result'
   const ok = outcome === 'normal' || outcome === 'sent'
+  // No scope surface here to watermark, but a replayed source still must be
+  // disclosed — the badge rides the header like everywhere else.
+  const replay = isReplayResult(structured)
   const provenance =
     resultRef.path ?? (resultRef.source === 'file' ? resultRef.uri : 'inline result')
   return (
@@ -22,10 +27,13 @@ export function GenericView({ structured, resultRef }: GenericViewProps) {
       <Card
         title={title}
         head={
-          outcome !== undefined ? (
+          outcome !== undefined || replay ? (
             <>
+              {replay && <BadgeReplay />}
               <CardSpacer />
-              <Chip variant={ok ? 'accent' : 'warn'}>outcome: {outcome}</Chip>
+              {outcome !== undefined && (
+                <Chip variant={ok ? 'accent' : 'warn'}>outcome: {outcome}</Chip>
+              )}
             </>
           ) : undefined
         }

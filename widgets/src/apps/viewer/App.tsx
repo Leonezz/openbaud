@@ -4,9 +4,12 @@ import { ObError } from '../../components/ObError'
 import { ObLoading } from '../../components/ObLoading'
 import type { OpenbaudSummary, ToolArgs, ToolResult } from '../../mcp/useWidget'
 import { useWidget } from '../../mcp/useWidget'
+import { CaptureView } from './CaptureView'
+import { DiagnosticsView } from './DiagnosticsView'
 import { isRecord } from './dispatch'
 import { GenericView } from './GenericView'
 import { PolarView } from './PolarView'
+import { TimelineView } from './TimelineView'
 import {
   INITIAL_VIEWER,
   parseResourceJson,
@@ -160,5 +163,13 @@ export function ViewerApp() {
       return <GenericView structured={state.structured} resultRef={state.ref} />
     case 'polar':
       return <PolarView widget={widget} scan={state.scan} resultRef={state.ref} />
+    case 'timeline':
+      return <TimelineView widget={widget} timeline={state.timeline} resultRef={state.ref} />
+    case 'diagnostics':
+      return (
+        <DiagnosticsView widget={widget} diagnostics={state.diagnostics} resultRef={state.ref} />
+      )
+    case 'capture':
+      return <CaptureView widget={widget} capture={state.capture} resultRef={state.ref} />
   }
 }

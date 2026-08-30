@@ -23,6 +23,9 @@
 // handed to show_result. No DOM, no React — unit-testable as-is.
 import type { OpenbaudSummary } from '../../mcp/useWidget'
 import type { PolarPoint } from '../../render/polar'
+import { readCapture, type CaptureData } from './capture'
+import { readDiagnostics, type DiagnosticsData } from './diagnostics'
+import { readTimeline, type TimelineData } from './timeline'
 
 export type JsonRecord = Record<string, unknown>
 
@@ -56,8 +59,20 @@ export interface PolarEncoding {
   readonly intensity: string | undefined
 }
 
+/** The device's own field names behind each visual channel (tooltip labels). */
+export interface PolarChannels {
+  readonly angle: string
+  readonly radius: string
+  /** Undefined when the declaration bound no intensity channel. */
+  readonly intensity: string | undefined
+}
+
 export interface PolarScan {
   readonly points: readonly PolarPoint[]
+  /** Field names the declaration mapped onto the channels — never guessed. */
+  readonly channels: PolarChannels
+  /** result.units: field name → unit string; empty when none were declared. */
+  readonly units: Readonly<Record<string, string>>
   /** Elements the server dropped from the array (truncation marker sum). */
   readonly truncatedPoints: number
   /** False when the declaration bound no intensity channel (ramp is hidden). */
@@ -72,6 +87,8 @@ export interface PolarScan {
   readonly checksum: string | undefined
   readonly seq: number | undefined
   readonly uptimeMs: number | undefined
+  /** True when the result's `port` names a replay transport ("replay:…"). */
+  readonly replay: boolean
 }
 
 interface Invalid {
@@ -82,6 +99,9 @@ interface Invalid {
 
 export type DispatchedView =
   | { readonly kind: 'polar'; readonly scan: PolarScan }
+  | { readonly kind: 'timeline'; readonly timeline: TimelineData }
+  | { readonly kind: 'diagnostics'; readonly diagnostics: DiagnosticsData }
+  | { readonly kind: 'capture'; readonly capture: CaptureData }
   | { readonly kind: 'generic' }
   | Invalid
 
@@ -114,7 +134,7 @@ function readEncoding(declared: unknown, label: string): PolarEncoding | Invalid
   }
   if (declared.kind !== 'polar') {
     return invalid(
-      `${label}.kind ${describe(declared.kind)} is not supported — this viewer renders "polar" only`,
+      `${label}.kind ${describe(declared.kind)} is not supported — this viewer renders "polar", "timeline", "diagnostics" and "capture"`,
     )
   }
   const data = nameOf(declared.data)
@@ -212,6 +232,19 @@ function readPolarPoints(
   return { kind: 'points', points, truncated }
 }
 
+/**
+ * result.units when present: parsed-field name → unit string. Entries whose
+ * value is not a string are dropped — a unit that is not text cannot be
+ * printed, and inventing one is exactly what this viewer never does.
+ */
+function readUnits(value: unknown): Readonly<Record<string, string>> {
+  if (!isRecord(value)) return {}
+  const entries = Object.entries(value).filter(
+    (entry): entry is [string, string] => typeof entry[1] === 'string',
+  )
+  return Object.fromEntries(entries)
+}
+
 export function asString(value: unknown): string | undefined {
   return typeof value === 'string' ? value : undefined
 }
@@ -232,6 +265,16 @@ function protocolLabel(parsed: JsonRecord): string | undefined {
 }
 
 /**
+ * True when the result's `port` names a replay transport ("replay:<capture>").
+ * Replayed data must always be disclosed on screen (REPLAY badge + watermark);
+ * a missing `port` field costs nothing but the label.
+ */
+export function isReplayResult(structured: OpenbaudSummary): boolean {
+  const port = asString(structured.port)
+  return port !== undefined && port.startsWith('replay:')
+}
+
+/**
  * @param structured full result object (`view` may declare its rendering)
  * @param override   show_result's `encoding`, which wins over `view` when set
  */
@@ -240,6 +283,19 @@ export function dispatchResult(structured: OpenbaudSummary, override?: unknown):
   const declared = overridden ? override : structured.view
   if (declared === undefined || declared === null) return { kind: 'generic' }
   const label = overridden ? 'encoding' : 'view'
+
+  // Timeline / diagnostics / capture declarations carry no channel mapping of
+  // their own — the whole result object is the payload; each module validates
+  // its contract and reports a specific reason when the data does not fit.
+  if (isRecord(declared) && declared.kind === 'timeline') {
+    return readTimeline(structured, label, isReplayResult(structured))
+  }
+  if (isRecord(declared) && declared.kind === 'diagnostics') {
+    return readDiagnostics(structured, label, isReplayResult(structured))
+  }
+  if (isRecord(declared) && declared.kind === 'capture') {
+    return readCapture(structured, label, isReplayResult(structured))
+  }
 
   const encoding = readEncoding(declared, label)
   if (encoding.kind === 'invalid') return encoding
@@ -256,6 +312,12 @@ export function dispatchResult(structured: OpenbaudSummary, override?: unknown):
     kind: 'polar',
     scan: {
       points: hit.points,
+      channels: {
+        angle: encoding.angle,
+        radius: encoding.radius,
+        intensity: encoding.intensity,
+      },
+      units: readUnits(structured.units),
       truncatedPoints: hit.truncated,
       hasIntensity: encoding.intensity !== undefined,
       simulatedScene: asNumber(parsed.simulated_scene) === 1,
@@ -266,6 +328,7 @@ export function dispatchResult(structured: OpenbaudSummary, override?: unknown):
       checksum: asString(structured.checksum),
       seq: asNumber(parsed.seq),
       uptimeMs: asNumber(parsed.uptime_ms),
+      replay: isReplayResult(structured),
     },
   }
 }

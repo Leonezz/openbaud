@@ -4,6 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width,initial-scale=1" />
     <title>openbaud widget harness</title>
+    <link rel="icon" href="data:," />
     <style>
       /* Fixture chrome only — neutral system colors, no palette of its own. */
       :root {
@@ -85,6 +86,11 @@
           <option value="show_result_encoded">show_result (encoding, foreign fields)</option>
           <option value="show_result_broken">show_result (view misses its field)</option>
           <option value="show_result_undeclared">show_result (nothing declared → KV)</option>
+          <option value="show_result_timeline">show_result (timeline, file → resource)</option>
+          <option value="show_result_diagnostics">show_result (diagnostics, inline)</option>
+          <option value="show_result_capture">show_result (capture, file → resource)</option>
+          <option value="show_result_replay">show_result (replay port → watermark)</option>
+          <option value="tool_cancelled">tool-cancelled (input, no result)</option>
         </select>
       </label>
       <label>
@@ -107,6 +113,11 @@
       <button id="toggle-theme" type="button">Toggle theme</button>
     </header>
     <main>
+      <!-- allow-same-origin is intentional for this dev harness: the widget is
+           served from the same Vite origin, and same-origin lets its module
+           scripts and HMR work. A real MCP Apps host serves the widget from an
+           isolated origin and sandboxes with allow-scripts only — do not treat
+           this combination as a model of production isolation. -->
       <iframe id="frame" title="widget under test" sandbox="allow-scripts allow-same-origin"></iframe>
       <pre id="log"></pre>
     </main>

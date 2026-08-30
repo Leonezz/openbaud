@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { BadgeSim } from '../../components/Badges'
+import { BadgeReplay, BadgeSim } from '../../components/Badges'
 import { Btn } from '../../components/Btn'
 import { Card, CardSpacer } from '../../components/Card'
 import { Chip } from '../../components/Chip'
@@ -7,11 +7,42 @@ import { Icon } from '../../components/Icon'
 import { Led } from '../../components/Led'
 import { ObError } from '../../components/ObError'
 import type { WidgetHandle } from '../../mcp/useWidget'
-import { drawPolar, type PolarFrame } from '../../render/polar'
+import {
+  drawPolar,
+  nearestPolarPoint,
+  polarLayout,
+  polarPointXy,
+  type PolarFrame,
+  type PolarPoint,
+} from '../../render/polar'
+import { createTooltipHost, type TooltipHost, type TooltipLine } from '../../render/tooltip'
 import { radarScale, type PolarScan } from './dispatch'
 import { intensityRange, type ResultRef } from './state'
 
 const RAMP_TOKENS = ['--ramp-g1', '--ramp-g2', '--ramp-g3', '--ramp-g4', '--ramp-g5'] as const
+/** Mouse-to-point hit radius in CSS pixels. */
+const HIT_RADIUS_PX = 12
+
+/**
+ * Tooltip rows under the device's own field names — exactly the names the
+ * declared encoding mapped onto each channel, the same route the dots were
+ * drawn from. A unit is appended only when the result's `units` map declares
+ * one for that field; an undeclared intensity channel contributes no row at
+ * all (its defaulted 0 is not device data).
+ */
+function pointTooltip(scan: PolarScan, point: PolarPoint): readonly TooltipLine[] {
+  const valueOf = (field: string, value: number): string => {
+    const unit = scan.units[field]
+    return unit === undefined ? String(value) : `${value} ${unit}`
+  }
+  return [
+    { label: scan.channels.angle, value: valueOf(scan.channels.angle, point.angleDeg) },
+    { label: scan.channels.radius, value: valueOf(scan.channels.radius, point.distanceMm) },
+    ...(scan.channels.intensity !== undefined
+      ? [{ label: scan.channels.intensity, value: valueOf(scan.channels.intensity, point.intensity) }]
+      : []),
+  ]
+}
 
 export interface PolarViewProps {
   readonly widget: WidgetHandle
@@ -34,7 +65,10 @@ function formatAngle(angleDeg: number): string {
  */
 export function PolarView({ widget, scan, resultRef }: PolarViewProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
+  const scopeRef = useRef<HTMLDivElement | null>(null)
+  const tooltipRef = useRef<TooltipHost | null>(null)
   const [modeError, setModeError] = useState<string | undefined>(undefined)
+  const [hover, setHover] = useState<number | null>(null)
 
   const range = useMemo(() => intensityRange(scan), [scan])
   const scale = useMemo(() => radarScale(scan.points), [scan])
@@ -54,8 +88,8 @@ export function PolarView({ widget, scan, resultRef }: PolarViewProps) {
     const canvas = canvasRef.current
     if (!canvas) return
     void theme
-    drawPolar(canvas, frame, { ...scale, sweepDeg, annotateNearest: true })
-  }, [frame, scale, sweepDeg, theme])
+    drawPolar(canvas, frame, { ...scale, sweepDeg, annotateNearest: true, highlightIndex: hover })
+  }, [frame, scale, sweepDeg, theme, hover])
 
   useEffect(() => {
     draw()
@@ -68,6 +102,60 @@ export function PolarView({ widget, scan, resultRef }: PolarViewProps) {
     observer.observe(canvas)
     return () => observer.disconnect()
   }, [draw])
+
+  // One tooltip host per scope surface; content is set per hover below.
+  useEffect(() => {
+    const scope = scopeRef.current
+    if (!scope) return
+    const tooltip = createTooltipHost(scope)
+    tooltipRef.current = tooltip
+    return () => {
+      tooltipRef.current = null
+      tooltip.destroy()
+    }
+  }, [])
+
+  // Per-point hover: the hit-test runs through the same polarLayout /
+  // polarPointXy math that painted the dots (render/polar.ts), so the point
+  // that looks nearest is the one that hits. Beyond HIT_RADIUS_PX: no point,
+  // no ring, no tooltip.
+  useEffect(() => {
+    const canvas = canvasRef.current
+    if (!canvas) return
+    const onMove = (event: MouseEvent): void => {
+      const box = canvas.getBoundingClientRect()
+      const layout = polarLayout(box.width, box.height, scale.maxDistanceMm)
+      const index = nearestPolarPoint(
+        layout,
+        scan.points,
+        event.clientX - box.left,
+        event.clientY - box.top,
+        HIT_RADIUS_PX,
+      )
+      setHover(index)
+      const tooltip = tooltipRef.current
+      if (tooltip === null) return
+      const point = index === null ? undefined : scan.points[index]
+      if (point === undefined) {
+        tooltip.hide()
+        return
+      }
+      // The canvas fills the scope (inset 0), so canvas and tooltip-host
+      // coordinates are the same space.
+      const at = polarPointXy(layout, point)
+      tooltip.show(at.x, at.y, pointTooltip(scan, point))
+    }
+    const onLeave = (): void => {
+      setHover(null)
+      tooltipRef.current?.hide()
+    }
+    canvas.addEventListener('mousemove', onMove)
+    canvas.addEventListener('mouseleave', onLeave)
+    return () => {
+      canvas.removeEventListener('mousemove', onMove)
+      canvas.removeEventListener('mouseleave', onLeave)
+    }
+  }, [scan, scale])
 
   const modes = widget.hostContext?.availableDisplayModes
   const fullscreen = widget.displayMode === 'fullscreen'
@@ -97,6 +185,7 @@ export function PolarView({ widget, scan, resultRef }: PolarViewProps) {
         title={`Radar — ${scan.command ?? 'scan'}`}
         head={
           <>
+            {scan.replay && <BadgeReplay />}
             {scan.simulatedScene && <BadgeSim />}
             {!outcomeOk && <Chip variant="warn">outcome: {scan.outcome}</Chip>}
             <CardSpacer />
@@ -131,8 +220,15 @@ export function PolarView({ widget, scan, resultRef }: PolarViewProps) {
           ) : undefined
         }
       >
-        <div className="ob-scope ob-scope--radar">
+        <div ref={scopeRef} className="ob-scope ob-scope--radar">
           <canvas ref={canvasRef} className="radar" />
+          {/* Replayed captures are disclosed on the surface itself, not only
+              in the header — the scope is what screenshots travel as. */}
+          {scan.replay && (
+            <div className="ob-watermark">
+              <span>REPLAY</span>
+            </div>
+          )}
           <div className="ob-scope__meta ob-scope__meta--tl">
             <span>
               {[scan.protocol, scan.device ?? 'unknown device']

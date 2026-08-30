@@ -58,12 +58,17 @@ export function PortPickerApp() {
   const [showAliases, setShowAliases] = useState(false)
   const [send, setSend] = useState<SendState>({ kind: 'idle' })
 
-  const acceptCandidates = useCallback((candidates: readonly EnrichedPort[]): void => {
-    setSend({ kind: 'idle' })
-    setShowAliases(false)
-    setSelectedPath(firstSelectable(visiblePorts(candidates, false)))
-    setLoad({ kind: 'ready', candidates })
-  }, [])
+  // `device` is who the agent asked for (tool input `device`, echoed in the
+  // ask_port result) — it steers preselection toward that device's own port.
+  const acceptCandidates = useCallback(
+    (candidates: readonly EnrichedPort[], device: string | undefined): void => {
+      setSend({ kind: 'idle' })
+      setShowAliases(false)
+      setSelectedPath(firstSelectable(visiblePorts(candidates, false), device))
+      setLoad({ kind: 'ready', candidates })
+    },
+    [],
+  )
 
   const fail = useCallback((title: string, message: string): void => {
     setSelectedPath(null)
@@ -80,7 +85,7 @@ export function PortPickerApp() {
       try {
         const ask = parseAskPort(result.structuredContent)
         setMeta({ reason: ask.reason, device: ask.device })
-        acceptCandidates(ask.candidates)
+        acceptCandidates(ask.candidates, ask.device)
       } catch (error) {
         fail('Unreadable ask_port result', errorMessage(error))
       }
@@ -112,11 +117,11 @@ export function PortPickerApp() {
         fail('list_ports failed', toolResultText(result) || 'list_ports returned an error')
         return
       }
-      acceptCandidates(parseListPorts(result.structuredContent))
+      acceptCandidates(parseListPorts(result.structuredContent), meta.device)
     } catch (error) {
       fail('Could not rescan serial ports', errorMessage(error))
     }
-  }, [callTool, acceptCandidates, fail])
+  }, [callTool, acceptCandidates, fail, meta.device])
 
   // The choice is pushed to the agent's context; the agent opens the port.
   const sendSelection = useCallback(
@@ -210,6 +215,8 @@ export function PortPickerApp() {
     if (load.kind === 'failed') {
       return (
         <div className="ob-card__body">
+          {/* No retry button here: the footer's RescanFoot is the single
+              Rescan control, matching the empty state. */}
           <ObError
             title={load.title}
             detail={
@@ -220,8 +227,6 @@ export function PortPickerApp() {
                 </div>
               </>
             }
-            onRetry={() => void rescan()}
-            retryLabel="Rescan"
           />
         </div>
       )

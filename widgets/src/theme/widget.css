@@ -254,6 +254,13 @@
   color: #ffffff; font-family: var(--font-mono); letter-spacing: 1px;
 }
 .ob-btn[disabled] { opacity: 0.45; cursor: not-allowed; }
+/* Disabled primary must not read as an actionable green fill (opacity alone
+   keeps the accent hue, especially on dark). Neutral surface tokens instead;
+   opacity stays 1 so the muted text keeps its own contrast in both themes. */
+.ob-btn--primary[disabled] {
+  background: var(--field-bg); border-color: var(--card-border);
+  color: var(--muted); opacity: 1;
+}
 
 /* ---------- hex 显示:字段 = 底纹 + 2px 下衬线 双编码 ---------- */
 .ob-hex {

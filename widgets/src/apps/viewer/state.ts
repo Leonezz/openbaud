@@ -12,7 +12,10 @@ import {
   type ReadResourceResult,
   type ToolResult,
 } from '../../mcp/useWidget'
+import type { CaptureData } from './capture'
+import type { DiagnosticsData } from './diagnostics'
 import { asNumber, asString, dispatchResult, isRecord, type PolarScan } from './dispatch'
+import type { TimelineData } from './timeline'
 
 /** Where the full result lives, per the show_result envelope. */
 export type ResultRef =
@@ -38,6 +41,9 @@ export type ViewerState =
   | { readonly kind: 'invalid'; readonly reason: string }
   | { readonly kind: 'generic'; readonly structured: OpenbaudSummary; readonly ref: ResultRef }
   | { readonly kind: 'polar'; readonly scan: PolarScan; readonly ref: ResultRef }
+  | { readonly kind: 'timeline'; readonly timeline: TimelineData; readonly ref: ResultRef }
+  | { readonly kind: 'diagnostics'; readonly diagnostics: DiagnosticsData; readonly ref: ResultRef }
+  | { readonly kind: 'capture'; readonly capture: CaptureData; readonly ref: ResultRef }
 
 export const INITIAL_VIEWER: ViewerState = { kind: 'idle' }
 
@@ -141,6 +147,11 @@ export function viewFor(
 ): ViewerState {
   const view = dispatchResult(structured, encoding)
   if (view.kind === 'polar') return { kind: 'polar', scan: view.scan, ref }
+  if (view.kind === 'timeline') return { kind: 'timeline', timeline: view.timeline, ref }
+  if (view.kind === 'diagnostics') {
+    return { kind: 'diagnostics', diagnostics: view.diagnostics, ref }
+  }
+  if (view.kind === 'capture') return { kind: 'capture', capture: view.capture, ref }
   if (view.kind === 'invalid') return { kind: 'invalid', reason: view.reason }
   return { kind: 'generic', structured, ref }
 }

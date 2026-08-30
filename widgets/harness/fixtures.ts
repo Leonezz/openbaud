@@ -118,7 +118,7 @@ export const LIST_PORTS_RESULT: JsonObject = {
   ports: ASK_PORT_CANDIDATES,
 }
 
-function hexToBytes(hex: string): number[] {
+export function hexToBytes(hex: string): number[] {
   return hex
     .trim()
     .split(/\s+/)
@@ -156,7 +156,7 @@ function scanAt(index: number): RadarScan {
   return scan
 }
 
-const RESULT_URI_PREFIX = 'openbaud://result/'
+export const RESULT_URI_PREFIX = 'openbaud://result/'
 
 function resultFileName(scan: RadarScan): string {
   return `res-${scan.ts}-run_command.json`
@@ -231,6 +231,9 @@ export function radarCommandResult(index: number): JsonObject {
   return {
     device: 'openbaud-pv-board',
     command: 'obp1_radar_scan',
+    // The transport the bytes actually crossed. A "replay:<capture>" value
+    // here is what makes the viewer watermark the surface as REPLAY.
+    port: '/dev/cu.usbmodem213101',
     tx_hex: scan.txHex,
     outcome: 'normal',
     // obp1_radar_scan declares validate: { checksum: crc16_modbus }, so the
@@ -265,6 +268,19 @@ export function radarCommandResult(index: number): JsonObject {
 export function undeclaredCommandResult(index: number): JsonObject {
   const { view: _view, ...rest } = radarCommandResult(index)
   return rest
+}
+
+/**
+ * The same scan as replayed from a saved capture: `port` names the replay
+ * transport instead of a device node. Everything else is identical — which is
+ * the point: only the disclosed provenance changes, and the viewer must
+ * watermark it.
+ */
+export function replayRadarResult(index: number): JsonObject {
+  return {
+    ...radarCommandResult(index),
+    port: 'replay:.openbaud/captures/pv-radar-demo.obcap',
+  }
 }
 
 /**
@@ -307,3 +323,6 @@ export function aliasScanResult(index: number): JsonObject {
     units: { uptime_ms: 'ms' },
   }
 }
+
+// The session-timeline fixture lives in ./timeline-fixture.ts (same canned
+// discipline, its own file so both stay under the size budget).

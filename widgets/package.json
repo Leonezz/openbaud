@@ -12,7 +12,8 @@
   "dependencies": {
     "@modelcontextprotocol/ext-apps": "^1.7.5",
     "react": "^19.2.8",
-    "react-dom": "^19.2.8"
+    "react-dom": "^19.2.8",
+    "uplot": "^1.6.32"
   },
   "devDependencies": {
     "@types/react": "^19.2.18",

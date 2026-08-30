@@ -138,8 +138,25 @@ export function visiblePorts(
   return showAliases ? candidates : candidates.filter((port) => port.alias_of === undefined)
 }
 
-/** First row the picker preselects: a visible, unblocked candidate. */
-export function firstSelectable(ports: readonly EnrichedPort[]): string | null {
+/**
+ * First row the picker preselects. When ask_port was invoked for a specific
+ * workspace device (the tool input's `device`, echoed back in the result),
+ * the first visible unblocked row whose `matches_devices` names that device
+ * wins — the agent asked on that device's behalf, so its matching port is the
+ * likeliest pick. Without a device, or when no unblocked row matches it, the
+ * previous rule stands unchanged: the first visible unblocked candidate.
+ * Preselection only — every row stays clickable either way.
+ */
+export function firstSelectable(
+  ports: readonly EnrichedPort[],
+  device?: string,
+): string | null {
+  if (device !== undefined) {
+    const matched = ports.find(
+      (port) => !isBlocked(port) && (port.matches_devices?.includes(device) ?? false),
+    )
+    if (matched !== undefined) return matched.path
+  }
   return ports.find((port) => !isBlocked(port))?.path ?? null
 }
 

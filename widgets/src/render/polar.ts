@@ -43,6 +43,8 @@ export interface PolarOptions {
   readonly annotateNearest?: boolean
   /** Dashed selection-sector overlay (selection-layer entry point). */
   readonly sector?: PolarSector | null
+  /** Hovered point (index into frame.points): drawn with a --brand ring. */
+  readonly highlightIndex?: number | null
 }
 
 const RAMP_TOKENS = ['--ramp-g1', '--ramp-g2', '--ramp-g3', '--ramp-g4', '--ramp-g5'] as const
@@ -58,6 +60,70 @@ function toRad(deg: number): number {
   return ((deg - 90) * Math.PI) / 180
 }
 
+/** Scope geometry derived from the canvas CSS-pixel size. */
+export interface PolarLayout {
+  readonly cx: number
+  readonly cy: number
+  readonly radius: number
+  readonly maxDistanceMm: number
+}
+
+/**
+ * The one place the scope geometry is computed: drawPolar paints through it
+ * and the hover hit-test measures through it, so they can never disagree.
+ */
+export function polarLayout(
+  width: number,
+  height: number,
+  maxDistanceMm: number,
+  compact = false,
+): PolarLayout {
+  return {
+    cx: width / 2,
+    cy: height / 2,
+    radius: Math.min(width, height) / 2 - (compact ? 18 : 26),
+    maxDistanceMm,
+  }
+}
+
+/** Canvas CSS-pixel position of a point — same edge clamp as the dot painter. */
+export function polarPointXy(
+  layout: PolarLayout,
+  point: PolarPoint,
+): { readonly x: number; readonly y: number } {
+  const mm = Math.min(point.distanceMm, layout.maxDistanceMm - 10)
+  const rr = (layout.radius * mm) / layout.maxDistanceMm
+  return {
+    x: layout.cx + rr * Math.cos(toRad(point.angleDeg)),
+    y: layout.cy + rr * Math.sin(toRad(point.angleDeg)),
+  }
+}
+
+/**
+ * Index of the point nearest to (x, y) — canvas CSS pixels — within
+ * `hitRadiusPx`, else null. Distance is measured in screen space through the
+ * same transform that painted the dots, so what looks closest is what hits.
+ */
+export function nearestPolarPoint(
+  layout: PolarLayout,
+  points: readonly PolarPoint[],
+  x: number,
+  y: number,
+  hitRadiusPx: number,
+): number | null {
+  let bestIndex: number | null = null
+  let bestSq = hitRadiusPx * hitRadiusPx
+  for (const [index, point] of points.entries()) {
+    const at = polarPointXy(layout, point)
+    const dsq = (x - at.x) ** 2 + (y - at.y) ** 2
+    if (dsq <= bestSq) {
+      bestIndex = index
+      bestSq = dsq
+    }
+  }
+  return bestIndex
+}
+
 export function drawPolar(canvas: HTMLCanvasElement, frame: PolarFrame, opts: PolarOptions = {}): void {
   const {
     maxDistanceMm = 2800,
@@ -67,6 +133,7 @@ export function drawPolar(canvas: HTMLCanvasElement, frame: PolarFrame, opts: Po
     compact = false,
     annotateNearest = false,
     sector = null,
+    highlightIndex = null,
   } = opts
 
   const rect = canvas.getBoundingClientRect()
@@ -95,9 +162,8 @@ export function drawPolar(canvas: HTMLCanvasElement, frame: PolarFrame, opts: Po
 
   const w = rect.width
   const h = rect.height
-  const cx = w / 2
-  const cy = h / 2
-  const radius = Math.min(w, h) / 2 - (compact ? 18 : 26)
+  const layout = polarLayout(w, h, maxDistanceMm, compact)
+  const { cx, cy, radius } = layout
   const px = (mm: number): number => (radius * mm) / maxDistanceMm
 
   const { intensityMin, intensityMax } = frame
@@ -176,9 +242,7 @@ export function drawPolar(canvas: HTMLCanvasElement, frame: PolarFrame, opts: Po
   }
 
   const dot = (p: PolarPoint, r: number): void => {
-    const rr = px(Math.min(p.distanceMm, maxDistanceMm - 10))
-    const x = cx + rr * Math.cos(toRad(p.angleDeg))
-    const y = cy + rr * Math.sin(toRad(p.angleDeg))
+    const { x, y } = polarPointXy(layout, p)
     ctx2d.fillStyle = binColor(p.intensity)
     ctx2d.beginPath()
     ctx2d.arc(x, y, r, 0, Math.PI * 2)
@@ -202,12 +266,24 @@ export function drawPolar(canvas: HTMLCanvasElement, frame: PolarFrame, opts: Po
     ctx2d.shadowBlur = 0
   }
 
+  // hover highlight: a --brand ring around the hovered point, same transform
+  // as the dot it surrounds
+  if (highlightIndex !== null && highlightIndex !== undefined) {
+    const hovered = frame.points[highlightIndex]
+    if (hovered !== undefined) {
+      const { x, y } = polarPointXy(layout, hovered)
+      ctx2d.strokeStyle = token('--brand')
+      ctx2d.lineWidth = 1.5
+      ctx2d.beginPath()
+      ctx2d.arc(x, y, (compact ? 2.4 : 3) + 3.5, 0, Math.PI * 2)
+      ctx2d.stroke()
+    }
+  }
+
   // direct label on the nearest target (ink token, not a series color)
   if (annotateNearest && frame.points.length > 0) {
     const nearest = frame.points.reduce((a, b) => (b.distanceMm < a.distanceMm ? b : a))
-    const rr = px(nearest.distanceMm)
-    const x = cx + rr * Math.cos(toRad(nearest.angleDeg))
-    const y = cy + rr * Math.sin(toRad(nearest.angleDeg))
+    const { x, y } = polarPointXy(layout, nearest)
     ctx2d.strokeStyle = token('--scope-faint')
     ctx2d.lineWidth = 1
     ctx2d.beginPath()

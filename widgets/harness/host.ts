@@ -9,6 +9,7 @@ import {
   LIST_PORTS_RESULT,
   radarCommandResult,
   radarScanCount,
+  replayRadarResult,
   resultTextForUri,
   showResultEnvelope,
   SHOW_RESULT_INLINE,
@@ -18,6 +19,9 @@ import {
   wrapToolResult,
   type JsonObject,
 } from './fixtures'
+import { captureEnvelope, captureTextForUri } from './capture-fixture'
+import { diagnosticsResult } from './diagnostics-fixture'
+import { timelineEnvelope, timelineTextForUri } from './timeline-fixture'
 
 type Theme = 'light' | 'dark'
 
@@ -120,7 +124,7 @@ function handleResourcesRead(id: number | string, params: JsonObject): void {
     respondError(id, -32002, `resource ${uri} not found (harness: resource mode = fail)`)
     return
   }
-  const text = resultTextForUri(uri)
+  const text = timelineTextForUri(uri) ?? captureTextForUri(uri) ?? resultTextForUri(uri)
   if (text === undefined) {
     respondError(id, -32002, `harness has no fixture for resource ${JSON.stringify(uri)}`)
     return
@@ -194,10 +198,22 @@ const INLINE_SCENARIOS: Readonly<
   show_result_broken: { data: brokenViewResult, envelope: SHOW_RESULT_INLINE },
   // Nothing declared anywhere — expect the generic key/value card.
   show_result_undeclared: { data: undeclaredCommandResult, envelope: SHOW_RESULT_INLINE },
+  // `port` names a replay transport — expect REPLAY badge + scope watermark.
+  show_result_replay: { data: replayRadarResult, envelope: SHOW_RESULT_INLINE },
+  // diagnose_frame payload: real OBP frame with its CRC rewritten to ccitt.
+  show_result_diagnostics: { data: () => diagnosticsResult(), envelope: SHOW_RESULT_INLINE },
 }
 
 /** show_result for scan `index`: the envelope only — the payload is a resource. */
 function sendShowResult(index: number): void {
+  if (scenarioSel.value === 'show_result_timeline' || scenarioSel.value === 'show_result_capture') {
+    // Timeline / capture slice: envelope only; the full JSON rides resources/read.
+    const envelope =
+      scenarioSel.value === 'show_result_timeline' ? timelineEnvelope() : captureEnvelope()
+    notify('ui/notifications/tool-input', { arguments: { path: envelope.path } })
+    notify('ui/notifications/tool-result', wrapToolResult(envelope))
+    return
+  }
   const inline = INLINE_SCENARIOS[scenarioSel.value]
   if (inline !== undefined) {
     notify('ui/notifications/tool-input', { arguments: { data: inline.data(index) } })
@@ -210,6 +226,15 @@ function sendShowResult(index: number): void {
 }
 
 function sendScenario(): void {
+  if (scenarioSel.value === 'tool_cancelled') {
+    // Host cancels the call after the input: tool-input, then tool-cancelled,
+    // deliberately NO tool-result — the app's cancelled branch must render.
+    notify('ui/notifications/tool-input', { arguments: ASK_PORT_INPUT })
+    notify('ui/notifications/tool-cancelled', {
+      reason: 'harness: host cancelled the tool call (scenario tool_cancelled)',
+    })
+    return
+  }
   if (scenarioSel.value.startsWith('show_result')) {
     sendShowResult(radarIndex++)
     return
