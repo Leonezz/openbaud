@@ -5,6 +5,7 @@ __pycache__/
 *.py[cod]
 node_modules/
 /dist/
+/plugins/openbaud/dist/
 
 # Local working material, not part of the shipped repo:
 # - root-level workspace artifacts from ad-hoc exploration sessions

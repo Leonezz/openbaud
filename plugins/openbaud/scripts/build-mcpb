@@ -1,0 +1,161 @@
+#!/bin/sh
+# Build the universal (arm64 + x86_64) macOS MCPB bundle for OpenBaud.
+#
+# Pipeline: widgets build + embed -> dual-target release compile (path-remapped)
+# -> lipo universal -> codesign -> manifest.json generation -> mcpb validate/pack.
+# Output: plugins/openbaud/dist/openbaud-<version>.mcpb
+#
+# The MCPB packaging approach (manifest 0.3, "binary" server type, ${__dirname}
+# entry template, @anthropic-ai/mcpb 2.1.2) was validated by the spike in
+# research/spikes/s1-mcpb/ — kept intact as evidence.
+set -eu
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+plugin_root=$(CDPATH= cd -- "$script_dir/.." && pwd)
+repo_root=$(CDPATH= cd -- "$plugin_root/../.." && pwd)
+
+kernel=$(uname -s 2>/dev/null || printf unknown)
+if [ "$kernel" != Darwin ]; then
+  printf 'build-mcpb targets macOS universal binaries and must run on Darwin (got %s).\n' "$kernel" >&2
+  exit 64
+fi
+
+for tool in pnpm cargo rustup lipo codesign npx python3; do
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    printf '%s not found: it is required to build the MCPB bundle.\n' "$tool" >&2
+    exit 69
+  fi
+done
+
+# --- Widgets: build and embed into the crate (same steps as build-runtime).
+cd "$repo_root/widgets"
+if [ -f node_modules/.modules.yaml ] && [ ! pnpm-lock.yaml -nt node_modules/.modules.yaml ]; then
+  printf 'widgets: node_modules up to date with pnpm-lock.yaml, skipping pnpm install.\n'
+else
+  pnpm install --frozen-lockfile
+fi
+pnpm build
+mkdir -p "$repo_root/crates/openbaud/src/mcp/ui"
+cp dist/port-picker.html dist/viewer.html "$repo_root/crates/openbaud/src/mcp/ui/"
+
+# --- Rust: compile release for both macOS architectures with remapped paths.
+arm_target=aarch64-apple-darwin
+x86_target=x86_64-apple-darwin
+rustup target add "$arm_target" "$x86_target"
+
+cargo_home=${CARGO_HOME:-$(CDPATH= cd -- "$(dirname -- "$(command -v cargo)")/.." && pwd)}
+rust_sysroot=$(rustc --print sysroot)
+remap_flags="--remap-path-prefix=$repo_root=/workspace/openbaud --remap-path-prefix=$cargo_home=/cargo-home --remap-path-prefix=$rust_sysroot=/rust-toolchain"
+if [ -n "${RUSTFLAGS:-}" ]; then
+  export RUSTFLAGS="$RUSTFLAGS $remap_flags"
+else
+  export RUSTFLAGS="$remap_flags"
+fi
+
+cd "$repo_root"
+cargo build --locked --release --package openbaud --target "$arm_target"
+cargo build --locked --release --package openbaud --target "$x86_target"
+
+# --- Bundle staging: universal binary via lipo, then codesign.
+version=$(cargo metadata --no-deps --format-version 1 | python3 -c '
+import json, sys
+metadata = json.load(sys.stdin)
+print(next(p["version"] for p in metadata["packages"] if p["name"] == "openbaud"))
+')
+
+bundle_dir="$repo_root/target/mcpb/bundle"
+rm -rf "$bundle_dir"
+mkdir -p "$bundle_dir/server"
+universal="$bundle_dir/server/openbaud"
+lipo -create \
+  "target/$arm_target/release/openbaud" \
+  "target/$x86_target/release/openbaud" \
+  -output "$universal"
+chmod 0755 "$universal"
+
+signing_identity=${OPENBAUD_CODESIGN_IDENTITY:--}
+if [ "$signing_identity" = "-" ]; then
+  codesign --force --sign - "$universal"
+else
+  codesign --force --options runtime --timestamp --sign "$signing_identity" "$universal"
+fi
+codesign --verify --strict --verbose=2 "$universal"
+
+archs=$(lipo -archs "$universal")
+printf 'lipo -archs: %s\n' "$archs"
+case "$archs" in
+  *arm64*) : ;;
+  *)
+    printf 'Universal binary is missing the arm64 slice (got: %s).\n' "$archs" >&2
+    exit 70
+    ;;
+esac
+case "$archs" in
+  *x86_64*) : ;;
+  *)
+    printf 'Universal binary is missing the x86_64 slice (got: %s).\n' "$archs" >&2
+    exit 70
+    ;;
+esac
+
+"$universal" --version
+if arch -x86_64 /usr/bin/true 2>/dev/null; then
+  arch -x86_64 "$universal" --version
+else
+  printf 'SKIPPED: x86_64 slice smoke test — Rosetta 2 is not available on this host.\n' >&2
+fi
+
+# --- Manifest: generated fresh each build, version sourced from cargo metadata.
+cat > "$bundle_dir/manifest.json" <<EOF
+{
+  "manifest_version": "0.3",
+  "name": "openbaud",
+  "display_name": "OpenBaud",
+  "version": "$version",
+  "description": "Structured, audited serial-port access for AI agents, with a reusable device knowledge format.",
+  "long_description": "OpenBaud is a serial-port capability layer for coding agents. It exposes MCP tools to discover and open serial ports, send and capture traffic, run typed device commands and workflows, and diagnose framing issues — every write is appended to an audit log. Device knowledge (profiles, commands, workflows, notes) accumulates as YAML in a workspace directory so what an agent learns about a device is kept and reused across sessions.",
+  "author": { "name": "zhuwenq" },
+  "server": {
+    "type": "binary",
+    "entry_point": "server/openbaud",
+    "mcp_config": {
+      "command": "\${__dirname}/server/openbaud",
+      "args": ["mcp"],
+      "env": { "OPENBAUD_WORKSPACE": "\${user_config.workspace}" }
+    }
+  },
+  "user_config": {
+    "workspace": {
+      "type": "directory",
+      "title": "Workspace directory",
+      "description": "Directory where OpenBaud stores device knowledge (devices/), captures, and the audit log. Created if it does not exist.",
+      "default": "\${HOME}/openbaud",
+      "required": true
+    }
+  },
+  "keywords": ["serial", "uart", "embedded", "hardware", "device", "mcp"],
+  "license": "MIT",
+  "compatibility": { "platforms": ["darwin"] }
+}
+EOF
+
+# --- Validate and pack.
+npx -y @anthropic-ai/mcpb@2.1.2 validate "$bundle_dir/manifest.json"
+
+dist_dir="$plugin_root/dist"
+mkdir -p "$dist_dir"
+artifact="$dist_dir/openbaud-$version.mcpb"
+npx -y @anthropic-ai/mcpb@2.1.2 pack "$bundle_dir" "$artifact"
+
+python3 - "$artifact" <<'PY'
+import hashlib
+import pathlib
+import sys
+
+bundle = pathlib.Path(sys.argv[1])
+checksum = hashlib.sha256(bundle.read_bytes()).hexdigest()
+bundle.with_name(bundle.name + ".sha256").write_text(
+    f"{checksum}  {bundle.name}\n"
+)
+PY
+printf 'MCPB bundle: %s\n' "$artifact"
