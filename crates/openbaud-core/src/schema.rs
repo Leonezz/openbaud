@@ -49,8 +49,11 @@ its data must be a record-array field of response.parse.fields, and every channe
 so a device keeps its own field names and nothing is ever inferred from naming; \
 kind: polar requires both angle and radius (intensity optional), \
 and a channel whose field declares a unit of the wrong kind (an angle channel on a length field, or the reverse) is rejected; \
-polar is the only kind a command YAML may declare — the timeline / diagnostics / capture kinds are \
-produced by tools (session_timeline / diagnose_frame / capture_frames) and are rejected here; \
+kind: heatmap requires data to name a scalar array parse field plus rows and cols with rows x cols >= 1 \
+(cells fill the grid row-major, units ride on the data field); \
+polar and heatmap are the only kinds a command YAML may declare — the timeline / diagnostics / capture kinds are \
+produced by tools (session_timeline / diagnose_frame / capture_frames), the scope kind is declared by the \
+live-stream descriptor an agent passes to show_result, and all of them are rejected here; \
 a command with no view is simply never charted.";
 
 const WORKFLOW_RULES: &str = "Semantic rules beyond this schema: \
@@ -235,7 +238,7 @@ mod tests {
         // New validate/array/split/bits vocabulary is present.
         for key in [
             "range", "encoding", "ascii_hex", "count", "stride", "elements", "split", "bits",
-            "offset", "lsb", "width",
+            "offset", "lsb", "width", "heatmap", "scope", "rows", "cols",
         ] {
             assert!(text.contains(key), "schema misses {key:?}");
         }
@@ -258,6 +261,13 @@ mod tests {
         for tool in ["session_timeline", "diagnose_frame", "capture_frames"] {
             assert!(desc.contains(tool), "rules miss producing tool {tool:?}");
         }
+        for needle in ["heatmap", "rows", "cols", "scope", "stream"] {
+            assert!(desc.contains(needle), "rules miss view vocabulary {needle:?}");
+        }
+        assert!(
+            desc.contains("polar and heatmap"),
+            "rules must name polar and heatmap as the declarable kinds: {desc}"
+        );
         assert!(
             desc.contains("control character"),
             "rules must state that text-frame string params reject control characters: {desc}"

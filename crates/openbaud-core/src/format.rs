@@ -534,7 +534,8 @@ pub enum Encoding {
 #[serde(deny_unknown_fields)]
 pub struct ViewSpec {
     pub kind: ViewKind,
-    /// Parse field holding the record array the channels index into.
+    /// polar: parse field holding the record array the channels index into.
+    /// heatmap: scalar array parse field whose values fill the grid row-major.
     pub data: String,
     /// polar: element field carrying the angle. Required for polar.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -545,14 +546,25 @@ pub struct ViewSpec {
     /// polar: element field shading each point. Optional.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub intensity: Option<String>,
+    /// heatmap: number of grid rows. Required for heatmap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows: Option<u32>,
+    /// heatmap: number of grid columns. Required for heatmap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cols: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ViewKind {
-    /// Angular scan drawn on polar axes. The only kind a command YAML may
-    /// declare.
+    /// Angular scan drawn on polar axes. Declarable in command YAML.
     Polar,
+    /// Fixed rows x cols grid filled row-major from a scalar array field.
+    /// Declarable in command YAML.
+    Heatmap,
+    /// Live multi-series plot over a stream session; declared only by the
+    /// stream descriptor an agent passes to `show_result`, never in YAML.
+    Scope,
     /// Session timeline produced by the `session_timeline` tool.
     Timeline,
     /// Frame diagnosis produced by the `diagnose_frame` tool.
@@ -566,6 +578,8 @@ impl ViewKind {
     pub fn name(&self) -> &'static str {
         match self {
             Self::Polar => "polar",
+            Self::Heatmap => "heatmap",
+            Self::Scope => "scope",
             Self::Timeline => "timeline",
             Self::Diagnostics => "diagnostics",
             Self::Capture => "capture",
@@ -892,17 +906,25 @@ fn unit_class(unit: &str) -> Option<&'static str> {
 /// must name a real field, so a renaming breaks the build instead of silently
 /// dropping the chart.
 fn check_view_spec(view: &ViewSpec, parse: Option<&ParseSpec>, path: &str) -> crate::Result<()> {
-    // Kind gate first, so a tool-produced kind gets this message and not a
+    // Kind gate first, so a non-declarable kind gets this message and not a
     // complaint about its channels.
     match view.kind {
-        ViewKind::Polar => {}
+        ViewKind::Polar | ViewKind::Heatmap => {}
+        ViewKind::Scope => {
+            return Err(ferr(
+                path,
+                "response.view.kind scope: this view kind is declared by a live-stream \
+                 descriptor (the stream + view object an agent passes to show_result), \
+                 not in command YAML — polar and heatmap are the only declarable kinds",
+            ));
+        }
         ViewKind::Timeline | ViewKind::Diagnostics | ViewKind::Capture => {
             return Err(ferr(
                 path,
                 format!(
                     "response.view.kind {}: this view kind is produced by tools \
                      (session_timeline / diagnose_frame / capture_frames), not declared in \
-                     command YAML — polar is the only declarable kind",
+                     command YAML — polar and heatmap are the only declarable kinds",
                     view.kind.name()
                 ),
             ));
@@ -914,6 +936,9 @@ fn check_view_spec(view: &ViewSpec, parse: Option<&ParseSpec>, path: &str) -> cr
     let data = fields.get(&view.data).ok_or_else(|| {
         ferr(path, format!("response.view.data {:?} is not a parse field", view.data))
     })?;
+    if view.kind == ViewKind::Heatmap {
+        return check_heatmap_view(view, data, path);
+    }
     let elements = data.elements.as_ref().ok_or_else(|| {
         ferr(
             path,
@@ -951,8 +976,15 @@ fn check_view_spec(view: &ViewSpec, parse: Option<&ParseSpec>, path: &str) -> cr
         Ok(())
     };
 
-    // Only polar reaches this point (the kind gate above returned for the
-    // tool-produced kinds).
+    // Only polar reaches this point (heatmap and the non-declarable kinds
+    // returned above).
+    if view.rows.is_some() || view.cols.is_some() {
+        return Err(ferr(
+            path,
+            "response.view.rows/cols are heatmap grid dimensions and do not apply to \
+             kind polar",
+        ));
+    }
     if view.angle.is_none() || view.radius.is_none() {
         return Err(ferr(
             path,
@@ -972,6 +1004,60 @@ fn check_view_spec(view: &ViewSpec, parse: Option<&ParseSpec>, path: &str) -> cr
                 ),
             ));
         }
+    }
+    Ok(())
+}
+
+/// Heatmap-specific view checks: the grid is filled row-major from a scalar
+/// array field, so `data` must be an array of single values and the declared
+/// grid must hold at least one cell. Units ride on the data field itself.
+fn check_heatmap_view(view: &ViewSpec, data: &FieldSpec, path: &str) -> crate::Result<()> {
+    for (name, set) in [
+        ("angle", view.angle.is_some()),
+        ("radius", view.radius.is_some()),
+        ("intensity", view.intensity.is_some()),
+    ] {
+        if set {
+            return Err(ferr(
+                path,
+                format!(
+                    "response.view.{name} is a polar channel and does not apply to \
+                     kind heatmap"
+                ),
+            ));
+        }
+    }
+    if data.count.is_none() {
+        return Err(ferr(
+            path,
+            format!(
+                "response.view.data {:?} is not an array field — a heatmap draws the \
+                 cells of an array parse field (one with `count`)",
+                view.data
+            ),
+        ));
+    }
+    if data.elements.is_some() {
+        return Err(ferr(
+            path,
+            format!(
+                "response.view.data {:?} is a record array — heatmap cells are single \
+                 values, so data must be a scalar array field",
+                view.data
+            ),
+        ));
+    }
+    let (Some(rows), Some(cols)) = (view.rows, view.cols) else {
+        return Err(ferr(
+            path,
+            "response.view kind heatmap requires both rows and cols grid dimensions",
+        ));
+    };
+    if rows == 0 || cols == 0 {
+        return Err(ferr(
+            path,
+            format!("response.view kind heatmap requires rows x cols >= 1, got {rows} x {cols}"),
+        ));
     }
     Ok(())
 }
@@ -1422,15 +1508,114 @@ response:
         assert_eq!(serde_json::to_string(&ViewKind::Timeline).unwrap(), "\"timeline\"");
         assert_eq!(serde_json::to_string(&ViewKind::Diagnostics).unwrap(), "\"diagnostics\"");
         assert_eq!(serde_json::to_string(&ViewKind::Capture).unwrap(), "\"capture\"");
+        assert_eq!(serde_json::to_string(&ViewKind::Scope).unwrap(), "\"scope\"");
+        assert_eq!(serde_json::to_string(&ViewKind::Heatmap).unwrap(), "\"heatmap\"");
         assert_eq!(serde_json::from_str::<ViewKind>("\"polar\"").unwrap(), ViewKind::Polar);
+        assert_eq!(serde_json::from_str::<ViewKind>("\"scope\"").unwrap(), ViewKind::Scope);
         for (kind, name) in [
             (ViewKind::Polar, "polar"),
             (ViewKind::Timeline, "timeline"),
             (ViewKind::Diagnostics, "diagnostics"),
             (ViewKind::Capture, "capture"),
+            (ViewKind::Scope, "scope"),
+            (ViewKind::Heatmap, "heatmap"),
         ] {
             assert_eq!(kind.name(), name);
         }
+    }
+
+    const HEATMAP_COMMAND: &str = r#"
+schema: openbaud/command@v0
+name: read_grid
+frame: { hex: "A5 30" }
+response:
+  match: { length: 66 }
+  parse:
+    fields:
+      cell_count: { at: 0, type: u8 }
+      cells: { at: 2, type: u8, count: 64, scale: 0.5, unit: C }
+      points:
+        at: 2
+        count: 3
+        stride: 2
+        elements:
+          v: { at: 0, type: u8 }
+  view: { kind: heatmap, data: cells, rows: 8, cols: 8 }
+"#;
+
+    #[test]
+    fn heatmap_view_declares_a_grid_over_a_scalar_array() {
+        let cmd = parse_command(HEATMAP_COMMAND, "grid.yaml").unwrap();
+        let view = cmd.response.as_ref().unwrap().view.as_ref().expect("view parsed");
+        assert_eq!(view.kind, ViewKind::Heatmap);
+        assert_eq!(view.data, "cells");
+        assert_eq!(view.rows, Some(8));
+        assert_eq!(view.cols, Some(8));
+    }
+
+    #[test]
+    fn heatmap_units_flow_through_the_units_mechanism() {
+        let cmd = parse_command(HEATMAP_COMMAND, "grid.yaml").unwrap();
+        let units = crate::exec::units(&cmd);
+        assert_eq!(units.get("cells").and_then(|v| v.as_str()), Some("C"));
+    }
+
+    #[test]
+    fn heatmap_data_must_name_an_array_parse_field() {
+        // The field must exist ...
+        let bad = HEATMAP_COMMAND.replace("data: cells", "data: nope");
+        let err = parse_command(&bad, "grid.yaml").unwrap_err().to_string();
+        assert!(err.contains("nope"), "got: {err}");
+
+        // ... must be an array, not a scalar ...
+        let bad = HEATMAP_COMMAND.replace("data: cells", "data: cell_count");
+        let err = parse_command(&bad, "grid.yaml").unwrap_err().to_string();
+        assert!(err.contains("cell_count") && err.contains("not an array"), "got: {err}");
+
+        // ... and a record array has no single value per cell.
+        let bad = HEATMAP_COMMAND.replace("data: cells", "data: points");
+        let err = parse_command(&bad, "grid.yaml").unwrap_err().to_string();
+        assert!(err.contains("record array"), "got: {err}");
+    }
+
+    #[test]
+    fn heatmap_requires_a_positive_grid() {
+        for (from, to, needle) in [
+            ("rows: 8, cols: 8", "rows: 0, cols: 8", ">= 1"),
+            ("rows: 8, cols: 8", "rows: 8, cols: 0", ">= 1"),
+            ("rows: 8, cols: 8", "rows: 8", "both rows and cols"),
+            ("rows: 8, cols: 8", "cols: 8", "both rows and cols"),
+        ] {
+            let bad = HEATMAP_COMMAND.replace(from, to);
+            assert_ne!(bad, HEATMAP_COMMAND, "replacement {from:?} did not apply");
+            let err = parse_command(&bad, "grid.yaml").unwrap_err().to_string();
+            assert!(err.contains(needle), "expected {needle:?} in: {err}");
+        }
+    }
+
+    #[test]
+    fn heatmap_rejects_polar_channels_and_polar_rejects_grid_dims() {
+        let bad =
+            HEATMAP_COMMAND.replace("rows: 8, cols: 8", "rows: 8, cols: 8, angle: cells");
+        let err = parse_command(&bad, "grid.yaml").unwrap_err().to_string();
+        assert!(err.contains("angle") && err.contains("heatmap"), "got: {err}");
+
+        let bad = SCAN_COMMAND.replace("intensity: quality", "intensity: quality, rows: 4");
+        let err = parse_command(&bad, "scan.yaml").unwrap_err().to_string();
+        assert!(err.contains("rows") && err.contains("polar"), "got: {err}");
+    }
+
+    #[test]
+    fn scope_view_kind_is_rejected_in_yaml_pointing_at_stream_descriptors() {
+        let bad = SCAN_COMMAND.replace("kind: polar", "kind: scope");
+        let err = parse_command(&bad, "scan.yaml").unwrap_err().to_string();
+        assert!(err.contains("scope"), "error must name the rejected kind: {err}");
+        assert!(err.contains("stream"), "error must point at the stream descriptor: {err}");
+        assert!(err.contains("show_result"), "error must name the declaring surface: {err}");
+        assert!(
+            err.contains("polar") && err.contains("heatmap"),
+            "error must list the declarable kinds: {err}"
+        );
     }
 
     #[test]
