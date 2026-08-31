@@ -25,6 +25,7 @@ import type { OpenbaudSummary } from '../../mcp/useWidget'
 import type { PolarPoint } from '../../render/polar'
 import { readCapture, type CaptureData } from './capture'
 import { readDiagnostics, type DiagnosticsData } from './diagnostics'
+import { readStreamDescriptor, type StreamDescriptor } from './stream'
 import { readTimeline, type TimelineData } from './timeline'
 
 export type JsonRecord = Record<string, unknown>
@@ -102,6 +103,8 @@ export type DispatchedView =
   | { readonly kind: 'timeline'; readonly timeline: TimelineData }
   | { readonly kind: 'diagnostics'; readonly diagnostics: DiagnosticsData }
   | { readonly kind: 'capture'; readonly capture: CaptureData }
+  /** Live stream descriptor: the widget opens its own stream_poll subscription. */
+  | { readonly kind: 'stream'; readonly descriptor: StreamDescriptor }
   | { readonly kind: 'generic' }
   | Invalid
 
@@ -134,7 +137,7 @@ function readEncoding(declared: unknown, label: string): PolarEncoding | Invalid
   }
   if (declared.kind !== 'polar') {
     return invalid(
-      `${label}.kind ${describe(declared.kind)} is not supported — this viewer renders "polar", "timeline", "diagnostics" and "capture"`,
+      `${label}.kind ${describe(declared.kind)} is not supported — this viewer renders "polar", "timeline", "diagnostics" and "capture" from saved results, plus "scope" and "heatmap" from a live stream descriptor`,
     )
   }
   const data = nameOf(declared.data)
@@ -281,6 +284,18 @@ export function isReplayResult(structured: OpenbaudSummary): boolean {
 export function dispatchResult(structured: OpenbaudSummary, override?: unknown): DispatchedView {
   const overridden = override !== undefined && override !== null
   const declared = overridden ? override : structured.view
+  // Live branch: a stream descriptor is not a saved result — data.stream names
+  // the session/parse to subscribe to and view must be a live kind. Any
+  // structural miss is a named invalid reason from readStreamDescriptor.
+  if (structured.stream !== undefined) {
+    const read = readStreamDescriptor(structured, 'data')
+    return read.kind === 'stream' ? { kind: 'stream', descriptor: read.descriptor } : read
+  }
+  if (isRecord(declared) && (declared.kind === 'scope' || declared.kind === 'heatmap')) {
+    return invalid(
+      `view.kind ${JSON.stringify(declared.kind)} is live-only — it renders a stream descriptor ({ stream: { session_id, parse }, view }), and this payload carries no "stream" object`,
+    )
+  }
   if (declared === undefined || declared === null) return { kind: 'generic' }
   const label = overridden ? 'encoding' : 'view'
 

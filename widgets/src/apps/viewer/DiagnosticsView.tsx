@@ -270,7 +270,7 @@ export function DiagnosticsView({ widget, diagnostics, resultRef }: DiagnosticsV
                 : 'no checksum match or no offset decodes — nothing to adopt'}
             </span>
           )}
-          {send.kind === 'sent' && <Receipt>{send.summary} sent to the agent</Receipt>}
+          {send.kind === 'sent' && <Receipt>{send.summary} accepted by the host</Receipt>}
           <span className="tl-note">row click: highlight in hex · local only, no tool calls</span>
         </div>
         {send.kind === 'failed' && (

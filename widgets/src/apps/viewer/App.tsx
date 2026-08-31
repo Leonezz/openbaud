@@ -8,7 +8,9 @@ import { CaptureView } from './CaptureView'
 import { DiagnosticsView } from './DiagnosticsView'
 import { isRecord } from './dispatch'
 import { GenericView } from './GenericView'
+import { HeatmapView } from './HeatmapView'
 import { PolarView } from './PolarView'
+import { ScopeView } from './ScopeView'
 import { TimelineView } from './TimelineView'
 import {
   INITIAL_VIEWER,
@@ -171,5 +173,17 @@ export function ViewerApp() {
       )
     case 'capture':
       return <CaptureView widget={widget} capture={state.capture} resultRef={state.ref} />
+    case 'stream':
+      // Live branch: the view opens its own per-consumer stream_poll
+      // subscription — it never shares (or steals from) the agent's.
+      return state.descriptor.view.kind === 'scope' ? (
+        <ScopeView widget={widget} stream={state.descriptor.stream} spec={state.descriptor.view} />
+      ) : (
+        <HeatmapView
+          widget={widget}
+          stream={state.descriptor.stream}
+          spec={state.descriptor.view}
+        />
+      )
   }
 }

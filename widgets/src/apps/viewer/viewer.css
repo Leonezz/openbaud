@@ -114,6 +114,38 @@ canvas.radar { position: absolute; inset: 0; width: 100%; height: 100%; display:
   color: var(--muted); text-transform: uppercase;
 }
 
+/* ===== W7 live scope + heatmap (stream_poll branch, tokens only) ===== */
+
+.ob-scope--live { padding: 26px 0 24px; }
+.scope-plot { width: 100%; position: relative; }
+.ob-scope--live .u-cursor-x { border-right-color: var(--scope-faint); }
+
+.scope-series i {
+  display: inline-block; width: 8px; height: 3px; border-radius: 1px;
+  margin: 0 4px 1px 0; font-style: normal;
+}
+
+/* Stream status strip: LED + text pairs; loss and parse errors never hide. */
+.stream-phase, .stream-loss { display: inline-flex; align-items: center; gap: 6px; }
+.stream-loss b, .stream-loss span { color: var(--danger); }
+.stream-warn, .stream-warn b { color: var(--warn); }
+
+.ob-scope--heatmap { padding: 26px 12px 24px; }
+.heat-wrap { width: 100%; }
+.heat-canvas { display: block; }
+.heat-empty {
+  height: 280px; display: grid; place-items: center;
+  font: 11px var(--font-mono); color: var(--scope-muted);
+}
+/* Legend gradient uses the exact ramp tokens the cells interpolate. */
+.heat-legend .heat-ramp {
+  display: inline-block; width: 72px; height: 8px; border-radius: 2px;
+  margin: 0 6px 0 0; vertical-align: middle;
+  border: 1px solid var(--scope-line);
+  background: linear-gradient(to right, var(--scope-bg), var(--s1));
+}
+.heat-legend span { display: inline-flex; align-items: center; }
+
 /* ===== shared chart tooltip (render/tooltip.ts host, tokens only) ===== */
 
 /* Tooltip hosts must be positioned: the scope is already relative; the uPlot

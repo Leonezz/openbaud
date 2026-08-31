@@ -370,7 +370,7 @@ export function TimelineView({ widget, timeline, resultRef }: TimelineViewProps)
           >
             {send.kind === 'sending' ? 'Sending quiet window' : 'Send quiet window to agent'}
           </Btn>
-          {send.kind === 'sent' && <Receipt>quiet window ({send.gapMs} ms) sent to the agent</Receipt>}
+          {send.kind === 'sent' && <Receipt>quiet window ({send.gapMs} ms) accepted by the host</Receipt>}
           <span className="tl-note">click: set A/B · drag: zoom · double-click: reset · scroll: pan</span>
         </div>
         {send.kind === 'failed' && (

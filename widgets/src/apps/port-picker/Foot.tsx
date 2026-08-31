@@ -21,15 +21,18 @@ function CandidateCount({ count }: { count: number }) {
 function SendStatus({ send }: { send: SendState }) {
   switch (send.kind) {
     case 'idle':
-      return <span>Your pick goes to the agent — it decides when to open the port.</span>
+      return <span>Your pick is handed to the host for the agent — the agent decides when to open the port.</span>
     case 'sending':
-      return <span>Sending the selection to the agent …</span>
+      return <span>Handing the selection to the host …</span>
     case 'failed':
       return <span>Selection was not sent — see the error above.</span>
     case 'sent':
+      // "Accepted by the host", not "sent to the agent": the widget only ever
+      // observes the host acknowledging ui/update-model-context — whether the
+      // content reaches the agent is host behavior it cannot see (spike S3).
       return (
         <>
-          <Receipt>Sent to the agent</Receipt>
+          <Receipt>Accepted by the host</Receipt>
           <Chip>{send.path}</Chip>
         </>
       )

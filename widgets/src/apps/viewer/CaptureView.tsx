@@ -333,7 +333,7 @@ export function CaptureView({ widget, capture, resultRef }: CaptureViewProps) {
 
             <div className="diag-actions">
               {send.kind === 'sent' && (
-                <Receipt>frame seq {send.seq} sent to the agent</Receipt>
+                <Receipt>frame seq {send.seq} accepted by the host</Receipt>
               )}
               <span className="tl-note">row click: select frame + send to agent</span>
             </div>

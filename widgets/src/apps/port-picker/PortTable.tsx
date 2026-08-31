@@ -8,7 +8,7 @@ export interface PortTableProps {
   /** Alias rows are listed on their own once the toggle is on. */
   showAliases: boolean
   selectedPath: string | null
-  /** Path already handed to the agent — its row keeps the ok LED. */
+  /** Path already handed to the host — its row keeps the ok LED. */
   sentPath: string | null
   onSelect: (path: string) => void
 }

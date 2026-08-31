@@ -21,6 +21,13 @@ import {
 } from './fixtures'
 import { captureEnvelope, captureTextForUri } from './capture-fixture'
 import { diagnosticsResult } from './diagnostics-fixture'
+import {
+  badStreamDescriptor,
+  handleStreamPoll,
+  heatmapStreamDescriptor,
+  scopeStreamDescriptor,
+  type StreamScenarioFlags,
+} from './stream-fixture'
 import { timelineEnvelope, timelineTextForUri } from './timeline-fixture'
 
 type Theme = 'light' | 'dark'
@@ -97,6 +104,15 @@ function hostContext(): JsonObject {
   }
 }
 
+/** Stream behavior switches derive from the selected scenario. */
+function streamFlags(): StreamScenarioFlags {
+  return {
+    dropped: scenarioSel.value === 'show_result_scope_dropped',
+    parseErrors: scenarioSel.value === 'show_result_scope_parse_error',
+    flaky: scenarioSel.value === 'show_result_scope_flaky',
+  }
+}
+
 function handleToolsCall(id: number | string, params: JsonObject): void {
   const name = typeof params.name === 'string' ? params.name : undefined
   switch (name) {
@@ -106,6 +122,17 @@ function handleToolsCall(id: number | string, params: JsonObject): void {
       break
     case 'ask_port':
       respond(id, wrapToolResult(ASK_PORT_RESULT))
+      break
+    // The live views open their own per-consumer subscription over the bridge.
+    case 'stream_poll':
+      try {
+        respond(
+          id,
+          wrapToolResult(handleStreamPoll((params.arguments ?? {}) as JsonObject, streamFlags())),
+        )
+      } catch (error) {
+        respond(id, wrapToolError(error instanceof Error ? error.message : String(error)))
+      }
       break
     // No case for `open` or the other data tools (run_command, read,
     // request…): under the 2026-08 contract only the agent calls those.
@@ -202,6 +229,17 @@ const INLINE_SCENARIOS: Readonly<
   show_result_replay: { data: replayRadarResult, envelope: SHOW_RESULT_INLINE },
   // diagnose_frame payload: real OBP frame with its CRC rewritten to ccitt.
   show_result_diagnostics: { data: () => diagnosticsResult(), envelope: SHOW_RESULT_INLINE },
+  // Live stream descriptors: the widget subscribes via stream_poll itself.
+  show_result_scope: { data: () => scopeStreamDescriptor(), envelope: SHOW_RESULT_INLINE },
+  show_result_scope_dropped: { data: () => scopeStreamDescriptor(), envelope: SHOW_RESULT_INLINE },
+  show_result_scope_parse_error: {
+    data: () => scopeStreamDescriptor(),
+    envelope: SHOW_RESULT_INLINE,
+  },
+  show_result_scope_flaky: { data: () => scopeStreamDescriptor(), envelope: SHOW_RESULT_INLINE },
+  show_result_heatmap: { data: () => heatmapStreamDescriptor(), envelope: SHOW_RESULT_INLINE },
+  // A live descriptor the viewer must reject with a named reason.
+  show_result_stream_bad: { data: () => badStreamDescriptor(), envelope: SHOW_RESULT_INLINE },
 }
 
 /** show_result for scan `index`: the envelope only — the payload is a resource. */

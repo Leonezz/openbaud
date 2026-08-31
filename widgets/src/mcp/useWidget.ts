@@ -63,7 +63,13 @@ export interface WidgetHandle {
   callTool: (name: string, args?: Record<string, unknown>) => Promise<ToolResult>
   /** MCP resources/read — how a widget pulls a full result the tool only referenced. */
   readResource: (uri: string) => Promise<ReadResourceResult>
-  /** ui/update-model-context — how a widget hands a user choice back to the agent. */
+  /**
+   * ui/update-model-context — hands a user choice to the host for the agent.
+   * A resolved promise only means the host accepted the request; whether the
+   * content ever reaches the agent is host behavior the widget cannot observe
+   * (spike S3: one host acks and drops). UI copy must claim host acceptance,
+   * never agent delivery.
+   */
   updateModelContext: (params: ModelContextUpdate) => Promise<void>
   requestDisplayMode: (mode: McpUiDisplayMode) => Promise<McpUiDisplayMode>
 }

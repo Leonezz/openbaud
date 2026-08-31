@@ -123,7 +123,8 @@ export function PortPickerApp() {
     }
   }, [callTool, acceptCandidates, fail, meta.device])
 
-  // The choice is pushed to the agent's context; the agent opens the port.
+  // The choice is pushed to the host for the agent's context; the agent opens
+  // the port. Delivery past the host is not observable from here (spike S3).
   const sendSelection = useCallback(
     async (port: EnrichedPort): Promise<void> => {
       setSend({ kind: 'sending', path: port.path })
