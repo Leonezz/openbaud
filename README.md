@@ -88,7 +88,7 @@ not yet Apple-notarized.
 To pin the current release rather than follow the default branch:
 
 ```sh
-codex plugin marketplace add Leonezz/openbaud --ref v0.1.5
+codex plugin marketplace add Leonezz/openbaud --ref v0.2.0
 codex plugin add openbaud@openbaud-marketplace
 ```
 

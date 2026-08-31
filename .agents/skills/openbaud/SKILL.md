@@ -122,10 +122,12 @@ them when the user is the audience — not as a habit.
   and not for a two-field answer you can simply say.
 - `ask_port` asks which port to use when several could plausibly be the device
   and the choice is genuinely the user's. It touches no hardware: the answer
-  arrives in your context and **you** then call `open`. For your own discovery
-  use `list_ports`, which already reports which workspace devices each port
-  matches, which ports a session is holding, and which are `/dev/tty.*` twins
-  of a canonical `/dev/cu.*` entry.
+  arrives in your context and **you** then call `open`. Some hosts render the
+  picker but never deliver the user's selection back to you — if no selection
+  arrives, ask the user directly which port they picked instead of guessing.
+  For your own discovery use `list_ports`, which already reports which
+  workspace devices each port matches, which ports a session is holding, and
+  which are `/dev/tty.*` twins of a canonical `/dev/cu.*` entry.
 
 On hosts without rendering both degrade to plain text — a candidate list you
 relay yourself, a pointer you can read from disk. Nothing breaks; the user just
@@ -180,7 +182,15 @@ touch the wire and are yours to call freely:
   120 s are swept by a later `stream_poll` call against the session (there is
   no background sweeper), at most 8 exist per session, and every result folds
   in the session's live counters as `stats`. It never waits — poll again when
-  you expect more.
+  you expect more. Pass `parse: {device, command}` when *creating* the
+  subscription (never on a follow-up poll — that is a loud error) to have
+  every frame parsed server-side with that workspace command's
+  `response.parse`: each frame then carries `parsed` (the field values) or a
+  per-frame `parse_error` (one bad frame never stops the stream), parsed once
+  at arrival so redelivery repeats the identical outcome; every result echoes
+  `parse: {device, command}` plus the command's `units` (same semantics as
+  `run_command`), and an unknown device or command — or a command without a
+  `response.parse` block — fails creation loudly.
 
 `session_timeline`, `capture_frames` and `diagnose_frame` results carry their
 own `view` declaration (`timeline`, `capture`, `diagnostics`) — hand the
