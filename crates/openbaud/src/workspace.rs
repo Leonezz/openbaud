@@ -7,18 +7,41 @@ use openbaud_core::format::{parse_command, parse_profile, parse_workflow, Comman
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-/// Resolve the task workspace when an installed Codex plugin starts OpenBaud.
+/// Resolve the task workspace when a host starts `openbaud mcp`.
 ///
-/// Codex resolves a plugin MCP's relative command by starting it in the plugin
-/// root. For a native executable, the inherited `PWD` still carries the task's
-/// original working directory. Only trust that value when the actual cwd is
-/// recognizably a plugin root; ordinary CLI launches continue to use cwd.
+/// Priority:
+/// 1. `OPENBAUD_WORKSPACE` — for hosts whose launch cwd is meaningless or
+///    unwritable (an MCPB bundle under Claude Desktop starts at `/`). Must be
+///    an absolute path; created if missing, both loudly on failure.
+/// 2. Codex plugin heuristic: Codex resolves a plugin MCP's relative command
+///    by starting it in the plugin root. For a native executable, the
+///    inherited `PWD` still carries the task's original working directory.
+///    Only trust that value when the actual cwd is recognizably a plugin root.
+/// 3. The current directory (ordinary CLI launches).
 pub fn resolve_mcp_workspace_root() -> anyhow::Result<PathBuf> {
+    if let Some(configured) = std::env::var_os("OPENBAUD_WORKSPACE") {
+        return workspace_root_from_env(Path::new(&configured));
+    }
     let cwd = std::env::current_dir().context("cannot determine current directory")?;
     Ok(resolve_mcp_workspace_root_from(
         &cwd,
         std::env::var_os("PWD").map(PathBuf::from).as_deref(),
     ))
+}
+
+fn workspace_root_from_env(configured: &Path) -> anyhow::Result<PathBuf> {
+    if !configured.is_absolute() {
+        bail!(
+            "OPENBAUD_WORKSPACE must be an absolute path, got {:?}",
+            configured.display()
+        );
+    }
+    std::fs::create_dir_all(configured).with_context(|| {
+        format!("cannot create OPENBAUD_WORKSPACE directory {:?}", configured.display())
+    })?;
+    configured
+        .canonicalize()
+        .with_context(|| format!("cannot resolve OPENBAUD_WORKSPACE {:?}", configured.display()))
 }
 
 fn resolve_mcp_workspace_root_from(cwd: &Path, inherited_pwd: Option<&Path>) -> PathBuf {
@@ -306,5 +329,20 @@ mod tests {
             resolve_mcp_workspace_root_from(plugin.path(), Some(Path::new("relative"))),
             plugin.path()
         );
+    }
+
+    #[test]
+    fn env_workspace_is_created_and_canonicalized() {
+        let base = tempfile::tempdir().unwrap();
+        let target = base.path().join("nested").join("ws");
+        let resolved = super::workspace_root_from_env(&target).unwrap();
+        assert!(target.is_dir(), "missing directory must be created");
+        assert_eq!(resolved, target.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn env_workspace_rejects_relative_paths_loudly() {
+        let err = super::workspace_root_from_env(Path::new("relative/ws")).unwrap_err();
+        assert!(err.to_string().contains("absolute"), "got: {err:#}");
     }
 }

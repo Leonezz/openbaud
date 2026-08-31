@@ -31,9 +31,11 @@
 
 use crate::engine::session::Session;
 use anyhow::{anyhow, bail};
+use openbaud_core::exec::parse_with_spec;
+use openbaud_core::format::ParseSpec;
 use openbaud_core::framing::{Deframer, Framing};
 use openbaud_core::hex;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::collections::{HashMap, VecDeque};
 
 /// Retention cap per subscription (risk ②): beyond this many unacknowledged
@@ -59,11 +61,30 @@ pub const DEFAULT_POLL_INLINE_BYTES: usize = 4096;
 pub const MIN_POLL_INLINE_BYTES: usize = 512;
 pub const MAX_POLL_INLINE_BYTES: usize = 262_144;
 
+/// Per-subscription parse configuration, resolved once at subscribe time
+/// (parse is a creation-time property — follow-up polls cannot change it).
+/// The spec is cloned out of the workspace command, so later YAML edits never
+/// mutate a live subscription.
+pub struct StreamParse {
+    pub device: String,
+    pub command: String,
+    pub spec: ParseSpec,
+    /// Unit labels from the command's field specs — the same semantics
+    /// `run_command` reports as its top-level `units`.
+    pub units: Map<String, Value>,
+}
+
 /// One deframed frame held for a consumer until it acknowledges delivery.
+/// `parsed` is decided once, when the frame is retained — redelivery (and an
+/// idempotent re-read after a lost response) carries the identical outcome.
 struct RetainedFrame {
     seq: u64,
     ts_ms: u64,
     bytes: Vec<u8>,
+    /// `None` on a subscription without parse; `Ok` carries the field-value
+    /// object, `Err` the per-frame reason — one bad frame never stops the
+    /// stream, and it is never silently skipped either.
+    parsed: Option<Result<Value, String>>,
 }
 
 /// One consumer's private view of the session stream: cursor, deframer and
@@ -98,10 +119,12 @@ struct Subscription {
     /// signal that `dropped_frames == 0` alone does not mean "no loss".
     dropped_chunks: u64,
     last_polled_ms: u64,
+    /// Optional per-frame parsing, fixed at subscribe time.
+    parse: Option<StreamParse>,
 }
 
 impl Subscription {
-    fn new(framing: Framing, now_ms: u64) -> Self {
+    fn new(framing: Framing, now_ms: u64, parse: Option<StreamParse>) -> Self {
         Self {
             cursor: 0,
             deframer: Deframer::new(framing),
@@ -112,6 +135,7 @@ impl Subscription {
             dropped_frames: 0,
             dropped_chunks: 0,
             last_polled_ms: now_ms,
+            parse,
         }
     }
 
@@ -163,7 +187,14 @@ impl Subscription {
     }
 
     fn retain(&mut self, ts_ms: u64, bytes: Vec<u8>) {
-        self.retained.push_back(RetainedFrame { seq: self.next_seq, ts_ms, bytes });
+        // Parse once, here, as the frame is retained — never per delivery, so
+        // ack/redelivery always carries the identical outcome. A failure is a
+        // per-frame `Err` (delivered as parse_error), never a stream abort.
+        let parsed = self
+            .parse
+            .as_ref()
+            .map(|p| parse_with_spec(&p.spec, &bytes).map_err(|e| e.to_string()));
+        self.retained.push_back(RetainedFrame { seq: self.next_seq, ts_ms, bytes, parsed });
         self.next_seq += 1;
         // Risk ②: bounded retention — a lagging consumer loses the oldest
         // frames, and the loss is counted, never silent.
@@ -218,8 +249,14 @@ impl Session {
     /// Create a subscription starting from the oldest still-buffered chunk.
     /// Sweeps idle subscriptions first (risk ③) and refuses to exceed the
     /// per-session cap. `now_ms` is a parameter (not read inside) so tests can
-    /// drive the TTL with a fabricated clock.
-    pub fn stream_subscribe(&self, now_ms: u64) -> anyhow::Result<String> {
+    /// drive the TTL with a fabricated clock. `parse` (already resolved from
+    /// the workspace by the caller) fixes per-frame parsing for the
+    /// subscription's whole lifetime.
+    pub fn stream_subscribe(
+        &self,
+        now_ms: u64,
+        parse: Option<StreamParse>,
+    ) -> anyhow::Result<String> {
         let mut set = self.subs.lock().unwrap();
         set.sweep(now_ms);
         if set.subs.len() >= MAX_SUBSCRIPTIONS_PER_SESSION {
@@ -234,7 +271,7 @@ impl Session {
         }
         set.next_id += 1;
         let id = format!("{}-sub{}", self.id, set.next_id);
-        set.subs.insert(id.clone(), Subscription::new(self.framing().clone(), now_ms));
+        set.subs.insert(id.clone(), Subscription::new(self.framing().clone(), now_ms, parse));
         Ok(id)
     }
 
@@ -307,12 +344,24 @@ impl Session {
             }
             oversized_frame = frames.is_empty() && frame_bytes > max_inline_bytes;
             page_bytes += frame_bytes;
-            frames.push(json!({
+            let mut frame = json!({
                 "seq": f.seq,
                 "ts_ms": f.ts_ms,
                 "hex": hex,
                 "text": text,
-            }));
+            });
+            // Per-frame parse outcome, decided once at retain time: success
+            // carries the field values, failure the honest per-frame reason.
+            match &f.parsed {
+                None => {}
+                Some(Ok(values)) => {
+                    frame["parsed"] = values.clone();
+                }
+                Some(Err(reason)) => {
+                    frame["parse_error"] = json!(reason);
+                }
+            }
+            frames.push(frame);
             if oversized_frame {
                 break;
             }
@@ -331,8 +380,17 @@ impl Session {
         }
         let (next_seq, dropped_frames, dropped_chunks) =
             (sub.next_seq, sub.dropped_frames, sub.dropped_chunks);
+        // Echo whether parse is in effect (and the command's unit labels, same
+        // semantics as run_command's `units`) — only on parse subscriptions,
+        // so a plain subscription's result shape is byte-for-byte unchanged.
+        let parse_echo = sub.parse.as_ref().map(|p| {
+            (
+                json!({ "device": p.device, "command": p.command }),
+                (!p.units.is_empty()).then(|| Value::Object(p.units.clone())),
+            )
+        });
         drop(set);
-        Ok(json!({
+        let mut result = json!({
             "subscription_id": sub_id,
             "session_id": self.id,
             "frames": frames,
@@ -342,7 +400,14 @@ impl Session {
             "dropped_frames": dropped_frames,
             "dropped_chunks": dropped_chunks,
             "stats": self.stream_stats(),
-        }))
+        });
+        if let Some((echo, units)) = parse_echo {
+            result["parse"] = echo;
+            if let Some(units) = units {
+                result["units"] = units;
+            }
+        }
+        Ok(result)
     }
 
     /// Explicitly release one subscription. Closing an unknown (or already

@@ -2009,7 +2009,7 @@ async fn stream_poll_surfaces_dead_port_once_drained() {
 
     // Buffered frames are still delivered after death — same rule as read.
     let now = openbaud::engine::now_ms();
-    let sub = session.stream_subscribe(now).unwrap();
+    let sub = session.stream_subscribe(now, None).unwrap();
     let result = session.stream_pull(&sub, None, 64, DEFAULT_POLL_INLINE_BYTES, now).unwrap();
     let texts: Vec<&str> = result["frames"]
         .as_array()
@@ -2038,7 +2038,7 @@ async fn stream_poll_counts_buffer_overflow_gap_per_subscription() {
         Box::new(client),
     );
     let now = openbaud::engine::now_ms();
-    let sub = session.stream_subscribe(now).unwrap();
+    let sub = session.stream_subscribe(now, None).unwrap();
 
     // ~1.13 MiB of 64-byte lines, never polled while they arrive.
     let line = {
@@ -2141,8 +2141,8 @@ async fn stream_subscription_ttl_sweeps_idle_subscribers() {
 
     // Any later stream call on the session sweeps subscriptions idle past the
     // TTL — driven here with a fabricated clock instead of a 120 s sleep.
-    let stale = session.stream_subscribe(now).unwrap();
-    let fresh = session.stream_subscribe(now + SUBSCRIPTION_IDLE_TTL_MS + 1).unwrap();
+    let stale = session.stream_subscribe(now, None).unwrap();
+    let fresh = session.stream_subscribe(now + SUBSCRIPTION_IDLE_TTL_MS + 1, None).unwrap();
     assert!(!session.has_stream_subscription(&stale), "stale subscription must be swept");
     assert!(session.has_stream_subscription(&fresh));
     let err = tools::call("stream_poll", json!({ "subscription_id": stale }), &ctx)
@@ -2164,7 +2164,7 @@ async fn stream_subscription_ttl_sweeps_idle_subscribers() {
     assert!(!session.has_stream_subscription(&fresh));
 
     // The explicit sweep seam reports what it removed.
-    let third = session.stream_subscribe(now).unwrap();
+    let third = session.stream_subscribe(now, None).unwrap();
     let swept = session.sweep_stream_subscriptions_at(now + SUBSCRIPTION_IDLE_TTL_MS + 1);
     assert_eq!(swept, vec![third]);
 }
@@ -2248,6 +2248,194 @@ async fn stream_poll_parameter_errors_are_loud() {
     .await
     .unwrap_err();
     assert!(err.to_string().contains("belongs"), "got: {err:#}");
+}
+
+// ---------------------------------------------------------------------------
+// stream_poll: per-frame parsing (parse resolved at subscribe time)
+// ---------------------------------------------------------------------------
+
+/// A command with a parse block carrying a unit, written into the scaffold
+/// workspace by the parse tests themselves so the shared scaffold stays
+/// untouched. `mv` decodes byte 1 as u8 — a one-byte frame cannot satisfy it,
+/// which is exactly what the parse_error tests need.
+fn write_volt_command(dir: &tempfile::TempDir) {
+    std::fs::write(
+        dir.path().join("devices/echodev/commands/volt.yaml"),
+        r#"
+schema: openbaud/command@v0
+name: volt
+frame: { hex: "56" }
+response:
+  match: { length: 2 }
+  parse: { fields: { mv: { at: 1, type: u8, unit: "mV" } } }
+"#,
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn stream_poll_parse_attaches_parsed_fields_per_frame() {
+    let dir = scaffold_workspace();
+    write_volt_command(&dir);
+    let ctx = ctx_for(&dir);
+    let sid = open_echo_lines(&ctx).await;
+
+    let created = tools::call(
+        "stream_poll",
+        json!({ "session_id": sid, "parse": { "device": "echodev", "command": "volt" } }),
+        &ctx,
+    )
+    .await
+    .unwrap();
+    let sub = created["subscription_id"].as_str().unwrap().to_string();
+    // The result echoes that parse is in effect, from creation on.
+    assert_eq!(created["parse"], json!({ "device": "echodev", "command": "volt" }));
+
+    tools::call("send", json!({ "session_id": sid, "text": "AB\n" }), &ctx).await.unwrap();
+    let result = poll_until_next_seq(&ctx, &sub, 1, 64).await;
+    assert_eq!(result["parse"], json!({ "device": "echodev", "command": "volt" }));
+    // Units travel with the result, same semantics as run_command.
+    assert_eq!(result["units"], json!({ "mv": "mV" }));
+    let frame = &result["frames"][0];
+    assert_eq!(frame["parsed"], json!({ "mv": 0x42 }));
+    assert!(frame.get("parse_error").is_none(), "got: {frame}");
+    // The original frame shape is unchanged next to `parsed`.
+    assert_eq!(frame["seq"], json!(0));
+    assert_eq!(frame["hex"], json!("41 42"));
+    assert_eq!(frame["text"], json!("AB"));
+    assert!(frame["ts_ms"].as_u64().unwrap() > 0);
+
+    // Idempotent redelivery (no ack) carries the same parsed values — the
+    // bytes were parsed once when the frame was retained, not per delivery.
+    let again = tools::call("stream_poll", json!({ "subscription_id": sub }), &ctx).await.unwrap();
+    assert_eq!(again["frames"][0]["parsed"], json!({ "mv": 0x42 }));
+}
+
+#[tokio::test]
+async fn stream_poll_parse_error_is_per_frame_and_stream_continues() {
+    let dir = scaffold_workspace();
+    write_volt_command(&dir);
+    let ctx = ctx_for(&dir);
+    let sid = open_echo_lines(&ctx).await;
+    let created = tools::call(
+        "stream_poll",
+        json!({ "session_id": sid, "parse": { "device": "echodev", "command": "volt" } }),
+        &ctx,
+    )
+    .await
+    .unwrap();
+    let sub = created["subscription_id"].as_str().unwrap().to_string();
+
+    // Frame "a" is one byte — `mv` at offset 1 cannot decode — then "QR"
+    // parses fine: one bad frame never interrupts the stream.
+    tools::call("send", json!({ "session_id": sid, "text": "a\nQR\n" }), &ctx).await.unwrap();
+    let result = poll_until_next_seq(&ctx, &sub, 2, 64).await;
+    let frames = result["frames"].as_array().unwrap();
+    assert_eq!(frames.len(), 2, "got: {result}");
+    let bad = &frames[0];
+    assert!(bad.get("parsed").is_none(), "got: {bad}");
+    assert!(
+        !bad["parse_error"].as_str().unwrap().is_empty(),
+        "bad frame must carry a parse_error reason, got: {bad}"
+    );
+    assert_eq!(bad["text"], json!("a"), "raw frame shape survives a parse failure");
+    let good = &frames[1];
+    assert_eq!(good["parsed"], json!({ "mv": 0x52 }));
+    assert!(good.get("parse_error").is_none(), "got: {good}");
+}
+
+#[tokio::test]
+async fn stream_poll_parse_creation_errors_are_loud() {
+    let dir = scaffold_workspace();
+    let ctx = ctx_for(&dir);
+    let sid = open_echo_lines(&ctx).await;
+
+    // Unknown device.
+    let err = tools::call(
+        "stream_poll",
+        json!({ "session_id": sid, "parse": { "device": "nodev", "command": "ping" } }),
+        &ctx,
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("no device"), "got: {err:#}");
+
+    // Unknown command.
+    let err = tools::call(
+        "stream_poll",
+        json!({ "session_id": sid, "parse": { "device": "echodev", "command": "zzz" } }),
+        &ctx,
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("no command"), "got: {err:#}");
+
+    // Command without a response.parse block (wipe has no response at all).
+    let err = tools::call(
+        "stream_poll",
+        json!({ "session_id": sid, "parse": { "device": "echodev", "command": "wipe" } }),
+        &ctx,
+    )
+    .await
+    .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("response.parse") && msg.contains("wipe"), "got: {msg}");
+
+    // Malformed parse argument shapes.
+    let err = tools::call(
+        "stream_poll",
+        json!({ "session_id": sid, "parse": "echodev/ping" }),
+        &ctx,
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("parse"), "got: {err:#}");
+    let err = tools::call(
+        "stream_poll",
+        json!({ "session_id": sid, "parse": { "device": "echodev" } }),
+        &ctx,
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("command"), "got: {err:#}");
+
+    // None of the failed creations may have leaked a subscription.
+    let created = tools::call("stream_poll", json!({ "session_id": sid }), &ctx).await.unwrap();
+    assert!(
+        created["subscription_id"].as_str().unwrap().ends_with("-sub1"),
+        "failed parse creations must not consume subscription slots, got: {created}"
+    );
+}
+
+#[tokio::test]
+async fn stream_poll_parse_on_follow_up_poll_is_loud_and_no_parse_is_unchanged() {
+    let dir = scaffold_workspace();
+    let ctx = ctx_for(&dir);
+    let sid = open_echo_lines(&ctx).await;
+    let created = tools::call("stream_poll", json!({ "session_id": sid }), &ctx).await.unwrap();
+    let sub = created["subscription_id"].as_str().unwrap().to_string();
+    // A subscription created without parse advertises none.
+    assert!(created.get("parse").is_none(), "got: {created}");
+
+    // parse belongs to creation only — a follow-up poll cannot smuggle it in.
+    let err = tools::call(
+        "stream_poll",
+        json!({ "subscription_id": sub, "parse": { "device": "echodev", "command": "ping" } }),
+        &ctx,
+    )
+    .await
+    .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("parse") && msg.contains("creat"), "got: {msg}");
+
+    // Zero regression without parse: frames carry neither parsed nor
+    // parse_error, and the result carries neither parse nor units.
+    tools::call("send", json!({ "session_id": sid, "text": "AB\n" }), &ctx).await.unwrap();
+    let result = poll_until_next_seq(&ctx, &sub, 1, 64).await;
+    assert!(result.get("parse").is_none(), "got: {result}");
+    assert!(result.get("units").is_none(), "got: {result}");
+    let frame = &result["frames"][0];
+    assert!(frame.get("parsed").is_none() && frame.get("parse_error").is_none(), "got: {frame}");
 }
 
 // ---------------------------------------------------------------------------

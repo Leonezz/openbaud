@@ -7,8 +7,8 @@
 use crate::engine::now_ms;
 use crate::engine::session::Session;
 use crate::engine::stream::{
-    DEFAULT_POLL_FRAMES, DEFAULT_POLL_INLINE_BYTES, MAX_POLL_FRAMES, MAX_POLL_INLINE_BYTES,
-    MIN_POLL_INLINE_BYTES, SUBSCRIPTION_IDLE_TTL_MS,
+    StreamParse, DEFAULT_POLL_FRAMES, DEFAULT_POLL_INLINE_BYTES, MAX_POLL_FRAMES,
+    MAX_POLL_INLINE_BYTES, MIN_POLL_INLINE_BYTES, SUBSCRIPTION_IDLE_TTL_MS,
 };
 use crate::mcp::tools::arg_u64_or;
 use crate::mcp::Ctx;
@@ -42,13 +42,22 @@ pub fn spec() -> Value {
             ones idle beyond 120 s are swept by later stream_poll calls, and closing the \
             session releases them all. Every result folds in the session's live counters as \
             stats. Returns immediately with whatever is available — never waits; a poll with \
-            nothing left to deliver on a dead port errors loudly instead of looking healthy.",
+            nothing left to deliver on a dead port errors loudly instead of looking healthy. \
+            Optionally pass parse: {device, command} when CREATING a subscription (never on a \
+            follow-up poll — that is a loud error) to parse every frame server-side with that \
+            workspace command's response.parse: each frame then carries parsed (the field \
+            values) or parse_error (the per-frame reason; one bad frame never stops the \
+            stream), parsed once at arrival so redelivery repeats the identical outcome, and \
+            every result echoes parse: {device, command} plus the command's units (same \
+            semantics as run_command). A device or command that does not exist, or a command \
+            without a response.parse block, fails subscription creation loudly.",
         "inputSchema": { "type": "object", "properties": {
             "session_id": { "type": "string", "description": "Open session to subscribe to; required when no subscription_id is given" },
             "subscription_id": { "type": "string", "description": "Subscription from an earlier stream_poll; required for follow-up polls and for close" },
             "since_seq": { "type": "integer", "description": "Acknowledge delivery: release frames with seq < since_seq — pass the last delivered frame's seq + 1; omit to redeliver the unacknowledged frames" },
             "max_frames": { "type": "integer", "default": DEFAULT_POLL_FRAMES, "minimum": 1, "maximum": MAX_POLL_FRAMES },
             "max_inline_bytes": { "type": "integer", "default": DEFAULT_POLL_INLINE_BYTES, "minimum": MIN_POLL_INLINE_BYTES, "maximum": MAX_POLL_INLINE_BYTES, "description": "Byte budget for one page's inlined frames, metered as each frame's rendered hex length + text length; whole frames only, except a single first frame beyond the budget (delivered with oversized_frame: true)" },
+            "parse": { "type": "object", "properties": { "device": { "type": "string" }, "command": { "type": "string" } }, "required": ["device", "command"], "description": "Only when creating a subscription (with session_id): parse every frame server-side with this workspace command's response.parse — frames carry parsed or parse_error; a follow-up poll passing parse is a loud error" },
             "close": { "type": "boolean", "description": "Release the subscription instead of polling it" }
         }},
         "annotations": {
@@ -98,6 +107,17 @@ pub fn stream_poll(args: &Value, ctx: &Arc<Ctx>) -> anyhow::Result<Value> {
 
     match (subscription_id, session_id) {
         (Some(sub_id), sid) => {
+            // parse is a creation-time property of the subscription — a
+            // follow-up poll trying to set (or repeat) it is a loud error,
+            // never silently ignored.
+            if args.get("parse").is_some_and(|v| !v.is_null()) {
+                bail!(
+                    "parse is set when the subscription is created (the call with \
+                     session_id only) — a follow-up poll cannot change or repeat it; \
+                     to parse with a different command, close this subscription and \
+                     create a new one"
+                );
+            }
             let session = find_subscription_session(sub_id, ctx)?;
             if let Some(sid) = sid {
                 if sid != session.id {
@@ -122,8 +142,12 @@ pub fn stream_poll(args: &Value, ctx: &Arc<Ctx>) -> anyhow::Result<Value> {
                      nothing to acknowledge"
                 );
             }
+            // Resolve parse from the workspace before subscribing, so a bad
+            // device/command/parse block fails loudly without consuming a
+            // subscription slot.
+            let parse = stream_parse_arg(args, ctx)?;
             let session = ctx.sessions.get(sid)?;
-            let sub_id = session.stream_subscribe(now)?;
+            let sub_id = session.stream_subscribe(now, parse)?;
             session.stream_pull(&sub_id, None, max_frames, max_inline_bytes, now)
         }
         (None, None) => bail!(
@@ -131,6 +155,41 @@ pub fn stream_poll(args: &Value, ctx: &Arc<Ctx>) -> anyhow::Result<Value> {
              (to poll an existing one)"
         ),
     }
+}
+
+/// Resolve the optional `parse: {device, command}` creation argument against
+/// the workspace: the named command's `response.parse` becomes the
+/// subscription's per-frame parse spec, its field units travel along (same
+/// semantics as `run_command`). Every failure — malformed argument, unknown
+/// device or command, command without a parse block — is loud.
+fn stream_parse_arg(args: &Value, ctx: &Arc<Ctx>) -> anyhow::Result<Option<StreamParse>> {
+    let Some(v) = args.get("parse").filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+    let obj = v
+        .as_object()
+        .ok_or_else(|| anyhow!("parse must be an object {{device, command}}, got {v}"))?;
+    let field = |key: &str| -> anyhow::Result<&str> {
+        obj.get(key).and_then(Value::as_str).ok_or_else(|| {
+            anyhow!("parse.{key} must be a string — parse is {{device, command}} naming a workspace command")
+        })
+    };
+    let device_name = field("device")?;
+    let command_name = field("command")?;
+    let device = ctx.workspace.load_device(device_name)?;
+    let cmd = device.command(command_name)?;
+    let Some(spec) = cmd.response.as_ref().and_then(|r| r.parse.as_ref()) else {
+        bail!(
+            "command {command_name:?} on device {device_name:?} declares no response.parse \
+             block — stream_poll can only parse frames with a command that declares one"
+        );
+    };
+    Ok(Some(StreamParse {
+        device: device_name.to_string(),
+        command: command_name.to_string(),
+        spec: spec.clone(),
+        units: openbaud_core::exec::units(cmd),
+    }))
 }
 
 /// The session holding a subscription id. Ids embed their session id, but the

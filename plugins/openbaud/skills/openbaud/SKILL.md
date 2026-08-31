@@ -76,7 +76,15 @@ the claim. Use `replay:<capture path>` for hardware-free regression tests.
   Lagging drops the oldest frames into a loud `dropped_frames` count and
   buffer overflow past the cursor into `dropped_chunks`; a drained poll on a
   dead port errors loudly; `close: true` releases it. Independent of `read`
-  — the two never steal frames from each other.
+  — the two never steal frames from each other. Pass `parse: {device,
+  command}` when *creating* the subscription (never on a follow-up poll —
+  loud error) to parse every frame server-side with that workspace command's
+  `response.parse`: frames then carry `parsed` (field values) or a per-frame
+  `parse_error` (one bad frame never stops the stream), parsed once at
+  arrival so redelivery repeats the identical outcome; results echo
+  `parse: {device, command}` plus the command's `units` (`run_command`
+  semantics), and an unknown device/command or a command without a
+  `response.parse` block fails creation loudly.
 - `schema`: obtain the exact knowledge-format contract.
 
 Prefer verified commands over repeated raw byte construction.
@@ -90,8 +98,10 @@ deliberately and not by habit:
   the data is the point; say a two-field answer instead of drawing it.
 - `ask_port`: ask which port to use when several could be the device and the
   choice is the user's. It opens nothing — the answer returns to you and you
-  call `open`. For your own discovery use `list_ports`, which reports device
-  matches, ports held by a session, and `/dev/tty.*` twins.
+  call `open`. On hosts that never deliver the selection back, ask the user
+  directly instead of guessing. For your own discovery use `list_ports`,
+  which reports device matches, ports held by a session, and `/dev/tty.*`
+  twins.
 
 ## Declarative rendering
 
