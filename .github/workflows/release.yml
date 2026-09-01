@@ -185,4 +185,10 @@ jobs:
               -c user.email=41898282+github-actions[bot]@users.noreply.github.com \
               commit -m "release: publish stable marketplace ${GITHUB_REF_NAME}"
           fi
-          git push origin HEAD:refs/heads/stable
+          git -C "$channel_worktree" push origin HEAD:refs/heads/stable
+          published_sha=$(git -C "$channel_worktree" rev-parse HEAD)
+          remote_sha=$(git ls-remote origin refs/heads/stable | cut -f1)
+          if [ "$published_sha" != "$remote_sha" ]; then
+            echo "stable marketplace points to $remote_sha, expected $published_sha" >&2
+            exit 1
+          fi
