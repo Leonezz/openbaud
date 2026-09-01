@@ -49,7 +49,7 @@ function aliasLabel(count: number, shown: boolean): string {
 }
 
 export function PortPickerApp() {
-  const widget = useWidget({ name: 'openbaud-port-picker', version: '0.2.0' })
+  const widget = useWidget({ name: 'openbaud-port-picker', version: '0.2.1' })
   const { callTool, updateModelContext, toolResult, cancelReason } = widget
 
   const [load, setLoad] = useState<Load>({ kind: 'waiting' })

@@ -1,8 +1,9 @@
 {
   "mcpServers": {
     "openbaud": {
-      "command": "./bin/darwin-arm64/openbaud",
+      "command": "node",
       "args": [
+        "./launcher.mjs",
         "mcp"
       ],
       "cwd": ".",

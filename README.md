@@ -67,7 +67,7 @@ Register this Git repository as the `openbaud-marketplace` marketplace and
 install its plugin:
 
 ```sh
-codex plugin marketplace add Leonezz/openbaud
+codex plugin marketplace add Leonezz/openbaud --ref stable
 codex plugin add openbaud@openbaud-marketplace
 ```
 
@@ -78,19 +78,23 @@ Use OpenBaud to identify this serial device. Start read-only, preserve a
 capture, and turn verified behavior into reusable commands.
 ```
 
-The plugin bundles its native MCP runtime; users do not need Rust, Cargo,
-Homebrew, or an install hook. The Git marketplace checkout currently bundles
-macOS Apple Silicon. The latest GitHub Release additionally publishes
-self-contained marketplace archives for macOS Intel, Linux x64/ARM64, and
-Windows x64. macOS binaries are ad-hoc signed for preview distribution but are
-not yet Apple-notarized.
+The stable marketplace plugin bundles all five native MCP runtimes and selects
+the matching one locally at startup. Users need Node.js 18 or newer for the
+portable launcher, but do not need Rust, Cargo, Homebrew, an install hook, or a
+runtime download. The supported hosts are macOS ARM64/Intel, Linux x64/ARM64,
+and Windows x64. macOS binaries are ad-hoc signed for preview distribution but
+are not yet Apple-notarized.
 
-To pin the current release rather than follow the default branch:
+The `stable` branch advances only after every native package and the aggregated
+plugin pass their smoke tests. To refresh it immediately, run:
 
 ```sh
-codex plugin marketplace add Leonezz/openbaud --ref v0.2.0
-codex plugin add openbaud@openbaud-marketplace
+codex plugin marketplace upgrade openbaud-marketplace
 ```
+
+Start a new task after an update. For an immutable installation, download the
+versioned universal or host-specific marketplace archive from GitHub Releases
+and register its extracted local path.
 
 See [plugins/openbaud/README.md](plugins/openbaud/README.md) for platform
 archives, upgrade instructions, packaging details, and smoke tests.
@@ -116,6 +120,8 @@ the current profile, command, and workflow formats.
 ```sh
 cargo test --workspace
 python3 scripts/validate-package.py
+python3 -m unittest scripts/test_package_plugin.py
+node --test scripts/test-plugin-launcher.mjs
 plugins/openbaud/scripts/build-runtime
 plugins/openbaud/scripts/smoke-test
 ```
@@ -123,7 +129,9 @@ plugins/openbaud/scripts/smoke-test
 GitHub Actions runs Clippy, package validation, native builds, tests, archive
 verification, and real MCP smoke tests on macOS ARM64/Intel, Linux x64/ARM64,
 and Windows x64. Stable `vMAJOR.MINOR.PATCH` tags publish all five platform
-archives plus SHA-256 files.
+archives, one universal marketplace archive, and SHA-256 files. The release
+workflow then advances the `stable` marketplace branch to that verified
+universal bundle.
 
 The Remotion source and real capture used to produce the public video live in
 [media/pv](media/pv/). Regenerate its data with `pnpm extract`, preview with

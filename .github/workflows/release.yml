@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release
   cancel-in-progress: false
 
 jobs:
@@ -71,6 +71,9 @@ jobs:
           mkdir -p dist-verify
           archive="dist-assets/openbaud-codex-plugin-${GITHUB_REF_NAME}-${{ matrix.platform }}.tar.gz"
           tar -xzf "$archive" -C dist-verify
+          python3 scripts/validate-package.py \
+            --package-root "dist-verify/openbaud-${GITHUB_REF_NAME}-${{ matrix.platform }}" \
+            --platform "${{ matrix.platform }}"
           dist-verify/openbaud-${GITHUB_REF_NAME}-${{ matrix.platform }}/plugins/openbaud/scripts/smoke-test
           python3 - "$archive" <<'PY'
           import hashlib
@@ -97,11 +100,28 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
       - uses: actions/download-artifact@v8
         with:
           path: dist
           pattern: release-*
           merge-multiple: true
+      - name: Assemble and smoke test universal marketplace plugin
+        run: |
+          python3 scripts/package-plugin.py \
+            --platform universal \
+            --tag "$GITHUB_REF_NAME" \
+            --input-dir dist \
+            --output-dir dist
+          mkdir -p dist-universal-verify
+          archive="dist/openbaud-codex-plugin-${GITHUB_REF_NAME}-universal.tar.gz"
+          tar -xzf "$archive" -C dist-universal-verify
+          python3 scripts/validate-package.py \
+            --package-root "dist-universal-verify/openbaud-${GITHUB_REF_NAME}-universal" \
+            --platform universal
+          dist-universal-verify/openbaud-${GITHUB_REF_NAME}-universal/plugins/openbaud/scripts/smoke-test
       - name: Verify release assets
         run: |
           python3 - <<'PY'
@@ -115,6 +135,7 @@ jobs:
               "linux-x64",
               "linux-arm64",
               "windows-x64",
+              "universal",
           )
           expected_names = set()
           for platform in platforms:
@@ -139,3 +160,29 @@ jobs:
             gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes --title "OpenBaud ${GITHUB_REF_NAME}"
           fi
           gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+      - name: Publish universal plugin to stable marketplace channel
+        run: |
+          bundle_parent=$(mktemp -d)
+          channel_worktree=$(mktemp -d)
+          archive="dist/openbaud-codex-plugin-${GITHUB_REF_NAME}-universal.tar.gz"
+          tar -xzf "$archive" -C "$bundle_parent"
+          bundle_root="$bundle_parent/openbaud-${GITHUB_REF_NAME}-universal"
+
+          if git ls-remote --exit-code origin refs/heads/stable >/dev/null 2>&1; then
+            git fetch --depth=1 origin refs/heads/stable:refs/remotes/origin/stable
+            git worktree add -b stable-publish "$channel_worktree" refs/remotes/origin/stable
+          else
+            git worktree add --detach "$channel_worktree" "$GITHUB_SHA"
+            git -C "$channel_worktree" switch --orphan stable-publish
+          fi
+          rsync -a --delete --exclude=.git "$bundle_root"/ "$channel_worktree"/
+          git -C "$channel_worktree" add -A
+          if git -C "$channel_worktree" diff --cached --quiet; then
+            echo "stable marketplace already contains ${GITHUB_REF_NAME}"
+          else
+            git -C "$channel_worktree" \
+              -c user.name=github-actions[bot] \
+              -c user.email=41898282+github-actions[bot]@users.noreply.github.com \
+              commit -m "release: publish stable marketplace ${GITHUB_REF_NAME}"
+          fi
+          git push origin HEAD:refs/heads/stable

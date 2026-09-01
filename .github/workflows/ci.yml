@@ -24,6 +24,10 @@ jobs:
         run: cargo test --workspace --locked
       - name: Validate Skill and plugin package
         run: python3 scripts/validate-package.py
+      - name: Test cross-platform plugin launcher
+        run: node --test scripts/test-plugin-launcher.mjs
+      - name: Test universal plugin packager
+        run: python3 -m unittest scripts/test_package_plugin.py
 
   widgets:
     name: Widget checks
@@ -106,4 +110,57 @@ jobs:
           mkdir -p dist-verify
           archive="dist-assets/openbaud-codex-plugin-${tag}-${{ matrix.platform }}.tar.gz"
           tar -xzf "$archive" -C dist-verify
+          python3 scripts/validate-package.py \
+            --package-root "dist-verify/openbaud-${tag}-${{ matrix.platform }}" \
+            --platform "${{ matrix.platform }}"
           dist-verify/openbaud-${tag}-${{ matrix.platform }}/plugins/openbaud/scripts/smoke-test
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ci-release-${{ matrix.platform }}
+          path: dist-assets/*
+          if-no-files-found: error
+
+  universal-plugin:
+    name: Assemble universal marketplace plugin
+    needs: platform-build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          pattern: ci-release-*
+          merge-multiple: true
+      - name: Package and smoke test universal plugin
+        run: |
+          version=$(python3 - <<'PY'
+          import pathlib
+          import tomllib
+
+          cargo = tomllib.loads(pathlib.Path("Cargo.toml").read_text())
+          print(cargo["workspace"]["package"]["version"])
+          PY
+          )
+          tag="v$version"
+          python3 scripts/package-plugin.py \
+            --platform universal \
+            --tag "$tag" \
+            --input-dir dist \
+            --output-dir dist
+          mkdir -p dist-verify
+          archive="dist/openbaud-codex-plugin-${tag}-universal.tar.gz"
+          tar -xzf "$archive" -C dist-verify
+          python3 scripts/validate-package.py \
+            --package-root "dist-verify/openbaud-${tag}-universal" \
+            --platform universal
+          dist-verify/openbaud-${tag}-universal/plugins/openbaud/scripts/smoke-test
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ci-release-universal
+          path: |
+            dist/openbaud-codex-plugin-*-universal.tar.gz
+            dist/openbaud-codex-plugin-*-universal.tar.gz.sha256
+          if-no-files-found: error

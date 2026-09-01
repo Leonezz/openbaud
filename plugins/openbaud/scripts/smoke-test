@@ -9,25 +9,19 @@ trap 'rm -rf "$test_root"' EXIT HUP INT TERM
 request_file="$test_root/requests.jsonl"
 response_file="$test_root/responses.jsonl"
 
-runtime_command=$(python3 - "$plugin_root/.mcp.json" <<'PY'
+python3 - "$plugin_root/.mcp.json" <<'PY'
 import json
 import pathlib
 import sys
 
 server = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))["mcpServers"]["openbaud"]
-command = server.get("command")
-if not isinstance(command, str) or not command.startswith("./bin/"):
-    raise SystemExit("plugin MCP must launch a bundled native runtime directly")
-if server.get("args") != ["mcp"]:
-    raise SystemExit("plugin MCP must launch with args [mcp]")
-print(command)
+if server.get("command") != "node":
+    raise SystemExit("plugin MCP must use the portable Node launcher")
+if server.get("args") != ["./launcher.mjs", "mcp"]:
+    raise SystemExit("plugin MCP must launch launcher.mjs with args [mcp]")
+if server.get("cwd") != ".":
+    raise SystemExit("plugin MCP cwd must resolve relative to the plugin root")
 PY
-)
-runtime="$plugin_root/${runtime_command#./}"
-if [ ! -f "$runtime" ]; then
-  printf 'Bundled MCP runtime is missing: %s\n' "$runtime" >&2
-  exit 1
-fi
 
 python3 - "$request_file" "$plugin_root/.codex-plugin/plugin.json" <<'PY'
 import json
@@ -70,10 +64,10 @@ PY
 
 (
   cd "$plugin_root"
-  env PWD="$test_root" "$runtime" mcp < "$request_file" > "$response_file"
+  env PWD="$test_root" node ./launcher.mjs mcp < "$request_file" > "$response_file"
 )
 
-python3 - "$response_file" "$test_root" "$plugin_root/.codex-plugin/plugin.json" "$runtime_command" <<'PY'
+python3 - "$response_file" "$test_root" "$plugin_root/.codex-plugin/plugin.json" <<'PY'
 import json
 import pathlib
 import sys
@@ -122,8 +116,10 @@ if server["version"] != manifest["version"]:
 server_config = mcp_config["mcpServers"]["openbaud"]
 if server_config.get("cwd") != ".":
     raise SystemExit("plugin MCP cwd must resolve relative to the plugin root")
-if server_config.get("command") != sys.argv[4]:
-    raise SystemExit("plugin MCP must launch the native runtime directly")
+if server_config.get("command") != "node":
+    raise SystemExit("plugin MCP must use the portable Node launcher")
+if server_config.get("args") != ["./launcher.mjs", "mcp"]:
+    raise SystemExit("plugin MCP must launch launcher.mjs with args [mcp]")
 if names != required:
     raise SystemExit(f"unexpected tools: {sorted(names)}")
 
