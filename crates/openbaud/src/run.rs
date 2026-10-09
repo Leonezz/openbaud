@@ -185,6 +185,22 @@ pub async fn execute_workflow(
     Ok((result, ok))
 }
 
+/// Refuse a command that describes pushed data (no frame): it is never sent.
+/// Called before any port is resolved or opened — opening a serial port can
+/// reset the board — by every entry point that executes commands.
+pub fn ensure_sendable(device: &str, cmd: &Command) -> anyhow::Result<()> {
+    if cmd.is_pushed() {
+        bail!(
+            "command {device}/{} describes pushed data (it has no frame) and is never sent — \
+             start the device's stream, then read it with stream_poll \
+             parse: {{device: {device:?}, command: {:?}}}",
+            cmd.name,
+            cmd.name
+        );
+    }
+    Ok(())
+}
+
 /// Run one workflow step, folding execution errors into the step entry.
 /// With `propagate_fatal`, a session-level fatal error is returned as `Err`
 /// instead (used for `steps`; `finally` records everything).

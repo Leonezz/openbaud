@@ -205,6 +205,23 @@ impl Workspace {
                 });
                 continue;
             }
+            let pushed: Vec<String> = wf
+                .referenced_commands()
+                .into_iter()
+                .filter(|c| commands.get(c).is_some_and(Command::is_pushed))
+                .collect();
+            if !pushed.is_empty() {
+                broken.push(BrokenFile {
+                    path: path_str,
+                    reason: format!(
+                        "workflow {:?} steps through pushed-data command(s) [{}]: they have no \
+                         frame and are never sent — read them with stream_poll parse instead",
+                        wf.name,
+                        pushed.join(", ")
+                    ),
+                });
+                continue;
+            }
             wf_first_file.insert(wf.name.clone(), path_str);
             workflows.insert(wf.name.clone(), wf);
         }

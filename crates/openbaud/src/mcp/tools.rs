@@ -145,7 +145,7 @@ pub fn list() -> Vec<Value> {
         }),
         json!({
             "name": "run_command",
-            "description": "Execute a named command from devices/<device>/commands/ with typed params: builds the frame, awaits the response and classifies the outcome (normal | exception | silence | timeout | checksum_error | malformed) against the command's declared `expect` (audited; an unmet expectation is an error carrying the full result JSON). Give session_id for an open session, or port to open an ephemeral one with the device's profile transport — port may be omitted when the profile declares a selector, and accepts replay:<capture path>. Commands with risk=danger additionally require acknowledge_risk=true.",
+            "description": "Execute a named command from devices/<device>/commands/ with typed params: builds the frame, awaits the response and classifies the outcome (normal | exception | silence | timeout | checksum_error | malformed) against the command's declared `expect` (audited; an unmet expectation is an error carrying the full result JSON). Give session_id for an open session, or port to open an ephemeral one with the device's profile transport — port may be omitted when the profile declares a selector, and accepts replay:<capture path>. Commands with risk=danger additionally require acknowledge_risk=true. A command without a frame describes pushed data and is never run: read it with stream_poll parse.",
             "inputSchema": { "type": "object", "required": ["device", "command"], "properties": {
                 "device": { "type": "string" },
                 "command": { "type": "string" },
@@ -594,8 +594,11 @@ async fn tool_run_command(args: Value, ctx: &Arc<Ctx>) -> anyhow::Result<Value> 
             return Err(e);
         }
     };
-    let cmd = match device.command(&command_name) {
-        Ok(c) => c.clone(),
+    let cmd = match device.command(&command_name).and_then(|c| {
+        run::ensure_sendable(&device_name, c)?;
+        Ok(c.clone())
+    }) {
+        Ok(c) => c,
         Err(e) => {
             audit_fail(ctx, base, &e)?;
             return Err(e);

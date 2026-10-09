@@ -59,11 +59,19 @@ pub fn resolve_params(cmd: &Command, provided: &Map<String, Value>) -> crate::Re
 
 /// Build the on-wire frame for a command with the given parameter values.
 pub fn build_frame(cmd: &Command, provided: &Map<String, Value>) -> crate::Result<Vec<u8>> {
+    let Some(frame) = &cmd.frame else {
+        return Err(CoreError::Template(format!(
+            "command {:?} has no frame — it describes data the device pushes and is never \
+             sent. Start the device's stream, then read it with stream_poll \
+             parse: {{device, command: {:?}}}",
+            cmd.name, cmd.name
+        )));
+    };
     let values = resolve_params(cmd, provided)?;
-    if let Some(hex) = &cmd.frame.hex {
+    if let Some(hex) = &frame.hex {
         let template = HexTemplate::parse(hex)?;
         template.build(&values, &cmd.param_types())
-    } else if let Some(text) = &cmd.frame.text {
+    } else if let Some(text) = &frame.text {
         Ok(render_text(text, &values)?.into_bytes())
     } else {
         Err(CoreError::Template("command has neither hex nor text frame".to_string()))
@@ -619,11 +627,27 @@ pub fn exception_triggered(spec: &ExceptionSpec, bytes: &[u8]) -> Option<bool> {
     Some(byte & mask == equals)
 }
 
-/// Units declared by the command's parse fields, for display alongside values.
+/// Units declared by the command's parse — binary fields, record-array
+/// elements, regex captures and split arrays — for display alongside values.
 pub fn units(cmd: &Command) -> Map<String, Value> {
     let mut out = Map::new();
-    if let Some(fields) = cmd.response.as_ref().and_then(|r| r.parse.as_ref()).and_then(|p| p.fields.as_ref())
-    {
+    let Some(parse) = cmd.response.as_ref().and_then(|r| r.parse.as_ref()) else { return out };
+    let text_unit = |t: &TextType| match t {
+        TextType::Spec(spec) => spec.unit.clone(),
+        TextType::Name(_) => None,
+    };
+    for (name, t) in parse.types.iter().flatten() {
+        if let Some(unit) = text_unit(t) {
+            out.insert(name.clone(), Value::from(unit));
+        }
+    }
+    // A split array's unit labels each element, reported under the capture.
+    for (name, split) in parse.split.iter().flatten() {
+        if let Some(unit) = text_unit(&split.type_spec) {
+            out.insert(name.clone(), Value::from(unit));
+        }
+    }
+    if let Some(fields) = parse.fields.as_ref() {
         for (name, field) in fields {
             if let Some(unit) = &field.unit {
                 out.insert(name.clone(), Value::from(unit.clone()));
@@ -1080,6 +1104,32 @@ response:
         let parsed = parse_response(&cmd, &[0xFF, 1, 2, 3, 4]).unwrap();
         assert_eq!(parsed, json!({"samples": [0.5, 1.0, 1.5, 2.0]}));
         assert_eq!(units(&cmd).get("samples").unwrap(), "V");
+    }
+
+    const TEXT_UNITS_CMD: &str = r#"
+schema: openbaud/command@v0
+name: therm
+frame: { text: "THERM?\r\n" }
+response:
+  match: { delimiter: "\r\n" }
+  parse:
+    regex: 'tmax=(?P<tmax>[0-9.]+) idx=(?P<idx>\d+): (?P<cells>.*)$'
+    types:
+      tmax: { type: float, unit: C }
+      idx: int
+    split:
+      cells: { sep: ",", type: { type: float, unit: C } }
+"#;
+
+    #[test]
+    fn text_captures_and_split_elements_declare_units() {
+        let cmd = parse_command(TEXT_UNITS_CMD, "c.yaml").unwrap();
+        let parsed = parse_response(&cmd, b"tmax=35.5 idx=42: 24.0,23.5").unwrap();
+        assert_eq!(parsed, json!({"tmax": 35.5, "idx": 42, "cells": [24.0, 23.5]}));
+        let u = units(&cmd);
+        assert_eq!(u.get("tmax").unwrap(), "C");
+        assert_eq!(u.get("cells").unwrap(), "C", "a split array's unit labels each element");
+        assert!(u.get("idx").is_none(), "no unit declared, none reported");
     }
 
     const RECORD_ARRAY_CMD: &str = r#"

@@ -889,14 +889,15 @@ async fn schema_tool_returns_schema_and_parsable_example() {
     assert_eq!(result["schema"]["additionalProperties"], json!(false));
 
     // example: true returns YAML that the real parser accepts (the command
-    // example is two `---`-separated documents: binary, then text).
+    // example is three `---`-separated documents: binary, text, and a
+    // pushed-data descriptor).
     let result = tools::call("schema", json!({ "kind": "command", "example": true }), &ctx)
         .await
         .unwrap();
     assert!(result.get("schema").is_none());
     let yaml = result["example"].as_str().unwrap();
     let docs: Vec<&str> = yaml.split("\n---\n").collect();
-    assert_eq!(docs.len(), 2, "command example holds two documents");
+    assert_eq!(docs.len(), 3, "command example holds three documents");
     for doc in docs {
         parse_command(doc, "example.yaml").unwrap();
     }
@@ -2625,6 +2626,159 @@ async fn stream_poll_parse_on_follow_up_poll_is_loud_and_no_parse_is_unchanged()
     assert!(result.get("units").is_none(), "got: {result}");
     let frame = &result["frames"][0];
     assert!(frame.get("parsed").is_none() && frame.get("parse_error").is_none(), "got: {frame}");
+}
+
+// ---------------------------------------------------------------------------
+// Pushed-data commands (no frame): parsed per streamed frame, never sent
+// ---------------------------------------------------------------------------
+
+/// A THERM-style pushed text line, and a checksummed pushed binary frame.
+fn write_pushed_commands(dir: &tempfile::TempDir) {
+    let cmds = dir.path().join("devices/echodev/commands");
+    std::fs::write(
+        cmds.join("therm_line.yaml"),
+        r#"
+schema: openbaud/command@v0
+name: therm_line
+description: one pushed THERM line
+response:
+  parse:
+    regex: 'tmax=(?P<tmax>[0-9.]+): (?P<cells>.*)$'
+    types: { tmax: { type: float, unit: C } }
+    split:
+      cells: { sep: ",", type: { type: float, unit: C } }
+  view: { kind: heatmap, data: cells, rows: 2, cols: 2 }
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        cmds.join("pm_frame.yaml"),
+        r#"
+schema: openbaud/command@v0
+name: pm_frame
+description: pushed 4-byte frame, sum8 over the first three bytes
+response:
+  validate: { checksum: sum8 }
+  parse: { fields: { pm: { at: 1, type: u16be, unit: "ug/m3" } } }
+"#,
+    )
+    .unwrap();
+}
+
+const NO_SUCH_PORT: &str = "/dev/openbaud-test-no-such-port";
+
+#[tokio::test]
+async fn run_command_refuses_pushed_data_before_touching_a_port() {
+    // Opening a serial port can reset the board (DTR), so a command that can
+    // never be sent is refused before any port is resolved or opened.
+    let dir = scaffold_workspace();
+    write_pushed_commands(&dir);
+    let ctx = ctx_for(&dir);
+    let err = tools::call(
+        "run_command",
+        json!({ "device": "echodev", "command": "therm_line", "port": NO_SUCH_PORT }),
+        &ctx,
+    )
+    .await
+    .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("stream_poll"), "points at the right tool: {msg}");
+    assert!(!msg.contains(NO_SUCH_PORT), "refused before touching the port: {msg}");
+
+    let audit = std::fs::read_to_string(dir.path().join(".openbaud/audit.jsonl")).unwrap();
+    let last: Value = serde_json::from_str(audit.lines().last().unwrap()).unwrap();
+    assert_eq!((last["command"].clone(), last["ok"].clone()), (json!("therm_line"), json!(false)));
+}
+
+#[tokio::test]
+async fn a_workflow_cannot_step_through_pushed_data() {
+    let dir = scaffold_workspace();
+    write_pushed_commands(&dir);
+    let wf_dir = dir.path().join("devices/echodev/workflows");
+    std::fs::create_dir_all(&wf_dir).unwrap();
+    std::fs::write(
+        wf_dir.join("grab.yaml"),
+        "schema: openbaud/workflow@v0\nname: grab\nsteps:\n  - command: therm_line\n",
+    )
+    .unwrap();
+    let ctx = ctx_for(&dir);
+    let err = tools::call(
+        "run_workflow",
+        json!({ "device": "echodev", "workflow": "grab", "port": NO_SUCH_PORT }),
+        &ctx,
+    )
+    .await
+    .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("therm_line") && msg.contains("pushed"), "got: {msg}");
+    assert!(!msg.contains(NO_SUCH_PORT), "refused before touching the port: {msg}");
+}
+
+#[tokio::test]
+async fn stream_poll_parses_pushed_text_with_its_units() {
+    let dir = scaffold_workspace();
+    write_pushed_commands(&dir);
+    let ctx = ctx_for(&dir);
+    let sid = open_echo_lines(&ctx).await;
+    let created = tools::call(
+        "stream_poll",
+        json!({ "session_id": sid, "parse": { "device": "echodev", "command": "therm_line" } }),
+        &ctx,
+    )
+    .await
+    .unwrap();
+    let sub = created["subscription_id"].as_str().unwrap().to_string();
+
+    tools::call("send", json!({ "session_id": sid, "text": "tmax=35.5: 24,23.5,25,26\n" }), &ctx)
+        .await
+        .unwrap();
+    let result = poll_until_next_seq(&ctx, &sub, 1, 64).await;
+    assert_eq!(result["units"], json!({ "tmax": "C", "cells": "C" }));
+    assert_eq!(
+        result["frames"][0]["parsed"],
+        json!({ "tmax": 35.5, "cells": [24.0, 23.5, 25.0, 26.0] })
+    );
+}
+
+#[tokio::test]
+async fn stream_poll_verifies_a_declared_checksum_on_every_pushed_frame() {
+    // A checksum the descriptor declares is enforced per frame: a corrupted
+    // frame becomes a parse_error naming the checksum, never a parsed value.
+    let dir = scaffold_workspace();
+    write_pushed_commands(&dir);
+    let ctx = ctx_for(&dir);
+    let opened = tools::call(
+        "open",
+        json!({ "port": "mock:echo", "framing": { "length_prefix": {
+            "header_len": 1, "len_at": 0, "len_size": 1, "endian": "be", "extra": 0 } } }),
+        &ctx,
+    )
+    .await
+    .unwrap();
+    let sid = opened["session_id"].as_str().unwrap().to_string();
+    let created = tools::call(
+        "stream_poll",
+        json!({ "session_id": sid, "parse": { "device": "echodev", "command": "pm_frame" } }),
+        &ctx,
+    )
+    .await
+    .unwrap();
+    let sub = created["subscription_id"].as_str().unwrap().to_string();
+
+    // Length-prefixed (first byte = 3 more bytes): 03 00 19 1C is valid
+    // (sum8 of 03 00 19 = 1C); 03 00 19 00 is the same frame corrupted.
+    tools::call("send", json!({ "session_id": sid, "hex": "03 00 19 1C 03 00 19 00" }), &ctx)
+        .await
+        .unwrap();
+    let result = poll_until_next_seq(&ctx, &sub, 2, 64).await;
+    let frames = result["frames"].as_array().unwrap();
+    assert_eq!(frames[0]["parsed"], json!({ "pm": 25 }), "got: {result}");
+    let bad = &frames[1];
+    assert!(bad.get("parsed").is_none(), "a corrupted frame must not parse: {bad}");
+    assert!(
+        bad["parse_error"].as_str().unwrap().contains("checksum"),
+        "the reason names the checksum: {bad}"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -158,9 +158,9 @@ pub fn stream_poll(args: &Value, ctx: &Arc<Ctx>) -> anyhow::Result<Value> {
 }
 
 /// Resolve the optional `parse: {device, command}` creation argument against
-/// the workspace: the named command's `response.parse` becomes the
-/// subscription's per-frame parse spec, its field units travel along (same
-/// semantics as `run_command`). Every failure — malformed argument, unknown
+/// the workspace: the named command's response block (`validate`, then
+/// `parse`) decodes every frame, and its units travel along (same semantics
+/// as `run_command`). A pushed-data command (no frame) is the natural choice. Every failure — malformed argument, unknown
 /// device or command, command without a parse block — is loud.
 fn stream_parse_arg(args: &Value, ctx: &Arc<Ctx>) -> anyhow::Result<Option<StreamParse>> {
     let Some(v) = args.get("parse").filter(|v| !v.is_null()) else {
@@ -178,16 +178,16 @@ fn stream_parse_arg(args: &Value, ctx: &Arc<Ctx>) -> anyhow::Result<Option<Strea
     let command_name = field("command")?;
     let device = ctx.workspace.load_device(device_name)?;
     let cmd = device.command(command_name)?;
-    let Some(spec) = cmd.response.as_ref().and_then(|r| r.parse.as_ref()) else {
+    if cmd.response.as_ref().and_then(|r| r.parse.as_ref()).is_none() {
         bail!(
             "command {command_name:?} on device {device_name:?} declares no response.parse \
              block — stream_poll can only parse frames with a command that declares one"
         );
-    };
+    }
     Ok(Some(StreamParse {
         device: device_name.to_string(),
         command: command_name.to_string(),
-        spec: spec.clone(),
+        decoder: cmd.clone(),
         units: openbaud_core::exec::units(cmd),
     }))
 }

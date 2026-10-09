@@ -7,7 +7,7 @@ use openbaud::engine::audit::Audit;
 use openbaud::engine::session::Session;
 use openbaud::engine::transport::open_port;
 use openbaud::output::shape_result;
-use openbaud::run::{execute_command, execute_workflow, resolve_port, workflow_risk};
+use openbaud::run::{ensure_sendable, execute_command, execute_workflow, resolve_port, workflow_risk};
 use openbaud::workspace::{Device, Workspace};
 use openbaud_core::format::Risk;
 use openbaud_core::framing::Framing;
@@ -87,6 +87,16 @@ async fn run_command_cli(
     max_inline_bytes: usize,
 ) -> anyhow::Result<()> {
     let cmd = device.command(name)?;
+    if let Err(e) = ensure_sendable(&device.name, cmd) {
+        audit.record(json!({
+            "tool": "cli.run",
+            "device": device.name,
+            "command": name,
+            "ok": false,
+            "detail": format!("{e:#}"),
+        }))?;
+        return Err(e);
+    }
 
     if cmd.risk == Risk::Danger && !acknowledge_risk {
         audit.record(json!({

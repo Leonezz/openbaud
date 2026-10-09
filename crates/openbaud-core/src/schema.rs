@@ -22,7 +22,7 @@ selector, when present, sets at least one of vid / pid / serial_number / product
 transport.data_bits is 5..=8 and transport.stop_bits is 1 or 2.";
 
 const COMMAND_RULES: &str = "Semantic rules beyond this schema: \
-frame sets exactly one of hex / text; \
+frame sets exactly one of hex / text — or is omitted entirely to describe pushed data (below); \
 response.match sets exactly one of length / delimiter / idle_ms and is required unless expect: silence; \
 expect: exception requires a response.exception block; \
 parse sets exactly one of fields (binary) / regex (text); \
@@ -39,8 +39,9 @@ bits only on unsigned integer types (u8, u16be, u16le, u32be, u32le, u32me) with
 and setting scale or offset makes the value a float; \
 scale/offset/bits/unit go on the element fields of a record array, not on its container; \
 types values and split.type are either a bare type name (int, float, string, hex_int) \
-or an object {type, bits, scale, offset} running the same pipeline — \
-bits only for int/hex_int (a negative value is a runtime error), scale/offset not for string; \
+or an object {type, bits, scale, offset, unit} running the same pipeline — \
+bits only for int/hex_int (a negative value is a runtime error), scale/offset/unit not for string; \
+a unit on a split labels every element and is reported under the capture name; \
 split only applies to regex parsing, its keys must be named captures, and a capture cannot appear in both types and split; \
 validate.range and validate.at accept negative indices counted from the frame end (-1 = last byte); \
 validate defaults reproduce the classic tail checksum over all preceding bytes; \
@@ -49,16 +50,20 @@ its data must be a record-array field of response.parse.fields, and every channe
 so a device keeps its own field names and nothing is ever inferred from naming; \
 kind: polar requires both angle and radius (intensity optional), \
 and a channel whose field declares a unit of the wrong kind (an angle channel on a length field, or the reverse) is rejected; \
-kind: heatmap requires data to name a scalar array parse field plus rows and cols with rows x cols >= 1 \
-(cells fill the grid row-major, units ride on the data field); \
+kind: heatmap requires data to name a scalar array parse field or a split capture with a numeric element type, \
+plus rows and cols with rows x cols >= 1 (cells fill the grid row-major, units ride on the data source); \
 polar and heatmap are the only kinds a command YAML may declare — the timeline / diagnostics / capture kinds are \
 produced by tools (session_timeline / diagnose_frame / capture_frames), the scope kind is declared by the \
 live-stream descriptor an agent passes to show_result, and all of them are rejected here; \
-a command with no view is simply never charted.";
+a command with no view is simply never charted; \
+a command without frame describes data the device pushes on its own: it is never sent, \
+needs response.parse (validate and view optional), is read with stream_poll parse: {device, command} \
+(validate is enforced on every pushed frame), and takes no params, timing, \
+risk other than read, nor response.match / expect / exception / timeout_ms / first_byte_ms.";
 
 const WORKFLOW_RULES: &str = "Semantic rules beyond this schema: \
 steps must not be empty; \
-every referenced command must exist in the same device directory; \
+every referenced command must exist in the same device directory and have a frame (pushed-data commands are never sent); \
 finally steps always run, even after a failed step.";
 
 /// The JSON Schema for one knowledge format, with `$id` set to the format
@@ -88,8 +93,8 @@ pub fn json_schema(kind: SchemaKind) -> Value {
 
 /// An annotated YAML example for one knowledge format. Every document in the
 /// returned string loads through the corresponding `parse_*` function (the
-/// command example holds two documents separated by `---`: one binary, one
-/// text).
+/// command example holds three documents separated by `---`: binary, text, and a
+/// pushed-data descriptor).
 pub fn example(kind: SchemaKind) -> &'static str {
     match kind {
         SchemaKind::Profile => PROFILE_EXAMPLE,
@@ -115,7 +120,8 @@ selector:           # all present fields must match (AND)
   product: "CH340"  # substring match
 "#;
 
-const COMMAND_EXAMPLE: &str = r#"# openbaud command examples - two documents: binary response, then text.
+const COMMAND_EXAMPLE: &str = r#"# openbaud command examples - three documents: binary response, text response,
+# and pushed data the device streams.
 schema: openbaud/command@v0
 name: read_waveform
 description: Read a waveform block (validate range, ascii_int, scalar and record arrays)
@@ -182,11 +188,25 @@ response:
       # Object form runs the same pipeline as binary fields:
       # value = ((converted >> lsb) & mask(width)) x scale + offset.
       # bits only for int/hex_int (negative values error at runtime).
-      temp: { type: hex_int, offset: -40 }
+      temp: { type: hex_int, offset: -40, unit: C }  # unit: numeric types only
     split:
       # Split the "values" capture on "," and convert each piece (the element
       # type takes the bare or the object form too).
       values: { sep: ",", type: float }
+---
+# Pushed data: no frame. Never sent — a stream_poll subscription created
+# with parse: {device, command: therm_line} decodes every frame the device
+# pushes with it (validate, when declared, is enforced per frame).
+schema: openbaud/command@v0
+name: therm_line
+description: One line of the device's THERM push stream (8x8 thermal matrix)
+response:
+  parse:
+    regex: 'rows=(?P<rows>\d+) cols=(?P<cols>\d+) .*?: (?P<cells>.*)$'
+    types: { rows: int, cols: int }
+    split:
+      cells: { sep: ",", type: { type: float, unit: C } }
+  view: { kind: heatmap, data: cells, rows: 8, cols: 8 }  # a numeric split can feed a heatmap
 "#;
 
 const WORKFLOW_EXAMPLE: &str = r#"# openbaud workflow example - a fixed command sequence with cleanup.
@@ -279,7 +299,7 @@ mod tests {
         parse_profile(example(SchemaKind::Profile), "example.yaml").unwrap();
         parse_workflow(example(SchemaKind::Workflow), "example.yaml").unwrap();
         let docs: Vec<&str> = example(SchemaKind::Command).split("\n---\n").collect();
-        assert_eq!(docs.len(), 2, "command example should hold two documents");
+        assert_eq!(docs.len(), 3, "command example should hold three documents");
         for doc in docs {
             parse_command(doc, "example.yaml").unwrap();
         }

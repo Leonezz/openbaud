@@ -31,8 +31,8 @@
 
 use crate::engine::session::Session;
 use anyhow::{anyhow, bail};
-use openbaud_core::exec::parse_with_spec;
-use openbaud_core::format::ParseSpec;
+use openbaud_core::exec::parse_response;
+use openbaud_core::format::Command;
 use openbaud_core::framing::{Framing, TimedDeframer};
 use openbaud_core::hex;
 use serde_json::{json, Map, Value};
@@ -68,7 +68,10 @@ pub const MAX_POLL_INLINE_BYTES: usize = 262_144;
 pub struct StreamParse {
     pub device: String,
     pub command: String,
-    pub spec: ParseSpec,
+    /// The command whose response block decodes each frame — `validate` then
+    /// `parse`, through the same `parse_response` `run_command` uses, so a
+    /// declared checksum is enforced on streamed frames too.
+    pub decoder: Command,
     /// Unit labels from the command's field specs — the same semantics
     /// `run_command` reports as its top-level `units`.
     pub units: Map<String, Value>,
@@ -176,7 +179,7 @@ impl Subscription {
         let parsed = self
             .parse
             .as_ref()
-            .map(|p| parse_with_spec(&p.spec, &bytes).map_err(|e| e.to_string()));
+            .map(|p| parse_response(&p.decoder, &bytes).map_err(|e| e.to_string()));
         self.retained.push_back(RetainedFrame { seq: self.next_seq, ts_ms, bytes, parsed });
         self.next_seq += 1;
         // Risk ②: bounded retention — a lagging consumer loses the oldest

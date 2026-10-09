@@ -264,8 +264,12 @@ pub struct Command {
     /// Declared parameters usable in the frame template.
     #[serde(default)]
     pub params: Vec<ParamSpec>,
-    /// The bytes to transmit.
-    pub frame: FrameSpec,
+    /// The bytes to transmit. Omit it to describe data the device pushes on
+    /// its own (a stream payload): such a command is never sent — a
+    /// `stream_poll` subscription parses each pushed frame with it — so it
+    /// needs `response.parse` and takes no request-side settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame: Option<FrameSpec>,
     /// How to collect and interpret the reply; omit for fire-and-forget.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response: Option<ResponseSpec>,
@@ -636,7 +640,7 @@ pub enum TextType {
 
 /// Object form of a text-side coercion type. `bits` requires an integer type
 /// (int or hex_int) and errors at runtime on negative converted values;
-/// `scale`/`offset` require a numeric type; none of the three apply to
+/// `scale`/`offset`/`unit` require a numeric type; none of them apply to
 /// `string`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -654,6 +658,11 @@ pub struct TextTypeSpec {
     /// Added after scaling: `value = converted x scale + offset`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub offset: Option<f64>,
+    /// Display unit of the converted value (e.g. "V", "C"), reported in the
+    /// result's `units` exactly like a binary field's `unit`. On a split it
+    /// labels every element. Numeric types only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
 }
 
 /// A bit sub-field of an unsigned integer value, evaluated as
@@ -764,6 +773,11 @@ pub struct Verified {
 }
 
 impl Command {
+    /// Whether this command describes pushed data (no frame, never sent).
+    pub fn is_pushed(&self) -> bool {
+        self.frame.is_none()
+    }
+
     /// Declared parameter types, resolved. Only valid after `parse_command`.
     pub fn param_types(&self) -> HashMap<String, FieldType> {
         self.params
@@ -800,7 +814,11 @@ pub fn parse_command(yaml: &str, path: &str) -> crate::Result<Command> {
 
     // Frame: exactly one of hex/text; hex templates must parse and only use
     // declared, binary-encodable params.
-    match (&cmd.frame.hex, &cmd.frame.text) {
+    let Some(frame) = &cmd.frame else {
+        check_pushed_command(&cmd, path)?;
+        return Ok(cmd);
+    };
+    match (&frame.hex, &frame.text) {
         (Some(hex), None) => {
             let template = HexTemplate::parse(hex).map_err(|e| ferr(path, format!("frame.hex: {e}")))?;
             for name in template.param_names() {
@@ -871,6 +889,60 @@ pub fn parse_command(yaml: &str, path: &str) -> crate::Result<Command> {
     Ok(cmd)
 }
 
+/// A command without `frame` describes data the device pushes; it is never
+/// sent, so it carries the parse (and optionally validate and view) for each
+/// pushed frame and nothing of the request/response exchange. Every
+/// request-side setting is refused rather than silently ignored.
+fn check_pushed_command(cmd: &Command, path: &str) -> crate::Result<()> {
+    let refuse = |what: &str| {
+        Err(ferr(
+            path,
+            format!(
+                "{what} does not apply to pushed data: a command without frame is never sent — \
+                 the session's framing cuts the stream and each pushed frame is parsed with \
+                 response.parse. Remove it, or add a frame if the device must be asked"
+            ),
+        ))
+    };
+    let Some(resp) = cmd.response.as_ref().filter(|r| r.parse.is_some()) else {
+        return Err(ferr(
+            path,
+            "a command without frame describes pushed data and needs response.parse to \
+             decode each pushed frame (or add a frame if the device must be asked)",
+        ));
+    };
+    if !cmd.params.is_empty() {
+        return refuse("params");
+    }
+    if cmd.risk != Risk::Read {
+        return refuse("risk write/danger");
+    }
+    if cmd.timing.is_some() {
+        return refuse("timing");
+    }
+    if resp.match_spec.is_some() {
+        return refuse("response.match");
+    }
+    if resp.expect != Expect::Normal || resp.exception.is_some() {
+        return refuse("response.expect / response.exception");
+    }
+    if resp.timeout_ms != default_timeout_ms() {
+        return refuse("response.timeout_ms");
+    }
+    if resp.first_byte_ms.is_some() {
+        return refuse("response.first_byte_ms");
+    }
+    if let Some(v) = &resp.validate {
+        check_validate_spec(v, path, "validate")?;
+    }
+    let parse = resp.parse.as_ref().expect("filtered on parse above");
+    check_parse_spec(parse, path, "parse")?;
+    if let Some(view) = &resp.view {
+        check_view_spec(view, Some(parse), path)?;
+    }
+    Ok(())
+}
+
 /// Static checks for a `validate` block: known checksum name, and range
 /// inversion when both ends are non-negative (mixed signs are resolved at
 /// runtime against the actual frame length).
@@ -930,15 +1002,15 @@ fn check_view_spec(view: &ViewSpec, parse: Option<&ParseSpec>, path: &str) -> cr
             ));
         }
     }
+    if view.kind == ViewKind::Heatmap {
+        return check_heatmap_view(view, parse, path);
+    }
     let fields = parse.and_then(|p| p.fields.as_ref()).ok_or_else(|| {
         ferr(path, "response.view needs response.parse.fields to name channels in")
     })?;
     let data = fields.get(&view.data).ok_or_else(|| {
         ferr(path, format!("response.view.data {:?} is not a parse field", view.data))
     })?;
-    if view.kind == ViewKind::Heatmap {
-        return check_heatmap_view(view, data, path);
-    }
     let elements = data.elements.as_ref().ok_or_else(|| {
         ferr(
             path,
@@ -1008,10 +1080,11 @@ fn check_view_spec(view: &ViewSpec, parse: Option<&ParseSpec>, path: &str) -> cr
     Ok(())
 }
 
-/// Heatmap-specific view checks: the grid is filled row-major from a scalar
-/// array field, so `data` must be an array of single values and the declared
-/// grid must hold at least one cell. Units ride on the data field itself.
-fn check_heatmap_view(view: &ViewSpec, data: &FieldSpec, path: &str) -> crate::Result<()> {
+/// Heatmap-specific view checks: the grid is filled row-major from one array
+/// of single numeric values — a binary scalar array field, or a regex split
+/// capture — and the declared grid must hold at least one cell. Units ride on
+/// the data source itself.
+fn check_heatmap_view(view: &ViewSpec, parse: Option<&ParseSpec>, path: &str) -> crate::Result<()> {
     for (name, set) in [
         ("angle", view.angle.is_some()),
         ("radius", view.radius.is_some()),
@@ -1027,6 +1100,59 @@ fn check_heatmap_view(view: &ViewSpec, data: &FieldSpec, path: &str) -> crate::R
             ));
         }
     }
+    let parse = parse.ok_or_else(|| ferr(path, "response.view needs response.parse to name its data in"))?;
+    if let Some(field) = parse.fields.as_ref().and_then(|f| f.get(&view.data)) {
+        check_heatmap_field(view, field, path)?;
+    } else if let Some(split) = parse.split.as_ref().and_then(|s| s.get(&view.data)) {
+        let element = match &split.type_spec {
+            TextType::Name(name) => name.as_str(),
+            TextType::Spec(spec) => spec.type_name.as_str(),
+        };
+        if element == "string" {
+            return Err(ferr(
+                path,
+                format!(
+                    "response.view.data {:?} splits into string elements — heatmap cells \
+                     need a numeric element type (int, float or hex_int)",
+                    view.data
+                ),
+            ));
+        }
+    } else if parse.types.as_ref().is_some_and(|t| t.contains_key(&view.data)) {
+        return Err(ferr(
+            path,
+            format!(
+                "response.view.data {:?} is a single regex capture, not an array — split it \
+                 (response.parse.split) to give the heatmap its cells",
+                view.data
+            ),
+        ));
+    } else {
+        return Err(ferr(
+            path,
+            format!(
+                "response.view.data {:?} is neither a parse field nor a split capture",
+                view.data
+            ),
+        ));
+    }
+    let (Some(rows), Some(cols)) = (view.rows, view.cols) else {
+        return Err(ferr(
+            path,
+            "response.view kind heatmap requires both rows and cols grid dimensions",
+        ));
+    };
+    if rows == 0 || cols == 0 {
+        return Err(ferr(
+            path,
+            format!("response.view kind heatmap requires rows x cols >= 1, got {rows} x {cols}"),
+        ));
+    }
+    Ok(())
+}
+
+/// A binary heatmap source must be an array of single values.
+fn check_heatmap_field(view: &ViewSpec, data: &FieldSpec, path: &str) -> crate::Result<()> {
     if data.count.is_none() {
         return Err(ferr(
             path,
@@ -1045,18 +1171,6 @@ fn check_heatmap_view(view: &ViewSpec, data: &FieldSpec, path: &str) -> crate::R
                  values, so data must be a scalar array field",
                 view.data
             ),
-        ));
-    }
-    let (Some(rows), Some(cols)) = (view.rows, view.cols) else {
-        return Err(ferr(
-            path,
-            "response.view kind heatmap requires both rows and cols grid dimensions",
-        ));
-    };
-    if rows == 0 || cols == 0 {
-        return Err(ferr(
-            path,
-            format!("response.view kind heatmap requires rows x cols >= 1, got {rows} x {cols}"),
         ));
     }
     Ok(())
@@ -1119,10 +1233,14 @@ fn check_text_type(t: &TextType, path: &str, ctx: &str) -> crate::Result<()> {
             check_text_type_name(&spec.type_name, path, ctx)?;
             match spec.type_name.as_str() {
                 "string" => {
-                    if spec.bits.is_some() || spec.scale.is_some() || spec.offset.is_some() {
+                    if spec.bits.is_some()
+                        || spec.scale.is_some()
+                        || spec.offset.is_some()
+                        || spec.unit.is_some()
+                    {
                         return Err(ferr(
                             path,
-                            format!("{ctx}: bits/scale/offset do not apply to type string"),
+                            format!("{ctx}: bits/scale/offset/unit do not apply to type string"),
                         ));
                     }
                 }
@@ -1578,6 +1696,47 @@ response:
         assert!(err.contains("record array"), "got: {err}");
     }
 
+    /// A thermal camera that reports its matrix as one text line — the shape
+    /// of the AMG8833 GridEYE stream: header captures, then 64 values.
+    const TEXT_HEATMAP_COMMAND: &str = r#"
+schema: openbaud/command@v0
+name: thermal_frame
+frame: { text: "THERM?\r\n" }
+response:
+  match: { delimiter: "\r\n" }
+  parse:
+    regex: 'rows=(?P<rows>\d+) cols=(?P<cols>\d+) .*?: (?P<cells>.*)$'
+    types:
+      rows: int
+      cols: int
+    split:
+      cells: { sep: ",", type: { type: float, unit: C } }
+  view: { kind: heatmap, data: cells, rows: 8, cols: 8 }
+"#;
+
+    #[test]
+    fn heatmap_data_may_be_a_numeric_split_capture() {
+        let cmd = parse_command(TEXT_HEATMAP_COMMAND, "therm.yaml").unwrap();
+        let view = cmd.response.as_ref().unwrap().view.as_ref().expect("view parsed");
+        assert_eq!((view.kind, view.data.as_str()), (ViewKind::Heatmap, "cells"));
+        assert_eq!(crate::exec::units(&cmd).get("cells").and_then(|v| v.as_str()), Some("C"));
+
+        // A scalar capture is not a grid ...
+        let bad = TEXT_HEATMAP_COMMAND.replace("data: cells", "data: rows");
+        let err = parse_command(&bad, "therm.yaml").unwrap_err().to_string();
+        assert!(err.contains("rows") && err.contains("not an array"), "got: {err}");
+
+        // ... and string cells have no value to colour.
+        let bad = TEXT_HEATMAP_COMMAND.replace("{ type: float, unit: C }", "string");
+        let err = parse_command(&bad, "therm.yaml").unwrap_err().to_string();
+        assert!(err.contains("cells") && err.contains("numeric"), "got: {err}");
+
+        // A name that is neither still fails, naming both places it looked.
+        let bad = TEXT_HEATMAP_COMMAND.replace("data: cells", "data: nope");
+        let err = parse_command(&bad, "therm.yaml").unwrap_err().to_string();
+        assert!(err.contains("nope") && err.contains("split"), "got: {err}");
+    }
+
     #[test]
     fn heatmap_requires_a_positive_grid() {
         for (from, to, needle) in [
@@ -1640,6 +1799,66 @@ response:
         let bad = COMMAND.replace("{addr}", "{address}");
         let err = parse_command(&bad, "c.yaml").unwrap_err();
         assert!(err.to_string().contains("address"));
+    }
+
+    /// Data the device pushes on its own: no frame, never sent — a stream
+    /// subscription parses each pushed frame with it.
+    const PUSHED_COMMAND: &str = r#"
+schema: openbaud/command@v0
+name: therm_line
+description: One frame of the THERM push stream (8x8 GridEYE matrix)
+response:
+  parse:
+    regex: 'rows=(?P<rows>\d+) cols=(?P<cols>\d+) .*?: (?P<cells>.*)$'
+    types: { rows: int, cols: int }
+    split:
+      cells: { sep: ",", type: { type: float, unit: C } }
+  view: { kind: heatmap, data: cells, rows: 8, cols: 8 }
+"#;
+
+    #[test]
+    fn a_command_without_frame_describes_pushed_data() {
+        let cmd = parse_command(PUSHED_COMMAND, "therm_line.yaml").unwrap();
+        assert!(cmd.frame.is_none());
+        assert!(cmd.is_pushed());
+        let err = crate::exec::build_frame(&cmd, &serde_json::Map::new()).unwrap_err().to_string();
+        assert!(
+            err.contains("therm_line") && err.contains("stream_poll"),
+            "running it must point at stream_poll: {err}"
+        );
+    }
+
+    #[test]
+    fn a_pushed_data_command_refuses_request_semantics() {
+        let without_parse = r#"
+schema: openbaud/command@v0
+name: nothing
+response:
+  view: { kind: heatmap, data: cells, rows: 8, cols: 8 }
+"#;
+        let err = parse_command(without_parse, "n.yaml").unwrap_err().to_string();
+        assert!(err.contains("frame") && err.contains("response.parse"), "got: {err}");
+        let no_response = "schema: openbaud/command@v0\nname: nothing\n";
+        let err = parse_command(no_response, "n.yaml").unwrap_err().to_string();
+        assert!(err.contains("frame") && err.contains("response.parse"), "got: {err}");
+
+        for (from, to, needle) in [
+            ("response:\n  parse:", "response:\n  match: { delimiter: \"\\n\" }\n  parse:", "match"),
+            ("response:\n  parse:", "response:\n  expect: silence\n  parse:", "expect"),
+            ("response:\n  parse:", "response:\n  timeout_ms: 500\n  parse:", "timeout_ms"),
+            ("response:\n  parse:", "response:\n  first_byte_ms: 50\n  parse:", "first_byte_ms"),
+            ("response:\n", "risk: write\nresponse:\n", "risk"),
+            ("response:\n", "params:\n  - { name: n, type: u8 }\nresponse:\n", "params"),
+            ("response:\n", "timing: { pre_delay_ms: 5 }\nresponse:\n", "timing"),
+        ] {
+            let bad = PUSHED_COMMAND.replacen(from, to, 1);
+            assert_ne!(bad, PUSHED_COMMAND, "replacement {from:?} did not apply");
+            let err = parse_command(&bad, "therm_line.yaml").unwrap_err().to_string();
+            assert!(
+                err.contains(needle) && err.contains("pushed"),
+                "expected {needle:?} rejected for pushed data in: {err}"
+            );
+        }
     }
 
     #[test]
@@ -2014,6 +2233,10 @@ response:
             // shared bits sanity checks apply on the text side too
             ("bits: { lsb: 4, width: 4 }", "bits: { lsb: 4, width: 0 }", "width must be >= 1"),
             ("bits: { lsb: 4, width: 4 }", "bits: { lsb: 60, width: 10 }", "exceeds the 63-bit text integer"),
+            // a unit labels a quantity; a string capture is not one
+            ("temp:  { type: hex_int, offset: -40 }",
+             "temp:  { type: string, unit: C }",
+             "do not apply to type string"),
             // the base type name is still checked in object form
             ("{ type: int, scale: 0.5, offset: 1 }",
              "{ type: bytes, scale: 0.5, offset: 1 }",
