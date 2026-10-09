@@ -144,7 +144,7 @@ canvas.radar { position: absolute; inset: 0; width: 100%; height: 100%; display:
   border: 1px solid var(--scope-line);
   background: linear-gradient(to right, var(--scope-bg), var(--s1));
 }
-.heat-legend span { display: inline-flex; align-items: center; }
+.heat-legend span { display: inline-flex; align-items: center; gap: 0.35em; }
 
 /* ===== shared chart tooltip (render/tooltip.ts host, tokens only) ===== */
 

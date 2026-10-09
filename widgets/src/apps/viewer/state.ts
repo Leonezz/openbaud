@@ -14,6 +14,7 @@ import {
 } from '../../mcp/useWidget'
 import type { CaptureData } from './capture'
 import type { DiagnosticsData } from './diagnostics'
+import type { HeatmapSnapshot } from './heatmapSnapshot'
 import { asNumber, asString, dispatchResult, isRecord, type PolarScan } from './dispatch'
 import type { StreamDescriptor } from './stream'
 import type { TimelineData } from './timeline'
@@ -45,6 +46,12 @@ export type ViewerState =
   | { readonly kind: 'timeline'; readonly timeline: TimelineData; readonly ref: ResultRef }
   | { readonly kind: 'diagnostics'; readonly diagnostics: DiagnosticsData; readonly ref: ResultRef }
   | { readonly kind: 'capture'; readonly capture: CaptureData; readonly ref: ResultRef }
+  | {
+      readonly kind: 'heatmap'
+      readonly heatmap: HeatmapSnapshot
+      readonly replay: boolean
+      readonly ref: ResultRef
+    }
   /** Live stream descriptor — the view opens its own stream_poll subscription. */
   | { readonly kind: 'stream'; readonly descriptor: StreamDescriptor; readonly ref: ResultRef }
 
@@ -155,6 +162,9 @@ export function viewFor(
     return { kind: 'diagnostics', diagnostics: view.diagnostics, ref }
   }
   if (view.kind === 'capture') return { kind: 'capture', capture: view.capture, ref }
+  if (view.kind === 'heatmap') {
+    return { kind: 'heatmap', heatmap: view.heatmap, replay: view.replay, ref }
+  }
   if (view.kind === 'stream') return { kind: 'stream', descriptor: view.descriptor, ref }
   if (view.kind === 'invalid') return { kind: 'invalid', reason: view.reason }
   return { kind: 'generic', structured, ref }

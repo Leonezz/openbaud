@@ -8,6 +8,7 @@ import { CaptureView } from './CaptureView'
 import { DiagnosticsView } from './DiagnosticsView'
 import { isRecord } from './dispatch'
 import { GenericView } from './GenericView'
+import { HeatmapSnapshotView } from './HeatmapSnapshotView'
 import { HeatmapView } from './HeatmapView'
 import { PolarView } from './PolarView'
 import { ScopeView } from './ScopeView'
@@ -173,6 +174,15 @@ export function ViewerApp() {
       )
     case 'capture':
       return <CaptureView widget={widget} capture={state.capture} resultRef={state.ref} />
+    case 'heatmap':
+      return (
+        <HeatmapSnapshotView
+          widget={widget}
+          heatmap={state.heatmap}
+          replay={state.replay}
+          resultRef={state.ref}
+        />
+      )
     case 'stream':
       // Live branch: the view opens its own per-consumer stream_poll
       // subscription — it never shares (or steals from) the agent's.

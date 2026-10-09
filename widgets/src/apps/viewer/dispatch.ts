@@ -25,6 +25,7 @@ import type { OpenbaudSummary } from '../../mcp/useWidget'
 import type { PolarPoint } from '../../render/polar'
 import { readCapture, type CaptureData } from './capture'
 import { readDiagnostics, type DiagnosticsData } from './diagnostics'
+import { readHeatmapSnapshot, type HeatmapSnapshot } from './heatmapSnapshot'
 import { readStreamDescriptor, type StreamDescriptor } from './stream'
 import { readTimeline, type TimelineData } from './timeline'
 
@@ -103,6 +104,8 @@ export type DispatchedView =
   | { readonly kind: 'timeline'; readonly timeline: TimelineData }
   | { readonly kind: 'diagnostics'; readonly diagnostics: DiagnosticsData }
   | { readonly kind: 'capture'; readonly capture: CaptureData }
+  /** A saved result's one grid (the live heatmap is a stream descriptor). */
+  | { readonly kind: 'heatmap'; readonly heatmap: HeatmapSnapshot; readonly replay: boolean }
   /** Live stream descriptor: the widget opens its own stream_poll subscription. */
   | { readonly kind: 'stream'; readonly descriptor: StreamDescriptor }
   | { readonly kind: 'generic' }
@@ -137,7 +140,7 @@ function readEncoding(declared: unknown, label: string): PolarEncoding | Invalid
   }
   if (declared.kind !== 'polar') {
     return invalid(
-      `${label}.kind ${describe(declared.kind)} is not supported — this viewer renders "polar", "timeline", "diagnostics" and "capture" from saved results, plus "scope" and "heatmap" from a live stream descriptor`,
+      `${label}.kind ${describe(declared.kind)} is not supported — this viewer renders "polar", "heatmap", "timeline", "diagnostics" and "capture" from saved results, plus "scope" and "heatmap" from a live stream descriptor`,
     )
   }
   const data = nameOf(declared.data)
@@ -291,9 +294,9 @@ export function dispatchResult(structured: OpenbaudSummary, override?: unknown):
     const read = readStreamDescriptor(structured, 'data')
     return read.kind === 'stream' ? { kind: 'stream', descriptor: read.descriptor } : read
   }
-  if (isRecord(declared) && (declared.kind === 'scope' || declared.kind === 'heatmap')) {
+  if (isRecord(declared) && declared.kind === 'scope') {
     return invalid(
-      `view.kind ${JSON.stringify(declared.kind)} is live-only — it renders a stream descriptor ({ stream: { session_id, parse }, view }), and this payload carries no "stream" object`,
+      `view.kind "scope" is live-only — it renders a stream descriptor ({ stream: { session_id, parse }, view }), and this payload carries no "stream" object`,
     )
   }
   if (declared === undefined || declared === null) return { kind: 'generic' }
@@ -310,6 +313,14 @@ export function dispatchResult(structured: OpenbaudSummary, override?: unknown):
   }
   if (isRecord(declared) && declared.kind === 'capture') {
     return readCapture(structured, label, isReplayResult(structured))
+  }
+  // A saved heatmap: the one grid this result carries (a command declared
+  // the view, or the agent passed it as an encoding).
+  if (isRecord(declared) && declared.kind === 'heatmap') {
+    const read = readHeatmapSnapshot(structured as JsonRecord, declared, label)
+    return read.kind === 'heatmap'
+      ? { kind: 'heatmap', heatmap: read.heatmap, replay: isReplayResult(structured) }
+      : read
   }
 
   const encoding = readEncoding(declared, label)

@@ -1,21 +1,16 @@
 // Live rows×cols heatmap: the same useStreamPoll state machine as ScopeView,
-// rendering the newest frame's parsed[data] array onto a canvas. The color
-// ramp interpolates two theme tokens (src/render/heat.ts), so both themes get
-// their own readable band and the legend gradient (pure CSS, same tokens)
-// always matches the cells. A frame whose grid does not fit the declared
-// rows×cols is counted and named — the last good grid stays on screen.
-import { useCallback, useEffect, useRef, useState } from 'react'
+// rendering the newest frame's parsed[data] array through the shared heat
+// grid (HeatGrid.tsx). A frame whose grid does not fit the declared rows×cols
+// is counted and named — the last good grid stays on screen.
+import { useCallback, useRef, useState } from 'react'
 import { Card, CardSpacer } from '../../components/Card'
 import { Chip } from '../../components/Chip'
 import { Led } from '../../components/Led'
 import type { WidgetHandle } from '../../mcp/useWidget'
-import { cssVarReader } from '../../render/uplot-host'
-import { drawHeatmapGrid, gridRange } from '../../render/heat'
+import { HeatCanvas, HeatEmpty, HeatLegend } from './HeatGrid'
 import type { HeatmapSpec, StreamFrame, StreamRef } from './stream'
 import { StreamErrorNotice, StreamStatusLine } from './StreamStatus'
 import { POLL_INTERVAL_MS, useStreamPoll, type FrameDelivery } from './useStreamPoll'
-
-const HEATMAP_HEIGHT = 280
 
 interface Grid {
   readonly values: readonly number[]
@@ -72,8 +67,6 @@ export interface HeatmapViewProps {
 }
 
 export function HeatmapView({ widget, stream, spec }: HeatmapViewProps) {
-  const canvasRef = useRef<HTMLCanvasElement | null>(null)
-  const wrapRef = useRef<HTMLDivElement | null>(null)
   const baseTsRef = useRef<number | undefined>(undefined)
   const [grid, setGrid] = useState<Grid | undefined>(undefined)
   const [bad, setBad] = useState<BadGrids>({ count: 0, reason: undefined })
@@ -97,42 +90,7 @@ export function HeatmapView({ widget, stream, spec }: HeatmapViewProps) {
 
   const status = useStreamPoll(widget, stream, onFrames)
 
-  // Paint the newest grid; theme switches repaint through the same path since
-  // the ramp tokens are read at draw time.
-  const theme = widget.theme
-  useEffect(() => {
-    const canvas = canvasRef.current
-    const wrap = wrapRef.current
-    if (canvas === null || wrap === null || grid === undefined) return
-    const paint = (): void => {
-      const dpr = window.devicePixelRatio || 1
-      const width = Math.max(1, Math.floor(wrap.clientWidth))
-      const height = HEATMAP_HEIGHT
-      canvas.width = Math.floor(width * dpr)
-      canvas.height = Math.floor(height * dpr)
-      canvas.style.width = `${width}px`
-      canvas.style.height = `${height}px`
-      const ctx = canvas.getContext('2d')
-      if (ctx === null) {
-        throw new Error('heatmap: canvas 2d context unavailable')
-      }
-      drawHeatmapGrid(
-        ctx,
-        { rows: spec.rows, cols: spec.cols, width: canvas.width, height: canvas.height },
-        grid.values,
-        cssVarReader(canvas),
-      )
-    }
-    paint()
-    const observer = new ResizeObserver(paint)
-    observer.observe(wrap)
-    return () => observer.disconnect()
-  }, [grid, spec, theme])
-
-  const range = grid !== undefined ? gridRange(grid.values) : undefined
   const unit = status.units[spec.data]
-  const withUnit = (value: number): string =>
-    `${Number.isInteger(value) ? value : value.toFixed(2)}${unit !== undefined ? ` ${unit}` : ''}`
   const lossy = status.droppedFrames > 0 || status.droppedChunks > 0
 
   return (
@@ -174,31 +132,13 @@ export function HeatmapView({ widget, stream, spec }: HeatmapViewProps) {
               poll <b>{POLL_INTERVAL_MS} ms</b>
             </span>
           </div>
-          <div ref={wrapRef} className="heat-wrap">
-            {grid !== undefined ? (
-              <canvas ref={canvasRef} className="heat-canvas" />
-            ) : (
-              <div className="heat-empty">waiting for the first grid frame</div>
-            )}
-          </div>
-        </div>
-        <div className="viewer-kpi heat-legend">
-          <span>
-            <i className="heat-ramp" />
-            {range !== undefined ? (
-              <>
-                min <b>{withUnit(range.min)}</b> · max <b>{withUnit(range.max)}</b>
-              </>
-            ) : (
-              <>no grid yet</>
-            )}
-          </span>
-          {unit !== undefined && (
-            <span>
-              unit <b>{unit}</b>
-            </span>
+          {grid !== undefined ? (
+            <HeatCanvas rows={spec.rows} cols={spec.cols} values={grid.values} theme={widget.theme} />
+          ) : (
+            <HeatEmpty text="waiting for the first grid frame" />
           )}
         </div>
+        <HeatLegend values={grid?.values} unit={unit} />
         <StreamStatusLine status={status} />
         {bad.count > 0 && (
           <div className="viewer-kpi">

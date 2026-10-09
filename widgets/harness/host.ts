@@ -21,6 +21,7 @@ import {
 } from './fixtures'
 import { captureEnvelope, captureTextForUri } from './capture-fixture'
 import { diagnosticsResult } from './diagnostics-fixture'
+import { heatmapSnapshotResult } from './heatmap-fixture'
 import {
   badStreamDescriptor,
   handleStreamPoll,
@@ -229,6 +230,9 @@ const INLINE_SCENARIOS: Readonly<
   show_result_replay: { data: replayRadarResult, envelope: SHOW_RESULT_INLINE },
   // diagnose_frame payload: real OBP frame with its CRC rewritten to ccitt.
   show_result_diagnostics: { data: () => diagnosticsResult(), envelope: SHOW_RESULT_INLINE },
+  // A command result declaring view: heatmap — the saved-grid branch (the
+  // live heatmap is a stream descriptor scenario).
+  show_result_heatmap_saved: { data: () => heatmapSnapshotResult(), envelope: SHOW_RESULT_INLINE },
   // Live stream descriptors: the widget subscribes via stream_poll itself.
   show_result_scope: { data: () => scopeStreamDescriptor(), envelope: SHOW_RESULT_INLINE },
   show_result_scope_dropped: { data: () => scopeStreamDescriptor(), envelope: SHOW_RESULT_INLINE },
