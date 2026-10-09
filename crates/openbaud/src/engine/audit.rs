@@ -24,6 +24,7 @@ impl Audit {
             .as_object_mut()
             .context("audit entry must be a JSON object")?;
         obj.insert("ts_ms".to_string(), Value::from(crate::engine::now_ms()));
+        obj.insert("run".to_string(), Value::from(crate::engine::run_id()));
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)

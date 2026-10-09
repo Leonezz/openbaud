@@ -14,7 +14,7 @@ use anyhow::{anyhow, bail, Context};
 use openbaud_core::checksum::ChecksumKind;
 use openbaud_core::exec::{parse_with_spec, verify_checksum};
 use openbaud_core::format::{Encoding, FramingSpec, ParseSpec, ValidateSpec};
-use openbaud_core::framing::{Deframer, Framing};
+use openbaud_core::framing::{Framing, TimedDeframer, TimedFrame};
 use openbaud_core::hex;
 use openbaud_core::CoreError;
 use serde_json::{json, Map, Value};
@@ -98,6 +98,9 @@ struct ObcapRecord {
 
 struct Obcap {
     session: String,
+    /// The recording process's run id; absent in captures made before run
+    /// ids existed, which then match audit entries by session id alone.
+    run: Option<String>,
     port: String,
     started_ms: u64,
     records: Vec<ObcapRecord>,
@@ -126,6 +129,11 @@ fn read_obcap(file: &Path, rel: &str) -> anyhow::Result<Obcap> {
             .ok_or_else(|| anyhow!("capture {rel:?}: header has no string {key:?}"))
     };
     let session = header_str("session")?;
+    let run = match header.get("run") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(run)) => Some(run.clone()),
+        Some(other) => bail!("capture {rel:?}: header run is not a string: {other}"),
+    };
     let port = header_str("port")?;
     let started_ms = header
         .get("started_ms")
@@ -162,7 +170,7 @@ fn read_obcap(file: &Path, rel: &str) -> anyhow::Result<Obcap> {
         }
         records.push(ObcapRecord { ts_ms, dir, bytes });
     }
-    Ok(Obcap { session, port, started_ms, records })
+    Ok(Obcap { session, run, port, started_ms, records })
 }
 
 // ---------------------------------------------------------------------------
@@ -183,7 +191,7 @@ pub fn session_timeline(args: &Value, ctx: &Arc<Ctx>) -> anyhow::Result<Value> {
     }
     let max_inline = arg_max_inline(args)?;
 
-    let all_events = audit_events(&ctx.workspace.root, &cap.session)?;
+    let all_events = audit_events(&ctx.workspace.root, &cap.session, cap.run.as_deref())?;
 
     // Natural span: the capture's own range — header start through its last
     // record. Never derived from audit events: session ids restart at s1
@@ -258,8 +266,10 @@ fn event_kind(entry: &Value) -> Option<&'static str> {
 
 /// The audit entries of one session as (ts_ms, timeline event) pairs. A
 /// missing audit log means no writes ever happened — an empty event list, not
-/// an error; a malformed line is loud.
-fn audit_events(root: &Path, session: &str) -> anyhow::Result<Vec<(u64, Value)>> {
+/// an error; a malformed line is loud. When the capture names its run, an
+/// entry must come from that run too: another process's same-named session
+/// is a different session.
+fn audit_events(root: &Path, session: &str, run: Option<&str>) -> anyhow::Result<Vec<(u64, Value)>> {
     let path = root.join(".openbaud/audit.jsonl");
     let content = match std::fs::read_to_string(&path) {
         Ok(content) => content,
@@ -276,7 +286,20 @@ fn audit_events(root: &Path, session: &str) -> anyhow::Result<Vec<(u64, Value)>>
         if entry.get("session").and_then(Value::as_str) != Some(session) {
             continue;
         }
-        let Some(ts_ms) = entry.get("ts_ms").and_then(Value::as_u64) else { continue };
+        if run.is_some() && entry.get("run").and_then(Value::as_str) != run {
+            continue;
+        }
+        // Place the event where its operation started: an operation that ran
+        // during the capture began no later than its own first byte, so it is
+        // inside the capture's span even when it completed after the last
+        // byte. Entries from before `started_ms` existed fall back to ts_ms.
+        let Some(ts_ms) = entry
+            .get("started_ms")
+            .and_then(Value::as_u64)
+            .or_else(|| entry.get("ts_ms").and_then(Value::as_u64))
+        else {
+            continue;
+        };
         let Some(kind) = event_kind(&entry) else { continue };
         let Some(tool) = entry.get("tool").and_then(Value::as_str) else { continue };
         let Some(ok) = entry.get("ok").and_then(Value::as_bool) else { continue };
@@ -385,55 +408,34 @@ struct CapFrame {
     bytes: Vec<u8>,
 }
 
-/// One direction's deframing state: a Deframer plus the pending-start
-/// timestamp, with the same semantics as `pending_since_ms` in session.rs —
-/// set when bytes enter an empty deframer, cleared when nothing is pending.
+/// One direction's deframing state: the shared `TimedDeframer`, fed with the
+/// recorded timestamps — the same rule live `read` and `stream_poll` apply to
+/// arrival times, so a capture re-frames exactly as the session framed it.
 struct Lane {
     dir: Dir,
-    deframer: Deframer,
-    pending_since: Option<u64>,
-    last_ts: Option<u64>,
+    deframer: TimedDeframer,
 }
 
 impl Lane {
     fn new(dir: Dir, framing: &Framing) -> Self {
-        Self { dir, deframer: Deframer::new(framing.clone()), pending_since: None, last_ts: None }
+        Self { dir, deframer: TimedDeframer::new(framing.clone()) }
     }
 
-    /// Idle-gap boundary, driven by record timestamps instead of the wall
-    /// clock: flush pending once the gap to `now_ts` reaches idle_ms.
-    /// `now_ts: None` is the end of the file — the wire went quiet for good.
-    fn idle_flush(&mut self, now_ts: Option<u64>, out: &mut Vec<CapFrame>) {
-        let Framing::Idle { idle_ms } = self.deframer.framing() else { return };
-        let idle_ms = *idle_ms;
-        if self.deframer.pending_len() == 0 {
-            return;
-        }
-        let gap_hit = match (now_ts, self.last_ts) {
-            (Some(now), Some(last)) => now.saturating_sub(last) >= idle_ms,
-            (None, _) => true,
-            (_, None) => false,
-        };
-        if gap_hit {
-            if let Some(bytes) = self.deframer.flush_pending() {
-                let ts = self.pending_since.take().unwrap_or_else(|| self.last_ts.unwrap_or(0));
-                out.push(CapFrame { seq: 0, ts_ms: ts, dir: self.dir, bytes });
-            }
-        }
+    fn emit(&self, frame: TimedFrame, out: &mut Vec<CapFrame>) {
+        out.push(CapFrame { seq: 0, ts_ms: frame.ts_ms, dir: self.dir, bytes: frame.bytes });
     }
 
     fn push(&mut self, rec: &ObcapRecord, out: &mut Vec<CapFrame>) {
-        self.idle_flush(Some(rec.ts_ms), out);
-        if self.pending_since.is_none() {
-            self.pending_since = Some(rec.ts_ms);
+        for frame in self.deframer.push(rec.ts_ms, &rec.bytes) {
+            self.emit(frame, out);
         }
-        for bytes in self.deframer.push(&rec.bytes) {
-            out.push(CapFrame { seq: 0, ts_ms: rec.ts_ms, dir: self.dir, bytes });
+    }
+
+    /// End of the file: the wire went quiet for good.
+    fn finish(&mut self, out: &mut Vec<CapFrame>) {
+        if let Some(frame) = self.deframer.finish() {
+            self.emit(frame, out);
         }
-        if self.deframer.pending_len() == 0 {
-            self.pending_since = None;
-        }
-        self.last_ts = Some(rec.ts_ms);
     }
 }
 
@@ -450,8 +452,8 @@ fn deframe_capture(records: &[ObcapRecord], framing: &Framing) -> (Vec<CapFrame>
             Dir::Rx => rx.push(rec, &mut frames),
         }
     }
-    tx.idle_flush(None, &mut frames);
-    rx.idle_flush(None, &mut frames);
+    tx.finish(&mut frames);
+    rx.finish(&mut frames);
     let unframed = (tx.deframer.pending_len() as u64, rx.deframer.pending_len() as u64);
     // An idle flush triggered late can carry an earlier pending-start ts than
     // frames already emitted from the other lane; a stable time sort restores

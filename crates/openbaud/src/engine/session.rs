@@ -7,7 +7,7 @@ use crate::engine::stream::SubscriptionSet;
 use crate::engine::transport::BoxedPort;
 use crate::engine::now_ms;
 use anyhow::{anyhow, bail, Context};
-use openbaud_core::framing::{Deframer, Framing, MatchRule, Matcher};
+use openbaud_core::framing::{Framing, MatchRule, Matcher, TimedDeframer, TimedFrame};
 use openbaud_core::hex;
 use std::collections::VecDeque;
 use std::path::Path;
@@ -101,8 +101,7 @@ impl Shared {
 struct ReadState {
     cursor: u64,
     seen_dropped: u64,
-    deframer: Deframer,
-    pending_since_ms: Option<u64>,
+    deframer: TimedDeframer,
     /// Frames deframed but not yet delivered (overflow of a max_frames read).
     queued: Vec<Frame>,
 }
@@ -175,8 +174,7 @@ impl Session {
             read_state: Mutex::new(ReadState {
                 cursor: 0,
                 seen_dropped: 0,
-                deframer: Deframer::new(framing),
-                pending_since_ms: None,
+                deframer: TimedDeframer::new(framing),
                 queued: Vec::new(),
             }),
             request_lock: Mutex::new(()),
@@ -203,10 +201,6 @@ impl Session {
     /// `stream_poll` uses to mirror `read_frames`' dead-port rule.
     pub(crate) fn check_alive(&self) -> anyhow::Result<()> {
         self.shared.check_alive()
-    }
-
-    pub(crate) fn last_rx(&self) -> u64 {
-        self.shared.last_rx_ms.load(Ordering::Relaxed)
     }
 
     /// The instantaneous session counters every `stream_poll` result folds in
@@ -317,31 +311,17 @@ impl Session {
                 let (chunks, new_cursor, _skipped) = buf.since(state.cursor);
                 state.cursor = new_cursor;
                 drop(buf);
+                // Idle boundaries between buffered chunks come from their
+                // arrival times, so a late read sees the same frames as a
+                // prompt one.
                 for (ts, bytes) in chunks {
-                    if state.pending_since_ms.is_none() {
-                        state.pending_since_ms = Some(ts);
-                    }
-                    for frame in state.deframer.push(&bytes) {
-                        frames.push(make_frame(ts, frame));
-                    }
-                    if state.deframer.pending_len() == 0 {
-                        state.pending_since_ms = None;
-                    }
+                    frames.extend(state.deframer.push(ts, &bytes).into_iter().map(make_frame));
                 }
             }
 
-            // Idle-gap framing: flush pending once the wire has been quiet.
-            if let Framing::Idle { idle_ms } = state.deframer.framing() {
-                let idle_ms = *idle_ms;
-                if state.deframer.pending_len() > 0 {
-                    let last = self.shared.last_rx_ms.load(Ordering::Relaxed);
-                    if now_ms().saturating_sub(last) >= idle_ms {
-                        if let Some(pending) = state.deframer.flush_pending() {
-                            let ts = state.pending_since_ms.take().unwrap_or_else(now_ms);
-                            frames.push(make_frame(ts, pending));
-                        }
-                    }
-                }
+            // The idle tail: close the last frame once the wire has been quiet.
+            if let Some(tail) = state.deframer.flush_if_quiet(now_ms()) {
+                frames.push(make_frame(tail));
             }
 
             if !frames.is_empty() || tokio::time::Instant::now() >= deadline {
@@ -557,8 +537,8 @@ impl Drop for Session {
     }
 }
 
-fn make_frame(ts_ms: u64, bytes: Vec<u8>) -> Frame {
-    Frame { ts_ms, hex: hex::to_hex(&bytes), text: hex::to_text_lossy(&bytes) }
+fn make_frame(frame: TimedFrame) -> Frame {
+    Frame { ts_ms: frame.ts_ms, hex: hex::to_hex(&frame.bytes), text: hex::to_text_lossy(&frame.bytes) }
 }
 
 async fn reader_loop(mut read_half: ReadHalf<BoxedPort>, shared: Arc<Shared>) {

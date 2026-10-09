@@ -45,6 +45,7 @@ impl CaptureWriter {
         let header = json!({
             "obcap": 1,
             "session": session,
+            "run": crate::engine::run_id(),
             "port": port,
             "note": note,
             "started_ms": started_ms,

@@ -1397,6 +1397,104 @@ async fn session_timeline_span_is_never_derived_from_audit_events() {
 }
 
 #[tokio::test]
+async fn session_timeline_ignores_a_concurrent_process_with_the_same_session_id() {
+    // Two server processes on one workspace (say, two agent hosts) both
+    // number their first session s1. Clipping to the capture's span is not
+    // enough when they overlap in time: the capture's run id decides.
+    let dir = scaffold_workspace();
+    write_obcap(
+        dir.path(),
+        "t.obcap",
+        &[
+            r#"{"obcap":1,"session":"s1","run":"rA","port":"mock:echo","note":null,"started_ms":1000}"#,
+            r#"{"ts_ms":1100,"dir":"tx","hex":"01"}"#,
+            r#"{"ts_ms":1900,"dir":"rx","hex":"AA"}"#,
+        ],
+    );
+    std::fs::create_dir_all(dir.path().join(".openbaud")).unwrap();
+    std::fs::write(
+        dir.path().join(".openbaud/audit.jsonl"),
+        concat!(
+            r#"{"tool":"send","session":"s1","run":"rA","port":"mock:echo","ok":true,"ts_ms":1200}"#,
+            "\n",
+            r#"{"tool":"send","session":"s1","run":"rB","port":"/dev/other","ok":true,"ts_ms":1300}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+    let ctx = ctx_for(&dir);
+
+    let result =
+        tools::call("session_timeline", json!({ "path": "captures/t.obcap" }), &ctx).await.unwrap();
+    let events = result["events"].as_array().unwrap();
+    assert_eq!(events.len(), 1, "the other process's s1 must not appear: {events:?}");
+    assert_eq!(events[0]["ts_ms"], json!(1200));
+}
+
+#[tokio::test]
+async fn session_timeline_places_events_at_their_start_inside_the_capture() {
+    // A request is audited once its response is in — after the capture's last
+    // byte when it is the final operation before capture_stop. Placed at its
+    // completion it would fall outside the span and vanish; placed where it
+    // started (it began before its own tx record) it is always on the
+    // timeline it belongs to.
+    let dir = scaffold_workspace();
+    write_obcap(
+        dir.path(),
+        "t.obcap",
+        &[
+            r#"{"obcap":1,"session":"s1","run":"rA","port":"mock:echo","note":null,"started_ms":1000}"#,
+            r#"{"ts_ms":1850,"dir":"tx","hex":"01"}"#,
+            r#"{"ts_ms":1900,"dir":"rx","hex":"AA"}"#,
+        ],
+    );
+    std::fs::create_dir_all(dir.path().join(".openbaud")).unwrap();
+    std::fs::write(
+        dir.path().join(".openbaud/audit.jsonl"),
+        concat!(
+            r#"{"tool":"request","session":"s1","run":"rA","port":"mock:echo","ok":true,"started_ms":1849,"ts_ms":1950}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+    let ctx = ctx_for(&dir);
+
+    let result =
+        tools::call("session_timeline", json!({ "path": "captures/t.obcap" }), &ctx).await.unwrap();
+    let events = result["events"].as_array().unwrap();
+    assert_eq!(events.len(), 1, "the final request belongs on this timeline: {result}");
+    assert_eq!(events[0]["ts_ms"], json!(1849), "placed where it started");
+}
+
+#[tokio::test]
+async fn captures_and_audit_entries_carry_this_process_run_id() {
+    let dir = scaffold_workspace();
+    let ctx = ctx_for(&dir);
+    let opened = tools::call("open", json!({ "port": "mock:echo" }), &ctx).await.unwrap();
+    let sid = opened["session_id"].as_str().unwrap().to_string();
+    let started =
+        tools::call("capture_start", json!({ "session_id": sid }), &ctx).await.unwrap();
+    let rel = started["path"].as_str().unwrap().to_string();
+    tools::call("send", json!({ "session_id": sid, "hex": "01" }), &ctx).await.unwrap();
+    tools::call("capture_stop", json!({ "session_id": sid }), &ctx).await.unwrap();
+    tools::call("close", json!({ "session_id": sid }), &ctx).await.unwrap();
+
+    let header_line = std::fs::read_to_string(dir.path().join(&rel)).unwrap();
+    let header: Value = serde_json::from_str(header_line.lines().next().unwrap()).unwrap();
+    let run = header["run"].as_str().expect("capture header names its run").to_string();
+    assert!(!run.is_empty());
+    let audit = std::fs::read_to_string(dir.path().join(".openbaud/audit.jsonl")).unwrap();
+    let last: Value = serde_json::from_str(audit.lines().last().unwrap()).unwrap();
+    assert_eq!(last["run"], json!(run), "audit entries carry the same run id: {last}");
+
+    let timeline = tools::call("session_timeline", json!({ "path": rel }), &ctx).await.unwrap();
+    assert!(
+        timeline["events"].as_array().unwrap().iter().any(|e| e["tool"] == json!("send")),
+        "this process's own write is on its own timeline: {timeline}"
+    );
+}
+
+#[tokio::test]
 async fn session_timeline_rejects_session_ids_and_bad_paths() {
     let dir = scaffold_workspace();
     let ctx = ctx_for(&dir);
@@ -2248,6 +2346,97 @@ async fn stream_poll_parameter_errors_are_loud() {
     .await
     .unwrap_err();
     assert!(err.to_string().contains("belongs"), "got: {err:#}");
+}
+
+// ---------------------------------------------------------------------------
+// Idle-gap framing for consumers slower than the wire
+// ---------------------------------------------------------------------------
+
+/// A port that emits `chunks` on its own, `gap_ms` apart, without being asked
+/// — a push stream. The test thread decides when (and whether) to read.
+fn talker_port(chunks: Vec<&'static [u8]>, gap_ms: u64) -> BoxedPort {
+    let (client, server) = tokio::io::duplex(4096);
+    tokio::spawn(async move {
+        let (_read, mut write) = tokio::io::split(server);
+        for chunk in chunks {
+            write.write_all(chunk).await.expect("talker write");
+            write.flush().await.ok();
+            tokio::time::sleep(std::time::Duration::from_millis(gap_ms)).await;
+        }
+        std::future::pending::<()>().await;
+    });
+    Box::new(client)
+}
+
+/// Block until the session has received `bytes` rx bytes, then let the wire
+/// stay quiet past the idle threshold — every chunk is buffered and unread.
+async fn wait_until_buffered(session: &Session, bytes: u64, quiet_ms: u64) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while session.stream_stats()["rx_bytes"].as_u64().unwrap_or(0) < bytes {
+        assert!(tokio::time::Instant::now() < deadline, "talker never delivered {bytes} bytes");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(quiet_ms)).await;
+}
+
+#[tokio::test]
+async fn read_keeps_idle_boundaries_of_chunks_buffered_before_the_read() {
+    // Three chunks 250 ms apart under idle_ms: 100 — three frames on the wire.
+    // The consumer reads only after all three are buffered, as an agent does.
+    // Boundaries are a property of the arrival times, not of when the
+    // consumer happens to ask; reading late must not merge them.
+    let session = Session::spawn(
+        "slow-read".into(),
+        "mock:talker".into(),
+        Framing::Idle { idle_ms: 100 },
+        talker_port(vec![b"A1", b"B2", b"C3"], 250),
+    );
+    wait_until_buffered(&session, 6, 300).await;
+
+    let frames = session.read_frames(500, 32).await.unwrap().frames;
+    let texts: Vec<String> = frames.iter().map(|f| f.text.clone()).collect();
+    assert_eq!(texts, vec!["A1", "B2", "C3"], "a late read must not merge idle-separated chunks");
+    let ts: Vec<u64> = frames.iter().map(|f| f.ts_ms).collect();
+    assert!(
+        ts.windows(2).all(|w| w[1] >= w[0] + 100),
+        "each frame keeps its own arrival time, not the first chunk's: {ts:?}"
+    );
+}
+
+#[tokio::test]
+async fn late_stream_subscription_keeps_idle_boundaries() {
+    // A subscription created after the chunks arrived deframes the retained
+    // buffer: the same three idle-separated frames, never one merged blob.
+    let session = Session::spawn(
+        "late-sub".into(),
+        "mock:talker".into(),
+        Framing::Idle { idle_ms: 100 },
+        talker_port(vec![b"A1", b"B2", b"C3"], 250),
+    );
+    wait_until_buffered(&session, 6, 300).await;
+
+    let now = openbaud::engine::now_ms();
+    let sub = session.stream_subscribe(now, None).unwrap();
+    let result = session.stream_pull(&sub, None, 64, DEFAULT_POLL_INLINE_BYTES, now).unwrap();
+    let texts: Vec<&str> =
+        result["frames"].as_array().unwrap().iter().map(|f| f["text"].as_str().unwrap()).collect();
+    assert_eq!(texts, vec!["A1", "B2", "C3"], "got: {result}");
+}
+
+#[tokio::test]
+async fn idle_tail_still_flushes_once_the_wire_goes_quiet() {
+    // The last frame has no following chunk to close it; it is cut by the
+    // wire staying quiet past idle_ms — and only then.
+    let session = Session::spawn(
+        "tail".into(),
+        "mock:talker".into(),
+        Framing::Idle { idle_ms: 100 },
+        talker_port(vec![b"only"], 0),
+    );
+    wait_until_buffered(&session, 4, 150).await;
+    let frames = session.read_frames(500, 32).await.unwrap().frames;
+    let texts: Vec<String> = frames.iter().map(|f| f.text.clone()).collect();
+    assert_eq!(texts, vec!["only"]);
 }
 
 // ---------------------------------------------------------------------------

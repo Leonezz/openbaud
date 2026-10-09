@@ -4,6 +4,7 @@
 //! `show_result` exist to put something in front of the user and are the only
 //! two that carry a UI template.
 
+use crate::engine::now_ms;
 use crate::engine::session::Session;
 use crate::engine::transport::{self, open_port, resolve_selector};
 use crate::mcp::{resources, Ctx};
@@ -476,6 +477,7 @@ fn audit_fail(ctx: &Ctx, mut base: Value, err: &anyhow::Error) -> anyhow::Result
 }
 
 async fn tool_send(args: Value, ctx: &Arc<Ctx>) -> anyhow::Result<Value> {
+    let started_ms = now_ms();
     let sid = arg_str(&args, "session_id")?.to_string();
     let staged = ctx
         .sessions
@@ -484,13 +486,14 @@ async fn tool_send(args: Value, ctx: &Arc<Ctx>) -> anyhow::Result<Value> {
     let (session, data) = match staged {
         Ok(ok) => ok,
         Err(e) => {
-            audit_fail(ctx, json!({ "tool": "send", "session": sid }), &e)?;
+            audit_fail(ctx, json!({ "tool": "send", "session": sid, "started_ms": started_ms }), &e)?;
             return Err(e);
         }
     };
     let outcome = session.write_raw(&data).await;
     ctx.audit.record(json!({
         "tool": "send",
+        "started_ms": started_ms,
         "session": session.id,
         "port": session.port_name,
         "tx_hex": hex::to_hex(&data),
@@ -502,6 +505,7 @@ async fn tool_send(args: Value, ctx: &Arc<Ctx>) -> anyhow::Result<Value> {
 }
 
 async fn tool_request(args: Value, ctx: &Arc<Ctx>) -> anyhow::Result<Value> {
+    let started_ms = now_ms();
     let sid = arg_str(&args, "session_id")?.to_string();
     let staged = (|| {
         let session = ctx.sessions.get(&sid)?;
@@ -521,13 +525,14 @@ async fn tool_request(args: Value, ctx: &Arc<Ctx>) -> anyhow::Result<Value> {
     let (session, data, rule, timeout, max_inline) = match staged {
         Ok(ok) => ok,
         Err(e) => {
-            audit_fail(ctx, json!({ "tool": "request", "session": sid }), &e)?;
+            audit_fail(ctx, json!({ "tool": "request", "session": sid, "started_ms": started_ms }), &e)?;
             return Err(e);
         }
     };
     let outcome = session.request(&data, rule, timeout).await;
     ctx.audit.record(json!({
         "tool": "request",
+        "started_ms": started_ms,
         "session": session.id,
         "port": session.port_name,
         "tx_hex": hex::to_hex(&data),
@@ -575,7 +580,12 @@ fn attach_warnings(result: &mut Value, device: &Device) {
 async fn tool_run_command(args: Value, ctx: &Arc<Ctx>) -> anyhow::Result<Value> {
     let device_name = arg_str(&args, "device")?.to_string();
     let command_name = arg_str(&args, "command")?.to_string();
-    let base = json!({ "tool": "run_command", "device": device_name, "command": command_name });
+    let base = json!({
+        "tool": "run_command",
+        "device": device_name,
+        "command": command_name,
+        "started_ms": now_ms(),
+    });
 
     let device = match ctx.workspace.load_device(&device_name) {
         Ok(d) => d,
@@ -679,7 +689,12 @@ async fn tool_run_command(args: Value, ctx: &Arc<Ctx>) -> anyhow::Result<Value> 
 async fn tool_run_workflow(args: Value, ctx: &Arc<Ctx>) -> anyhow::Result<Value> {
     let device_name = arg_str(&args, "device")?.to_string();
     let workflow_name = arg_str(&args, "workflow")?.to_string();
-    let base = json!({ "tool": "run_workflow", "device": device_name, "workflow": workflow_name });
+    let base = json!({
+        "tool": "run_workflow",
+        "device": device_name,
+        "workflow": workflow_name,
+        "started_ms": now_ms(),
+    });
 
     let staged = (|| {
         let device = ctx.workspace.load_device(&device_name)?;
@@ -748,7 +763,7 @@ async fn tool_run_workflow(args: Value, ctx: &Arc<Ctx>) -> anyhow::Result<Value>
                 "port": session.port_name,
             });
             let obj = step_entry.as_object_mut().expect("object");
-            for field in ["command", "ok", "outcome", "tx_hex", "detail", "error"] {
+            for field in ["command", "started_ms", "ok", "outcome", "tx_hex", "detail", "error"] {
                 if let Some(v) = step.get(field) {
                     obj.insert(field.to_string(), v.clone());
                 }

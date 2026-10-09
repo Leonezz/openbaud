@@ -5,7 +5,7 @@
 //! recoverable. The four risk red lines and their resolutions:
 //!
 //! - Risk ① (never steal from `read`): a subscription owns its *own* ChunkBuf
-//!   cursor, its own `Deframer` and its own retention queue, and reads the
+//!   cursor, its own `TimedDeframer` and its own retention queue, and reads the
 //!   chunk buffer only through the non-destructive `ChunkBuf::since()`.
 //!   `ReadState` — the `read` tool's cursor — is structurally out of reach
 //!   from this module, so neither consumer can ever take the other's frames.
@@ -33,7 +33,7 @@ use crate::engine::session::Session;
 use anyhow::{anyhow, bail};
 use openbaud_core::exec::parse_with_spec;
 use openbaud_core::format::ParseSpec;
-use openbaud_core::framing::{Deframer, Framing};
+use openbaud_core::framing::{Framing, TimedDeframer};
 use openbaud_core::hex;
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, VecDeque};
@@ -96,10 +96,7 @@ struct Subscription {
     /// buffer's cumulative `dropped_bytes` is surfaced in every poll's
     /// `stats` (same source of truth the `read` tool reports deltas of).
     cursor: u64,
-    deframer: Deframer,
-    /// Wall-clock start of the frame currently pending in the deframer, with
-    /// the same semantics as `pending_since_ms` in `ReadState`.
-    pending_since_ms: Option<u64>,
+    deframer: TimedDeframer,
     retained: VecDeque<RetainedFrame>,
     /// Seq the next deframed frame will get; monotonic per subscription.
     next_seq: u64,
@@ -127,8 +124,7 @@ impl Subscription {
     fn new(framing: Framing, now_ms: u64, parse: Option<StreamParse>) -> Self {
         Self {
             cursor: 0,
-            deframer: Deframer::new(framing),
-            pending_since_ms: None,
+            deframer: TimedDeframer::new(framing),
             retained: VecDeque::new(),
             next_seq: 0,
             delivered_seq: 0,
@@ -154,35 +150,22 @@ impl Subscription {
             // correctly across the gap; splicing pre-gap and post-gap bytes
             // into one frame would be silent corruption. Destroy it and count
             // the loss as a dropped frame.
-            if self.deframer.pending_len() > 0 {
-                let _ = self.deframer.flush_pending();
+            if self.deframer.discard_pending() {
                 self.dropped_frames += 1;
             }
-            self.pending_since_ms = None;
         }
         self.cursor = new_cursor;
+        // Idle boundaries between retained chunks come from their arrival
+        // times, so a subscription created late — or polled rarely — sees the
+        // same frames as one polled promptly.
         for (ts, bytes) in chunks {
-            if self.pending_since_ms.is_none() {
-                self.pending_since_ms = Some(ts);
-            }
-            for frame in self.deframer.push(&bytes) {
-                self.retain(ts, frame);
-            }
-            if self.deframer.pending_len() == 0 {
-                self.pending_since_ms = None;
+            for frame in self.deframer.push(ts, &bytes) {
+                self.retain(frame.ts_ms, frame.bytes);
             }
         }
-        // Idle-gap framing: flush pending once the wire has been quiet.
-        if let Framing::Idle { idle_ms } = self.deframer.framing() {
-            let idle_ms = *idle_ms;
-            if self.deframer.pending_len() > 0
-                && now_ms.saturating_sub(session.last_rx()) >= idle_ms
-            {
-                if let Some(pending) = self.deframer.flush_pending() {
-                    let ts = self.pending_since_ms.take().unwrap_or(now_ms);
-                    self.retain(ts, pending);
-                }
-            }
+        // The idle tail: close the last frame once the wire has been quiet.
+        if let Some(tail) = self.deframer.flush_if_quiet(now_ms) {
+            self.retain(tail.ts_ms, tail.bytes);
         }
     }
 

@@ -194,6 +194,9 @@ async fn run_step(
     step: &StepSpec,
     propagate_fatal: bool,
 ) -> anyhow::Result<Value> {
+    // When this step began — its audit entry is written after the whole
+    // workflow, so the start must be carried here to place it in time.
+    let started_ms = crate::engine::now_ms();
     let outcome = async {
         let cmd = device.command(&step.command)?;
         let params = step.params.clone().unwrap_or_default();
@@ -202,15 +205,15 @@ async fn run_step(
     .await;
     match outcome {
         Ok((mut entry, ok)) => {
-            entry
-                .as_object_mut()
-                .expect("execute_command results are objects")
-                .insert("ok".to_string(), json!(ok));
+            let obj = entry.as_object_mut().expect("execute_command results are objects");
+            obj.insert("ok".to_string(), json!(ok));
+            obj.insert("started_ms".to_string(), json!(started_ms));
             Ok(entry)
         }
         Err(e) if propagate_fatal && is_session_fatal(&e) => Err(e),
         Err(e) => Ok(json!({
             "command": step.command,
+            "started_ms": started_ms,
             "ok": false,
             "error": format!("{e:#}"),
         })),
