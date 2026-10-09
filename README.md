@@ -29,7 +29,12 @@ OpenBaud keeps the evidence that makes the result repeatable:
 - **Sediment knowledge:** turn verified behavior into typed, reviewable YAML
   commands and fixed workflows with provenance.
 - **Parse real protocols:** validate checksums and decode scalars, bit fields,
-  split lists, and record arrays into structured results.
+  split lists, and record arrays into structured results — including data a
+  device pushes on its own, checked frame by frame.
+- **Refuse what would be wrong:** a command declares the device state it
+  depends on (`requires`), and is refused before a byte is sent when the
+  session has not established that state — instead of returning a valid frame
+  that means something else.
 - **Replay without hardware:** record every RX/TX byte in `.obcap`, then rerun
   the same command and parser against the capture.
 
@@ -110,6 +115,8 @@ devices/<device>/workflows/*.yaml
 devices/<device>/notes.md
 captures/*.obcap
 .openbaud/audit.jsonl
+reports/    # derived analysis for people, citing the captures it came from
+scripts/    # one-off analysis helpers; device behavior belongs in commands
 ```
 
 The `schema` MCP tool and `openbaud schema` CLI command are the authority for
@@ -142,8 +149,10 @@ The Remotion source and real capture used to produce the public video live in
 Serial writes can reconfigure or actuate physical hardware. OpenBaud marks raw
 writes and device commands as potentially destructive MCP operations, keeps an
 append-only audit, and requires explicit acknowledgement for commands declared
-with `risk: danger`. Start unknown devices read-only and preserve a recovery
-path before changing state.
+with `risk: danger`. Commands that declare `requires` are refused until the
+session has established that device state; overriding with
+`assume_preconditions` is recorded in the result and the audit. Start unknown
+devices read-only and preserve a recovery path before changing state.
 
 ## License
 

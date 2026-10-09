@@ -29,6 +29,18 @@ knowledge:
 - `devices/<name>/workflows/*.yaml`: fixed sequences and cleanup steps.
 - `devices/<name>/notes.md`: evidence, quirks, unknowns, and datasheet references.
 - `captures/*.obcap`: timestamped RX/TX evidence.
+- `reports/`: derived analysis for people, citing the captures it came from;
+  `scripts/`: one-off analysis helpers (device behavior belongs in commands).
+
+When a command only means what it says in a particular device state (a mode, a
+meter profile), declare it: `requires: {mode: MODBUS}` on the command and
+`establishes: {mode: "{mode}"}` on the command that switches it. Facts live on
+the session — established only on the expected outcome, lost on any other
+outcome and after any raw `send`/`request` — and an unmet or unknown required
+fact refuses the command before anything is sent. In a workflow, earlier steps
+establish what later steps require. For data the device pushes on its own,
+write a command **without `frame`** (only `response.parse`, `validate`, `view`)
+and read it with `stream_poll` `parse: {device, command}`.
 
 Before writing a profile, command, or workflow, call the `schema` tool for that
 kind. Its output is authoritative; do not guess field names from examples.
@@ -78,9 +90,10 @@ the claim. Use `replay:<capture path>` for hardware-free regression tests.
   dead port errors loudly; `close: true` releases it. Independent of `read`
   — the two never steal frames from each other. Pass `parse: {device,
   command}` when *creating* the subscription (never on a follow-up poll —
-  loud error) to parse every frame server-side with that workspace command's
+  loud error) to decode every frame server-side with that workspace command's
+  response block — a declared `validate` checksum is enforced per frame, then
   `response.parse`: frames then carry `parsed` (field values) or a per-frame
-  `parse_error` (one bad frame never stops the stream), parsed once at
+  `parse_error` (one bad frame never stops the stream), decoded once at
   arrival so redelivery repeats the identical outcome; results echo
   `parse: {device, command}` plus the command's `units` (`run_command`
   semantics), and an unknown device/command or a command without a
@@ -129,6 +142,9 @@ Serial writes can reconfigure, actuate, or permanently damage hardware.
 - Treat unknown raw frames as potentially destructive.
 - Never set `acknowledge_risk: true` without explicit user confirmation of the
   described consequence.
+- Never pass `assume_preconditions: true` to get past a refusal. Establish the
+  required state on the session instead; assume only when the user confirms
+  the device is already in that state — the result and audit log record it.
 - Stop transmitting when baud, framing, checksum, or device identity is unclear.
 - Keep secrets and sensitive payloads out of notes and shared device packs.
 

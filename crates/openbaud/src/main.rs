@@ -18,8 +18,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// List serial ports
-    Ports,
+    /// List serial ports, with the workspace devices whose selector matches
+    Ports {
+        /// Workspace directory whose device profiles are matched (defaults to
+        /// the current directory)
+        #[arg(long, default_value = ".")]
+        workspace: PathBuf,
+    },
     /// Scaffold an openbaud workspace in DIR
     Init {
         #[arg(default_value = ".")]
@@ -70,7 +75,7 @@ enum Command {
 async fn main() {
     let cli = Cli::parse();
     let result = match cli.command {
-        Command::Ports => cmd_ports::run(),
+        Command::Ports { workspace } => cmd_ports::run(&workspace),
         Command::Init { dir } => cmd_init::run(&dir),
         Command::Mcp => {
             let root = workspace::resolve_mcp_workspace_root()

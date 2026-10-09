@@ -19,6 +19,10 @@ next session (or the next person) starts where you finished.
 - `captures/*.obcap` — lossless wire captures (JSONL: ts_ms, dir, hex)
 - `.openbaud/audit.jsonl` — every write you performed, append-only
 - `.openbaud/out/` — full copies of oversized tool results (see `full_result` below)
+- `reports/` — derived analysis you write for people (charts, summaries); cite
+  the capture each one came from so it stays auditable
+- `scripts/` — one-off analysis helpers that are not device knowledge (device
+  behavior belongs in commands, never in a script)
 
 ## Exploration workflow
 
@@ -53,7 +57,10 @@ under `devices/`** instead of guessing field names or type lists.
 
 The vocabulary covers, beyond the basics: binary/scalar and record **arrays**
 (`count`/`stride`/`elements`), text **`split`** arrays, `hex_int` captures,
-and checksum `validate` with `range`/`at`/`encoding: ascii_hex`.
+checksum `validate` with `range`/`at`/`encoding: ascii_hex`, a `unit` on text
+captures as well as binary fields, **device state** (`requires` /
+`establishes`, below) and **pushed data** — a command without `frame` that
+describes what the device streams on its own (below).
 
 A short taste of a command (`openbaud/command@v0`):
 
@@ -93,6 +100,39 @@ into first-class commands: a Modbus illegal-function probe declares
 probe declares `expect: silence` (the `match` rule may then be omitted; set a
 short `timeout_ms`). See the `schema` tool for the exact syntax, including
 `timing` settling delays.
+
+## Device state: `requires` and `establishes`
+
+A frame can be well-formed, checksummed and parse cleanly while meaning
+something else: a Modbus read sent while the emulator holds the wrong meter
+profile returns a valid frame whose "voltage" is another register entirely.
+Whenever a command only means what it says in a particular device state,
+declare that state instead of writing it in the description:
+
+```yaml
+# select_modbus_profile.yaml — sets the fact
+establishes: { modbus_profile: "{profile}" }   # a literal or a template over params
+# pzem_read_voltage.yaml — depends on it
+requires: { mode: MODBUS, modbus_profile: pzem }
+```
+
+Facts live on the **session**. A command that establishes facts records them
+only when it meets its expected outcome; any other outcome makes them unknown
+(the device may or may not have changed), and a raw `send`/`request` makes
+every fact unknown. Before a command with `requires` is sent, each fact is
+checked (values compare case-insensitively): a missing, different or unknown
+fact **refuses the command before anything is written**, naming what is wrong
+and which commands establish the fact. So establish state on the same session
+first — or put the switch and the read in one workflow, where earlier steps
+establish what later steps require (checked before the session even opens).
+An ephemeral session (`port` instead of `session_id`, and every CLI run) knows
+no facts. `session_stats` shows each session's `facts`.
+
+If you *know* the device is already in that state — say, the user just set it
+up by hand — pass `assume_preconditions: true` (CLI: `--assume-preconditions`).
+That is an explicit claim on the record: the result carries
+`preconditions: {assumed: …}` and the audit log says `assumed`. Never assume to
+make a refusal go away; establish the state instead.
 
 ## Oversized results
 
@@ -172,7 +212,9 @@ touch the wire and are yours to call freely:
   length — pages hold whole frames only, in `seq` order, and `page_bytes`
   reports the page's actual total. A first frame alone beyond the budget is
   still delivered — alone, with `oversized_frame: true` — so delivery always
-  makes progress even through idle-merged megabyte frames.
+  makes progress. Idle-gap framing cuts frames by the gaps between chunk
+  arrival times, so a subscription created late or polled rarely sees the
+  same frames as one polled promptly.
   Omit `since_seq` and the unacknowledged frames come back unchanged, so a
   lost response costs nothing. A consumer that lags loses the oldest retained
   frames, counted in `dropped_frames`; session-buffer overflow past the
@@ -184,13 +226,23 @@ touch the wire and are yours to call freely:
   in the session's live counters as `stats`. It never waits — poll again when
   you expect more. Pass `parse: {device, command}` when *creating* the
   subscription (never on a follow-up poll — that is a loud error) to have
-  every frame parsed server-side with that workspace command's
-  `response.parse`: each frame then carries `parsed` (the field values) or a
-  per-frame `parse_error` (one bad frame never stops the stream), parsed once
-  at arrival so redelivery repeats the identical outcome; every result echoes
-  `parse: {device, command}` plus the command's `units` (same semantics as
-  `run_command`), and an unknown device or command — or a command without a
-  `response.parse` block — fails creation loudly.
+  every frame decoded server-side with that workspace command's response
+  block — its `validate` checksum, when declared, is enforced on every frame,
+  then `response.parse`: each frame then carries `parsed` (the field values)
+  or a per-frame `parse_error` (a bad checksum or a failed parse; one bad
+  frame never stops the stream), decoded once at arrival so redelivery repeats
+  the identical outcome; every result echoes `parse: {device, command}` plus
+  the command's `units` (same semantics as `run_command`), and an unknown
+  device or command — or a command without a `response.parse` block — fails
+  creation loudly.
+
+**Pushed data.** For a device that streams on its own, describe one pushed
+frame as a command **without `frame`**: only `response.parse` (required),
+`validate` and `view`. It is never sent — `run_command` and workflows refuse
+it before touching a port — and it is exactly what `parse: {device, command}`
+wants. Start the stream with an ordinary command, subscribe with the pushed
+one. A numeric `split` capture can feed a heatmap view, so a thermal camera
+that prints its matrix as one text line still draws as a grid.
 
 `session_timeline`, `capture_frames` and `diagnose_frame` results carry their
 own `view` declaration (`timeline`, `capture`, `diagnostics`) — hand the
@@ -205,7 +257,10 @@ overriding command defaults — `schema` tool has the format).
 
 Semantics: steps run in order on one session; the first failing step skips
 the rest; `finally` steps are **all attempted regardless**, failures recorded
-per step. Workflow risk is the maximum of its commands' risk (`danger` needs
+per step. Facts established by earlier steps satisfy the `requires` of later
+ones; a step whose `requires` nothing before it establishes refuses the whole
+workflow before the session is opened. A step cannot be a pushed-data
+command. Workflow risk is the maximum of its commands' risk (`danger` needs
 `acknowledge_risk`). Workflow names must not collide with command names.
 Execute with the `run_workflow` tool or `openbaud run <device>/<workflow>`.
 
