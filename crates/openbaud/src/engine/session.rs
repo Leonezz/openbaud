@@ -3,6 +3,7 @@
 //! it independently. Buffer overflow is reported, never silent.
 
 use crate::engine::capture::{CaptureStats, CaptureWriter};
+use crate::engine::facts::Facts;
 use crate::engine::stream::SubscriptionSet;
 use crate::engine::transport::BoxedPort;
 use crate::engine::now_ms;
@@ -127,6 +128,9 @@ pub struct Session {
     /// subscriptions can never steal frames from each other (risk ①). Living
     /// inside the session, they are all released when it closes (risk ③).
     pub(crate) subs: StdMutex<SubscriptionSet>,
+    /// What this session has established about the device's state, checked
+    /// against commands' `requires` (see `preconditions.rs`).
+    facts: StdMutex<Facts>,
     reader: JoinHandle<()>,
 }
 
@@ -179,8 +183,18 @@ impl Session {
             }),
             request_lock: Mutex::new(()),
             subs: StdMutex::new(SubscriptionSet::default()),
+            facts: StdMutex::new(Facts::default()),
             reader,
         })
+    }
+
+    /// A snapshot of what this session knows about the device's state.
+    pub fn facts(&self) -> Facts {
+        self.facts.lock().unwrap().clone()
+    }
+
+    pub fn update_facts(&self, update: impl FnOnce(&mut Facts)) {
+        update(&mut self.facts.lock().unwrap());
     }
 
     /// The framing this session deframes with; each stream subscription
@@ -265,6 +279,7 @@ impl Session {
             "rx_bytes": self.shared.rx_bytes.load(Ordering::Relaxed),
             "tx_bytes": self.shared.tx_bytes.load(Ordering::Relaxed),
             "capture": capture,
+            "facts": self.facts.lock().unwrap().known(),
         });
         let obj = out.as_object_mut().expect("stats is an object");
         if let Some(e) = self.shared.error.lock().unwrap().as_ref() {

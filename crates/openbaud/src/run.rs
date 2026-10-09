@@ -7,6 +7,7 @@
 
 use crate::engine::session::Session;
 use crate::engine::transport::{self, REPLAY_PREFIX};
+use crate::preconditions;
 use crate::workspace::Device;
 use anyhow::bail;
 use openbaud_core::exec::{build_frame, classify, expect_met, units};
@@ -28,13 +29,13 @@ pub async fn execute_command(
     device: &Device,
     cmd: &Command,
     params: &Map<String, Value>,
+    assume_preconditions: bool,
 ) -> anyhow::Result<(Value, bool)> {
     let tx = build_frame(cmd, params)?;
-    if let Some(t) = &cmd.timing {
-        if t.pre_delay_ms > 0 {
-            tokio::time::sleep(Duration::from_millis(t.pre_delay_ms)).await;
-        }
-    }
+    // Before anything is sent: the state this command depends on, and the
+    // state it will establish (rendered now so a bad value never half-runs).
+    let preconditions = preconditions::check(device, cmd, &session.facts(), assume_preconditions)?;
+    let established = preconditions::render_establishes(cmd, params)?;
 
     let mut out = Map::new();
     out.insert("device".to_string(), json!(device.name));
@@ -44,9 +45,43 @@ pub async fn execute_command(
     out.insert("port".to_string(), json!(session.port_name));
     out.insert("tx_hex".to_string(), json!(hex::to_hex(&tx)));
 
+    let exchanged = exchange(session, device, cmd, &tx, &mut out).await;
+    let failure = match &exchanged {
+        Ok(true) => None,
+        Ok(false) => Some(format!(
+            "ended with outcome {}",
+            out.get("outcome").cloned().unwrap_or(Value::Null)
+        )),
+        Err(e) => Some(format!("failed ({e:#})")),
+    };
+    session.update_facts(|facts| {
+        preconditions::record_outcome(facts, device, cmd, &established, failure.as_deref())
+    });
+    let met = exchanged?;
+    if let Some(report) = preconditions {
+        out.insert("preconditions".to_string(), report);
+    }
+    Ok((Value::Object(out), met))
+}
+
+/// Send `tx` and classify the reply into `out`, applying the command's
+/// timing. Returns whether the declared expectation was met.
+async fn exchange(
+    session: &Session,
+    device: &Device,
+    cmd: &Command,
+    tx: &[u8],
+    out: &mut Map<String, Value>,
+) -> anyhow::Result<bool> {
+    if let Some(t) = &cmd.timing {
+        if t.pre_delay_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(t.pre_delay_ms)).await;
+        }
+    }
+
     let met = match &cmd.response {
         None => {
-            session.write_raw(&tx).await?;
+            session.write_raw(tx).await?;
             out.insert("outcome".to_string(), json!("sent"));
             out.insert(
                 "note".to_string(),
@@ -66,7 +101,7 @@ pub async fn execute_command(
             };
             let raw = session
                 .request_classified(
-                    &tx,
+                    tx,
                     rule,
                     resp.exception.as_ref(),
                     resp.timeout_ms,
@@ -129,7 +164,7 @@ pub async fn execute_command(
             json!({ "pre_delay_ms": t.pre_delay_ms, "post_delay_ms": t.post_delay_ms }),
         );
     }
-    Ok((Value::Object(out), met))
+    Ok(met)
 }
 
 /// Execute a workflow on the session: steps in order, first failure skips the
@@ -142,6 +177,7 @@ pub async fn execute_workflow(
     session: &Session,
     device: &Device,
     wf: &Workflow,
+    assume_preconditions: bool,
 ) -> anyhow::Result<(Value, bool)> {
     let mut steps_out: Vec<Value> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
@@ -154,7 +190,7 @@ pub async fn execute_workflow(
         }
         // A dead session is the only error worth aborting the workflow for;
         // anything else is this step's failure.
-        let entry = run_step(session, device, step, true).await?;
+        let entry = run_step(session, device, step, true, assume_preconditions).await?;
         if entry.get("ok") != Some(&json!(true)) {
             failed = true;
         }
@@ -166,7 +202,7 @@ pub async fn execute_workflow(
     for step in &wf.finally {
         // `finally` steps are attempted unconditionally, one failure never
         // blocks the next — even a dead session is recorded, not thrown.
-        let entry = run_step(session, device, step, false).await?;
+        let entry = run_step(session, device, step, false, assume_preconditions).await?;
         if entry.get("ok") != Some(&json!(true)) {
             finally_ok = false;
         }
@@ -209,6 +245,7 @@ async fn run_step(
     device: &Device,
     step: &StepSpec,
     propagate_fatal: bool,
+    assume_preconditions: bool,
 ) -> anyhow::Result<Value> {
     // When this step began — its audit entry is written after the whole
     // workflow, so the start must be carried here to place it in time.
@@ -216,7 +253,7 @@ async fn run_step(
     let outcome = async {
         let cmd = device.command(&step.command)?;
         let params = step.params.clone().unwrap_or_default();
-        execute_command(session, device, cmd, &params).await
+        execute_command(session, device, cmd, &params, assume_preconditions).await
     }
     .await;
     match outcome {

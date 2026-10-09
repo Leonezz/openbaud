@@ -264,6 +264,20 @@ pub struct Command {
     /// Declared parameters usable in the frame template.
     #[serde(default)]
     pub params: Vec<ParamSpec>,
+    /// Device state this command needs before it is sent: fact name -> value,
+    /// e.g. `{ mode: MODBUS, modbus_profile: pzem }`. Checked against the
+    /// facts established earlier on the same session (see `establishes`); a
+    /// fact that is unknown or different refuses the command unless the
+    /// caller explicitly assumes preconditions. Values compare ASCII
+    /// case-insensitively.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub requires: BTreeMap<String, String>,
+    /// Device state this command sets: fact name -> value, a literal or a
+    /// text template over the command's params (e.g. `{ mode: "{mode}" }`).
+    /// Established on the session only when the command completes with its
+    /// expected outcome; any other outcome makes these facts unknown.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub establishes: BTreeMap<String, String>,
     /// The bytes to transmit. Omit it to describe data the device pushes on
     /// its own (a stream payload): such a command is never sent — a
     /// `stream_poll` subscription parses each pushed frame with it — so it
@@ -814,6 +828,7 @@ pub fn parse_command(yaml: &str, path: &str) -> crate::Result<Command> {
 
     // Frame: exactly one of hex/text; hex templates must parse and only use
     // declared, binary-encodable params.
+    check_facts(&cmd, &declared, path)?;
     let Some(frame) = &cmd.frame else {
         check_pushed_command(&cmd, path)?;
         return Ok(cmd);
@@ -889,6 +904,34 @@ pub fn parse_command(yaml: &str, path: &str) -> crate::Result<Command> {
     Ok(cmd)
 }
 
+/// `requires` / `establishes`: non-empty fact names and values; an
+/// establishes template may only reference declared params.
+fn check_facts(cmd: &Command, declared: &HashMap<&str, FieldType>, path: &str) -> crate::Result<()> {
+    for (block, facts) in [("requires", &cmd.requires), ("establishes", &cmd.establishes)] {
+        for (name, value) in facts {
+            if name.trim().is_empty() || name.chars().any(char::is_whitespace) {
+                return Err(ferr(path, format!("{block}: fact name {name:?} must be a non-empty word")));
+            }
+            if value.trim().is_empty() {
+                return Err(ferr(path, format!("{block}.{name}: value must not be empty")));
+            }
+        }
+    }
+    for (name, template) in &cmd.establishes {
+        let placeholders = crate::template::text_placeholders(template)
+            .map_err(|e| ferr(path, format!("establishes.{name}: {e}")))?;
+        for param in placeholders {
+            if !declared.contains_key(param.as_str()) {
+                return Err(ferr(
+                    path,
+                    format!("establishes.{name} references undeclared param {param:?}"),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// A command without `frame` describes data the device pushes; it is never
 /// sent, so it carries the parse (and optionally validate and view) for each
 /// pushed frame and nothing of the request/response exchange. Every
@@ -913,6 +956,9 @@ fn check_pushed_command(cmd: &Command, path: &str) -> crate::Result<()> {
     };
     if !cmd.params.is_empty() {
         return refuse("params");
+    }
+    if !cmd.requires.is_empty() || !cmd.establishes.is_empty() {
+        return refuse("requires / establishes");
     }
     if cmd.risk != Risk::Read {
         return refuse("risk write/danger");
@@ -1850,6 +1896,7 @@ response:
             ("response:\n", "risk: write\nresponse:\n", "risk"),
             ("response:\n", "params:\n  - { name: n, type: u8 }\nresponse:\n", "params"),
             ("response:\n", "timing: { pre_delay_ms: 5 }\nresponse:\n", "timing"),
+            ("response:\n", "requires: { mode: THERM }\nresponse:\n", "requires"),
         ] {
             let bad = PUSHED_COMMAND.replacen(from, to, 1);
             assert_ne!(bad, PUSHED_COMMAND, "replacement {from:?} did not apply");
@@ -1858,6 +1905,34 @@ response:
                 err.contains(needle) && err.contains("pushed"),
                 "expected {needle:?} rejected for pushed data in: {err}"
             );
+        }
+    }
+
+    const STATEFUL: &str = r#"
+schema: openbaud/command@v0
+name: select_profile
+risk: write
+params:
+  - { name: profile, type: string }
+requires: { mode: SETUP }
+establishes: { modbus_profile: "{profile}", ready: "yes" }
+frame: { text: "MODBUS_PROFILE={profile}\r\n" }
+"#;
+
+    #[test]
+    fn requires_and_establishes_are_checked_statically() {
+        let cmd = parse_command(STATEFUL, "s.yaml").unwrap();
+        assert_eq!(cmd.requires.get("mode").map(String::as_str), Some("SETUP"));
+        assert_eq!(cmd.establishes.get("modbus_profile").map(String::as_str), Some("{profile}"));
+        for (from, to, needle) in [
+            ("\"{profile}\", ready", "\"{prof}\", ready", "undeclared param \"prof\""),
+            ("ready: \"yes\"", "ready: \"\"", "must not be empty"),
+            ("requires: { mode: SETUP }", "requires: { \"two words\": SETUP }", "non-empty word"),
+        ] {
+            let bad = STATEFUL.replace(from, to);
+            assert_ne!(bad, STATEFUL, "replacement {from:?} did not apply");
+            let err = parse_command(&bad, "s.yaml").unwrap_err().to_string();
+            assert!(err.contains(needle), "expected {needle:?} in: {err}");
         }
     }
 

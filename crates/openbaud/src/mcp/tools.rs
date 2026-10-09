@@ -9,6 +9,8 @@ use crate::engine::session::Session;
 use crate::engine::transport::{self, open_port, resolve_selector};
 use crate::mcp::{resources, Ctx};
 use crate::output::{self, shape_result};
+use crate::engine::facts::Facts;
+use crate::preconditions;
 use crate::run;
 use crate::workspace::Device;
 use anyhow::{anyhow, bail};
@@ -122,7 +124,7 @@ pub fn list() -> Vec<Value> {
         }),
         json!({
             "name": "send",
-            "description": "Write raw bytes (audited). Provide exactly one of hex ('01 A0 FF') or text (control chars as-is, e.g. \"AT\\r\\n\").",
+            "description": "Write raw bytes (audited). Provide exactly one of hex ('01 A0 FF') or text (control chars as-is, e.g. \"AT\\r\\n\"; a written-out escape such as a backslash followed by n is refused — use hex for literal backslash sequences).",
             "inputSchema": { "type": "object", "required": ["session_id"], "properties": {
                 "session_id": { "type": "string" },
                 "hex": { "type": "string" },
@@ -145,7 +147,7 @@ pub fn list() -> Vec<Value> {
         }),
         json!({
             "name": "run_command",
-            "description": "Execute a named command from devices/<device>/commands/ with typed params: builds the frame, awaits the response and classifies the outcome (normal | exception | silence | timeout | checksum_error | malformed) against the command's declared `expect` (audited; an unmet expectation is an error carrying the full result JSON). Give session_id for an open session, or port to open an ephemeral one with the device's profile transport — port may be omitted when the profile declares a selector, and accepts replay:<capture path>. Commands with risk=danger additionally require acknowledge_risk=true. A command without a frame describes pushed data and is never run: read it with stream_poll parse.",
+            "description": "Execute a named command from devices/<device>/commands/ with typed params: builds the frame, awaits the response and classifies the outcome (normal | exception | silence | timeout | checksum_error | malformed) against the command's declared `expect` (audited; an unmet expectation is an error carrying the full result JSON). Give session_id for an open session, or port to open an ephemeral one with the device's profile transport — port may be omitted when the profile declares a selector, and accepts replay:<capture path>. Commands with risk=danger additionally require acknowledge_risk=true. A command that declares `requires` (device state such as a mode or a meter profile) runs only when this session established those facts — via commands that declare `establishes`, on this session — and is otherwise refused before anything is sent (an ephemeral session knows no facts); assume_preconditions=true runs it anyway and records the preconditions as assumed. A command without a frame describes pushed data and is never run: read it with stream_poll parse.",
             "inputSchema": { "type": "object", "required": ["device", "command"], "properties": {
                 "device": { "type": "string" },
                 "command": { "type": "string" },
@@ -153,19 +155,21 @@ pub fn list() -> Vec<Value> {
                 "session_id": { "type": "string" },
                 "port": { "type": "string", "description": "Optional when session_id is given or the device profile has a selector" },
                 "acknowledge_risk": { "type": "boolean" },
+                "assume_preconditions": { "type": "boolean", "description": "Run although `requires` facts are not established on the session — only when you know the device is in that state; the result and the audit record them as assumed" },
                 "max_inline_bytes": max_inline_bytes_schema()
             }},
             "annotations": hardware_write,
         }),
         json!({
             "name": "run_workflow",
-            "description": "Execute a workflow from devices/<device>/workflows/: its steps run in order on one session (step params override command defaults); the first failing step skips the rest, then every `finally` step is attempted regardless. Returns {ok, steps, finally, skipped}; ok=false is an error carrying the full result JSON. Workflow risk is the maximum of its commands' risk — danger requires acknowledge_risk=true. Session resolution is the same as run_command (session_id, port, or profile selector).",
+            "description": "Execute a workflow from devices/<device>/workflows/: its steps run in order on one session (step params override command defaults); the first failing step skips the rest, then every `finally` step is attempted regardless. Returns {ok, steps, finally, skipped}; ok=false is an error carrying the full result JSON. Workflow risk is the maximum of its commands' risk — danger requires acknowledge_risk=true. Session resolution is the same as run_command (session_id, port, or profile selector). Preconditions are checked before the session is opened: every step's `requires` must be established by an earlier step (or already on the named session), unless assume_preconditions=true.",
             "inputSchema": { "type": "object", "required": ["device", "workflow"], "properties": {
                 "device": { "type": "string" },
                 "workflow": { "type": "string" },
                 "session_id": { "type": "string" },
                 "port": { "type": "string", "description": "Optional when session_id is given or the device profile has a selector" },
                 "acknowledge_risk": { "type": "boolean" },
+                "assume_preconditions": { "type": "boolean", "description": "Run although `requires` facts are not established on the session — only when you know the device is in that state; the result and the audit record them as assumed" },
                 "max_inline_bytes": max_inline_bytes_schema()
             }},
             "annotations": hardware_write,
@@ -462,9 +466,54 @@ fn tool_schema(args: &Value) -> anyhow::Result<Value> {
 fn payload_bytes(args: &Value) -> anyhow::Result<Vec<u8>> {
     match (args.get("hex").and_then(Value::as_str), args.get("text").and_then(Value::as_str)) {
         (Some(h), None) => Ok(hex::parse_hex(h)?),
-        (None, Some(t)) => Ok(t.as_bytes().to_vec()),
+        (None, Some(t)) => {
+            refuse_written_out_escape(t)?;
+            Ok(t.as_bytes().to_vec())
+        }
         _ => bail!("provide exactly one of: hex, text"),
     }
+}
+
+/// `text` is sent byte for byte: control characters must already be real
+/// characters. A written-out escape (`\n`, `\r`, `\t`, `\0`, `\xHH`) almost
+/// always means the caller wanted the control character and would otherwise
+/// put a backslash and a letter on the wire without any error — so it is
+/// refused. A payload that really needs those bytes is sent as hex.
+fn refuse_written_out_escape(text: &str) -> anyhow::Result<()> {
+    let bytes = text.as_bytes();
+    for (i, window) in bytes.windows(2).enumerate() {
+        if window[0] != b'\\' {
+            continue;
+        }
+        let escape = match window[1] {
+            b'n' | b'r' | b't' | b'0' => Some(&text[i..i + 2]),
+            b'x' if bytes.get(i + 2..i + 4).is_some_and(|h| h.iter().all(u8::is_ascii_hexdigit)) => {
+                Some(&text[i..i + 4])
+            }
+            _ => None,
+        };
+        if let Some(escape) = escape {
+            bail!(
+                "text contains the written-out escape {escape:?} at byte {i}: text is sent \
+                 byte for byte, so this would transmit a backslash, not a control character. \
+                 Put the real character in the string (e.g. a JSON \"\\n\" decodes to a newline), \
+                 or send the exact bytes with hex"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Raw bytes can put the device in any state, so after a raw write nothing a
+/// command established on this session can be relied on any more. Applied
+/// whether or not the write succeeded: a failed write may still have been
+/// partly sent.
+fn forget_facts_after_raw_write(session: &Session, tool: &str, data: &[u8]) {
+    let reason = format!(
+        "a raw {tool} wrote arbitrary bytes ({}) after it was established",
+        hex::to_hex(data)
+    );
+    session.update_facts(|facts| facts.lose_all(&reason));
 }
 
 /// Append a failed-attempt entry to the audit log. Write-capable operations
@@ -491,6 +540,7 @@ async fn tool_send(args: Value, ctx: &Arc<Ctx>) -> anyhow::Result<Value> {
         }
     };
     let outcome = session.write_raw(&data).await;
+    forget_facts_after_raw_write(&session, "send", &data);
     ctx.audit.record(json!({
         "tool": "send",
         "started_ms": started_ms,
@@ -530,6 +580,7 @@ async fn tool_request(args: Value, ctx: &Arc<Ctx>) -> anyhow::Result<Value> {
         }
     };
     let outcome = session.request(&data, rule, timeout).await;
+    forget_facts_after_raw_write(&session, "request", &data);
     ctx.audit.record(json!({
         "tool": "request",
         "started_ms": started_ms,
@@ -565,6 +616,22 @@ async fn resolve_session(
             Ok((ctx.sessions.open(&port, framing, boxed), true))
         }
     }
+}
+
+/// What the session behind `args` already knows, decided before any port is
+/// touched: a named session's facts, or nothing at all for the fresh
+/// ephemeral session `port` / the profile selector would open.
+fn facts_before_open(args: &Value, ctx: &Arc<Ctx>) -> anyhow::Result<Facts> {
+    match args.get("session_id").and_then(Value::as_str) {
+        Some(id) => Ok(ctx.sessions.get(id)?.facts()),
+        None => Ok(Facts::default()),
+    }
+}
+
+/// `"verified"` / `"assumed"` from a result's preconditions report, for the
+/// audit log.
+fn preconditions_status(result: &Value) -> Option<String> {
+    result.get("preconditions")?.as_object()?.keys().next().cloned()
 }
 
 /// Attach the device's broken-file warnings to a successful result.
@@ -625,9 +692,13 @@ async fn tool_run_command(args: Value, ctx: &Arc<Ctx>) -> anyhow::Result<Value> 
             Some(other) => bail!("params must be an object, got {other}"),
             None => Map::new(),
         };
-        Ok((params, arg_max_inline(&args)?))
+        let assume = arg_bool_or(&args, "assume_preconditions", false)?;
+        // Refused before any port is resolved or opened when the session's
+        // facts (none, for an ephemeral session) cannot satisfy `requires`.
+        preconditions::check(&device, &cmd, &facts_before_open(&args, ctx)?, assume)?;
+        Ok((params, arg_max_inline(&args)?, assume))
     })();
-    let (params, max_inline) = match staged {
+    let (params, max_inline, assume) = match staged {
         Ok(p) => p,
         Err(e) => {
             audit_fail(ctx, base, &e)?;
@@ -643,7 +714,7 @@ async fn tool_run_command(args: Value, ctx: &Arc<Ctx>) -> anyhow::Result<Value> 
         }
     };
 
-    let exec = run::execute_command(&session, &device, &cmd, &params).await;
+    let exec = run::execute_command(&session, &device, &cmd, &params, assume).await;
     if ephemeral {
         // The id was just created by us; failure here can only mean it is
         // already gone, which is fine.
@@ -663,6 +734,9 @@ async fn tool_run_command(args: Value, ctx: &Arc<Ctx>) -> anyhow::Result<Value> 
             entry.insert("ok".to_string(), json!(*ok));
             if !ok {
                 entry.insert("detail".to_string(), json!("expectation not met"));
+            }
+            if let Some(status) = preconditions_status(result) {
+                entry.insert("preconditions".to_string(), json!(status));
             }
         }
         Err(e) => {
@@ -703,9 +777,10 @@ async fn tool_run_workflow(args: Value, ctx: &Arc<Ctx>) -> anyhow::Result<Value>
         let device = ctx.workspace.load_device(&device_name)?;
         let wf = device.workflow(&workflow_name)?.clone();
         let (risk, danger_steps) = run::workflow_risk(&device, &wf)?;
-        Ok((device, wf, risk, danger_steps, arg_max_inline(&args)?))
+        let assume = arg_bool_or(&args, "assume_preconditions", false)?;
+        Ok((device, wf, risk, danger_steps, arg_max_inline(&args)?, assume))
     })();
-    let (device, wf, risk, danger_steps, max_inline) = match staged {
+    let (device, wf, risk, danger_steps, max_inline, assume) = match staged {
         Ok(ok) => ok,
         Err(e) => {
             audit_fail(ctx, base, &e)?;
@@ -729,6 +804,15 @@ async fn tool_run_workflow(args: Value, ctx: &Arc<Ctx>) -> anyhow::Result<Value>
         return Err(e);
     }
 
+    // A step whose preconditions nothing before it can establish refuses the
+    // whole workflow — before its session is opened and before any byte.
+    let simulated = facts_before_open(&args, ctx)
+        .and_then(|facts| preconditions::simulate_workflow(&device, &wf, &facts, assume));
+    if let Err(e) = simulated {
+        audit_fail(ctx, base, &e)?;
+        return Err(e);
+    }
+
     let (session, ephemeral) = match resolve_session(&args, &device, ctx).await {
         Ok(ok) => ok,
         Err(e) => {
@@ -737,7 +821,7 @@ async fn tool_run_workflow(args: Value, ctx: &Arc<Ctx>) -> anyhow::Result<Value>
         }
     };
 
-    let exec = run::execute_workflow(&session, &device, &wf).await;
+    let exec = run::execute_workflow(&session, &device, &wf, assume).await;
     if ephemeral {
         let _ = ctx.sessions.close(&session.id);
     }
@@ -771,6 +855,9 @@ async fn tool_run_workflow(args: Value, ctx: &Arc<Ctx>) -> anyhow::Result<Value>
                     obj.insert(field.to_string(), v.clone());
                 }
             }
+            if let Some(status) = preconditions_status(step) {
+                obj.insert("preconditions".to_string(), json!(status));
+            }
             ctx.audit.record(step_entry)?;
         }
     }
@@ -798,6 +885,13 @@ pub(crate) fn arg_str<'a>(args: &'a Value, key: &str) -> anyhow::Result<&'a str>
     args.get(key)
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("missing required string argument {key:?}"))
+}
+
+pub(crate) fn arg_bool_or(args: &Value, key: &str, default: bool) -> anyhow::Result<bool> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(default),
+        Some(v) => v.as_bool().ok_or_else(|| anyhow!("argument {key:?} must be a boolean, got {v}")),
+    }
 }
 
 pub(crate) fn arg_u64_or(args: &Value, key: &str, default: u64) -> anyhow::Result<u64> {

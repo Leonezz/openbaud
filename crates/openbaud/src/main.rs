@@ -45,6 +45,11 @@ enum Command {
         /// Required to execute commands marked risk=danger
         #[arg(long)]
         acknowledge_risk: bool,
+        /// Run even though the commands' `requires` facts are not established
+        /// on this (fresh) session — you vouch for the device's state; the
+        /// result and the audit log record the preconditions as assumed
+        #[arg(long)]
+        assume_preconditions: bool,
         /// Result JSONs longer than this many bytes are written in full to
         /// .openbaud/out/ and printed as a summary carrying a full_result
         /// path; raise it to force large results inline
@@ -83,9 +88,17 @@ async fn main() {
                 Err(e) => Err(e),
             }
         }
-        Command::Run { spec, port, sets, workspace, acknowledge_risk, max_inline_bytes } => {
-            cmd_run::run(&spec, port.as_deref(), &sets, &workspace, acknowledge_risk, max_inline_bytes)
-                .await
+        Command::Run {
+            spec,
+            port,
+            sets,
+            workspace,
+            acknowledge_risk,
+            assume_preconditions,
+            max_inline_bytes,
+        } => {
+            let opts = cmd_run::RunOptions { acknowledge_risk, assume_preconditions, max_inline_bytes };
+            cmd_run::run(&spec, port.as_deref(), &sets, &workspace, &opts).await
         }
         Command::Schema { kind, example } => cmd_schema::run(kind, example),
     };

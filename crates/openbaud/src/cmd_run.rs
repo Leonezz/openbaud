@@ -4,6 +4,8 @@
 
 use anyhow::{anyhow, bail};
 use openbaud::engine::audit::Audit;
+use openbaud::engine::facts::Facts;
+use openbaud::preconditions;
 use openbaud::engine::session::Session;
 use openbaud::engine::transport::open_port;
 use openbaud::output::shape_result;
@@ -15,13 +17,21 @@ use serde_json::{json, Map, Value};
 use std::path::Path;
 use std::sync::Arc;
 
+/// The CLI's execution switches.
+pub struct RunOptions {
+    /// Required to execute commands marked risk=danger.
+    pub acknowledge_risk: bool,
+    /// Run although `requires` facts are not established on the session.
+    pub assume_preconditions: bool,
+    pub max_inline_bytes: usize,
+}
+
 pub async fn run(
     spec: &str,
     port: Option<&str>,
     sets: &[String],
     workspace_dir: &Path,
-    acknowledge_risk: bool,
-    max_inline_bytes: usize,
+    opts: &RunOptions,
 ) -> anyhow::Result<()> {
     let (device_name, name) = spec
         .split_once('/')
@@ -34,13 +44,13 @@ pub async fn run(
     // at load time), so command lookup goes first.
     if device.commands.contains_key(name) {
         return run_command_cli(
-            spec, &device, name, port, sets, &workspace, &audit, acknowledge_risk, max_inline_bytes,
+            spec, &device, name, port, sets, &workspace, &audit, opts,
         )
         .await;
     }
     if device.workflows.contains_key(name) {
         return run_workflow_cli(
-            spec, &device, name, port, sets, &workspace, &audit, acknowledge_risk, max_inline_bytes,
+            spec, &device, name, port, sets, &workspace, &audit, opts,
         )
         .await;
     }
@@ -83,8 +93,7 @@ async fn run_command_cli(
     sets: &[String],
     workspace: &Workspace,
     audit: &Audit,
-    acknowledge_risk: bool,
-    max_inline_bytes: usize,
+    opts: &RunOptions,
 ) -> anyhow::Result<()> {
     let cmd = device.command(name)?;
     if let Err(e) = ensure_sendable(&device.name, cmd) {
@@ -98,7 +107,7 @@ async fn run_command_cli(
         return Err(e);
     }
 
-    if cmd.risk == Risk::Danger && !acknowledge_risk {
+    if cmd.risk == Risk::Danger && !opts.acknowledge_risk {
         audit.record(json!({
             "tool": "cli.run",
             "device": device.name,
@@ -123,8 +132,21 @@ async fn run_command_cli(
         params.insert(key.to_string(), value);
     }
 
+    // A CLI session is always fresh — it knows no facts — so an unmet
+    // `requires` is certain and refused before the port is opened.
+    if let Err(e) = preconditions::check(device, cmd, &Facts::default(), opts.assume_preconditions) {
+        audit.record(json!({
+            "tool": "cli.run",
+            "device": device.name,
+            "command": name,
+            "ok": false,
+            "detail": format!("{e:#}"),
+        }))?;
+        return Err(e);
+    }
+
     let session = open_session(device, port, workspace).await?;
-    let exec = execute_command(&session, device, cmd, &params).await;
+    let exec = execute_command(&session, device, cmd, &params, opts.assume_preconditions).await;
 
     let mut entry = json!({
         "tool": "cli.run",
@@ -141,6 +163,14 @@ async fn run_command_cli(
                     obj.insert(key.to_string(), v.clone());
                 }
             }
+            // "verified" / "assumed": a run on assumed state stays on the record.
+            if let Some(status) = result
+                .get("preconditions")
+                .and_then(Value::as_object)
+                .and_then(|o| o.keys().next())
+            {
+                obj.insert("preconditions".to_string(), json!(status));
+            }
             obj.insert("ok".to_string(), json!(*ok));
             if !ok {
                 obj.insert("detail".to_string(), json!("expectation not met"));
@@ -154,7 +184,7 @@ async fn run_command_cli(
     audit.record(entry)?;
 
     let (result, ok) = exec?;
-    let result = shape_result(result, &workspace.root, "cli.run", max_inline_bytes)?;
+    let result = shape_result(result, &workspace.root, "cli.run", opts.max_inline_bytes)?;
     println!("{}", serde_json::to_string_pretty(&result)?);
     if !ok {
         bail!(
@@ -175,8 +205,7 @@ async fn run_workflow_cli(
     sets: &[String],
     workspace: &Workspace,
     audit: &Audit,
-    acknowledge_risk: bool,
-    max_inline_bytes: usize,
+    opts: &RunOptions,
 ) -> anyhow::Result<()> {
     if !sets.is_empty() {
         bail!("--set does not apply to workflows — parameters live in the workflow's steps");
@@ -184,7 +213,7 @@ async fn run_workflow_cli(
     let wf = device.workflow(name)?;
     let (risk, danger_steps) = workflow_risk(device, wf)?;
 
-    if risk == Risk::Danger && !acknowledge_risk {
+    if risk == Risk::Danger && !opts.acknowledge_risk {
         audit.record(json!({
             "tool": "cli.run",
             "device": device.name,
@@ -203,8 +232,21 @@ async fn run_workflow_cli(
         eprintln!("warning: {warning}");
     }
 
+    if let Err(e) =
+        preconditions::simulate_workflow(device, wf, &Facts::default(), opts.assume_preconditions)
+    {
+        audit.record(json!({
+            "tool": "cli.run",
+            "device": device.name,
+            "workflow": name,
+            "ok": false,
+            "detail": format!("{e:#}"),
+        }))?;
+        return Err(e);
+    }
+
     let session = open_session(device, port, workspace).await?;
-    let exec = execute_workflow(&session, device, wf).await;
+    let exec = execute_workflow(&session, device, wf, opts.assume_preconditions).await;
 
     let (result, ok) = match exec {
         Ok(ok) => ok,
@@ -254,7 +296,7 @@ async fn run_workflow_cli(
 
     // Shaping happens after the per-step audit extraction above — audit
     // entries always see the untruncated result.
-    let result = shape_result(result, &workspace.root, "cli.run", max_inline_bytes)?;
+    let result = shape_result(result, &workspace.root, "cli.run", opts.max_inline_bytes)?;
     println!("{}", serde_json::to_string_pretty(&result)?);
     if !ok {
         bail!("workflow {spec} failed");

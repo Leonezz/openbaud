@@ -56,14 +56,22 @@ polar and heatmap are the only kinds a command YAML may declare — the timeline
 produced by tools (session_timeline / diagnose_frame / capture_frames), the scope kind is declared by the \
 live-stream descriptor an agent passes to show_result, and all of them are rejected here; \
 a command with no view is simply never charted; \
+requires maps fact names to the values the device state must have before the command is sent \
+(compared ASCII case-insensitively against facts established earlier on the same session), \
+and establishes maps fact names to the values the command sets — literals or text templates over declared params — \
+recorded only when the command meets its expected outcome; any other outcome makes those facts unknown, \
+and a raw send/request makes every fact unknown; an unmet or unknown required fact refuses the command \
+before anything is sent unless the caller passes assume_preconditions, which is recorded; \
 a command without frame describes data the device pushes on its own: it is never sent, \
 needs response.parse (validate and view optional), is read with stream_poll parse: {device, command} \
-(validate is enforced on every pushed frame), and takes no params, timing, \
+(validate is enforced on every pushed frame), and takes no params, requires, establishes, timing, \
 risk other than read, nor response.match / expect / exception / timeout_ms / first_byte_ms.";
 
 const WORKFLOW_RULES: &str = "Semantic rules beyond this schema: \
 steps must not be empty; \
 every referenced command must exist in the same device directory and have a frame (pushed-data commands are never sent); \
+every step's requires must be established by an earlier step (or already on the named session) — \
+checked before the session is opened, unless assume_preconditions is passed; \
 finally steps always run, even after a failed step.";
 
 /// The JSON Schema for one knowledge format, with `$id` set to the format
@@ -93,8 +101,8 @@ pub fn json_schema(kind: SchemaKind) -> Value {
 
 /// An annotated YAML example for one knowledge format. Every document in the
 /// returned string loads through the corresponding `parse_*` function (the
-/// command example holds three documents separated by `---`: binary, text, and a
-/// pushed-data descriptor).
+/// command example holds four documents separated by `---`: binary, text, a
+/// state switch that establishes a fact, and a pushed-data descriptor).
 pub fn example(kind: SchemaKind) -> &'static str {
     match kind {
         SchemaKind::Profile => PROFILE_EXAMPLE,
@@ -120,8 +128,8 @@ selector:           # all present fields must match (AND)
   product: "CH340"  # substring match
 "#;
 
-const COMMAND_EXAMPLE: &str = r#"# openbaud command examples - three documents: binary response, text response,
-# and pushed data the device streams.
+const COMMAND_EXAMPLE: &str = r#"# openbaud command examples - four documents: binary response, text response,
+# a state switch that establishes a fact, and pushed data the device streams.
 schema: openbaud/command@v0
 name: read_waveform
 description: Read a waveform block (validate range, ascii_int, scalar and record arrays)
@@ -173,6 +181,9 @@ provenance:
 schema: openbaud/command@v0
 name: poll_status
 description: Poll a text status line (NMEA-style checksum)
+# Device state this command needs, checked against facts established earlier
+# on the same session (case-insensitively); refused before sending otherwise.
+requires: { mode: STATUS }
 frame: { text: "STATUS?\r\n" }
 response:
   match: { delimiter: "\r\n" }
@@ -193,6 +204,20 @@ response:
       # Split the "values" capture on "," and convert each piece (the element
       # type takes the bare or the object form too).
       values: { sep: ",", type: float }
+---
+# State switch: establishes the fact other commands require. Recorded only
+# when the command meets its expected outcome; any other outcome makes the
+# fact unknown again.
+schema: openbaud/command@v0
+name: set_mode
+risk: write
+params:
+  - { name: mode, type: string }
+establishes: { mode: "{mode}" }   # a literal, or a template over params
+frame: { text: "MODE={mode}\r\n" }
+response:
+  match: { delimiter: "\r\n" }
+  parse: { regex: '^OK - Mode set to: (?P<mode>\w+)$' }
 ---
 # Pushed data: no frame. Never sent — a stream_poll subscription created
 # with parse: {device, command: therm_line} decodes every frame the device
@@ -299,7 +324,7 @@ mod tests {
         parse_profile(example(SchemaKind::Profile), "example.yaml").unwrap();
         parse_workflow(example(SchemaKind::Workflow), "example.yaml").unwrap();
         let docs: Vec<&str> = example(SchemaKind::Command).split("\n---\n").collect();
-        assert_eq!(docs.len(), 3, "command example should hold three documents");
+        assert_eq!(docs.len(), 4, "command example should hold four documents");
         for doc in docs {
             parse_command(doc, "example.yaml").unwrap();
         }

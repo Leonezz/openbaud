@@ -236,6 +236,32 @@ async fn tool_open_send_read_close_flow() {
 }
 
 #[tokio::test]
+async fn text_payload_with_a_written_out_escape_is_refused_before_the_wire() {
+    // `"PING\\n"` arrives as the six characters P I N G \ n — a caller who
+    // meant a newline would otherwise put a backslash and an `n` on the wire
+    // without any error. Refused loudly, nothing written, pointing at hex.
+    let dir = scaffold_workspace();
+    let ctx = ctx_for(&dir);
+    let opened = tools::call("open", json!({ "port": "mock:echo" }), &ctx).await.unwrap();
+    let sid = opened["session_id"].as_str().unwrap().to_string();
+
+    for (tool, text) in [("send", "PING\\n"), ("request", "AT\\r\\n"), ("send", "\\x02STX")] {
+        let err = tools::call(tool, json!({ "session_id": sid, "text": text }), &ctx)
+            .await
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("escape") && msg.contains("hex"), "{tool} {text:?}: {msg}");
+    }
+    let stats = tools::call("session_stats", json!({ "session_id": sid }), &ctx).await.unwrap();
+    assert_eq!(stats["sessions"][0]["tx_bytes"], json!(0), "nothing reached the wire: {stats}");
+
+    // Real control characters and backslashes that are not escapes still go out.
+    tools::call("send", json!({ "session_id": sid, "text": "AT\r\n" }), &ctx).await.unwrap();
+    tools::call("send", json!({ "session_id": sid, "text": "re\\d+" }), &ctx).await.unwrap();
+    tools::call("close", json!({ "session_id": sid }), &ctx).await.unwrap();
+}
+
+#[tokio::test]
 async fn tool_capture_records_both_directions() {
     let dir = scaffold_workspace();
     let ctx = ctx_for(&dir);
@@ -889,15 +915,15 @@ async fn schema_tool_returns_schema_and_parsable_example() {
     assert_eq!(result["schema"]["additionalProperties"], json!(false));
 
     // example: true returns YAML that the real parser accepts (the command
-    // example is three `---`-separated documents: binary, text, and a
-    // pushed-data descriptor).
+    // example is four `---`-separated documents: binary, text, a state switch
+    // that establishes a fact, and a pushed-data descriptor).
     let result = tools::call("schema", json!({ "kind": "command", "example": true }), &ctx)
         .await
         .unwrap();
     assert!(result.get("schema").is_none());
     let yaml = result["example"].as_str().unwrap();
     let docs: Vec<&str> = yaml.split("\n---\n").collect();
-    assert_eq!(docs.len(), 3, "command example holds three documents");
+    assert_eq!(docs.len(), 4, "command example holds four documents");
     for doc in docs {
         parse_command(doc, "example.yaml").unwrap();
     }
@@ -2945,4 +2971,248 @@ async fn stream_poll_max_inline_bytes_range_is_loud() {
     .await
     .unwrap_err();
     assert!(err.to_string().contains("max_inline_bytes"), "got: {err:#}");
+}
+
+// ---------------------------------------------------------------------------
+// Preconditions: `requires` checked against facts the session established
+// ---------------------------------------------------------------------------
+
+/// An echo-backed mode switch that establishes `mode`, a read that requires
+/// mode MODBUS, and a mode switch that always times out (its fact becomes
+/// unknown). Echo answers "MODE=X\n" with the same line, so set_mode is
+/// `normal` exactly like a device acknowledging the switch.
+fn write_stateful_commands(dir: &tempfile::TempDir) {
+    let cmds = dir.path().join("devices/echodev/commands");
+    std::fs::write(
+        cmds.join("set_mode.yaml"),
+        r#"
+schema: openbaud/command@v0
+name: set_mode
+risk: write
+params:
+  - { name: mode, type: string }
+frame: { text: "MODE={mode}\n" }
+establishes: { mode: "{mode}" }
+response:
+  match: { delimiter: "\n" }
+  parse: { regex: '^MODE=(?P<mode>\w+)$' }
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        cmds.join("read_v.yaml"),
+        r#"
+schema: openbaud/command@v0
+name: read_v
+requires: { mode: MODBUS }
+frame: { text: "V?\n" }
+response:
+  match: { delimiter: "\n" }
+  parse: { regex: '^(?P<echo>V\?)$' }
+"#,
+    )
+    .unwrap();
+    // Establishes mode, but only ever SETUP — never a way to reach MODBUS.
+    std::fs::write(
+        cmds.join("escape.yaml"),
+        "schema: openbaud/command@v0\nname: escape\nrisk: write\nestablishes: { mode: SETUP }\nframe: { hex: \"AA 55\" }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        cmds.join("set_mode_lost.yaml"),
+        r#"
+schema: openbaud/command@v0
+name: set_mode_lost
+risk: write
+params:
+  - { name: mode, type: string }
+frame: { text: "M={mode}\n" }
+establishes: { mode: "{mode}" }
+response:
+  match: { length: 200 }
+  timeout_ms: 150
+"#,
+    )
+    .unwrap();
+}
+
+async fn open_echo(ctx: &Arc<Ctx>) -> String {
+    let opened = tools::call("open", json!({ "port": "mock:echo" }), ctx).await.unwrap();
+    opened["session_id"].as_str().unwrap().to_string()
+}
+
+async fn run(ctx: &Arc<Ctx>, sid: &str, command: &str, params: Value) -> anyhow::Result<Value> {
+    tools::call(
+        "run_command",
+        json!({ "device": "echodev", "command": command, "session_id": sid, "params": params }),
+        ctx,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn an_unestablished_precondition_refuses_the_command_and_names_the_fix() {
+    let dir = scaffold_workspace();
+    write_stateful_commands(&dir);
+    let ctx = ctx_for(&dir);
+    let sid = open_echo(&ctx).await;
+
+    let err = run(&ctx, &sid, "read_v", json!({})).await.unwrap_err();
+    let msg = format!("{err:#}");
+    for needle in ["mode", "MODBUS", "set_mode", "assume_preconditions"] {
+        assert!(msg.contains(needle), "expected {needle:?} in: {msg}");
+    }
+    assert!(
+        !msg.contains("echodev/escape"),
+        "a command that can only establish mode = SETUP is no way to reach MODBUS: {msg}"
+    );
+    let stats = tools::call("session_stats", json!({ "session_id": sid }), &ctx).await.unwrap();
+    assert_eq!(stats["sessions"][0]["tx_bytes"], json!(0), "nothing was sent: {stats}");
+}
+
+#[tokio::test]
+async fn an_established_different_value_refuses_naming_who_set_it() {
+    let dir = scaffold_workspace();
+    write_stateful_commands(&dir);
+    let ctx = ctx_for(&dir);
+    let sid = open_echo(&ctx).await;
+
+    run(&ctx, &sid, "set_mode", json!({ "mode": "ECHO" })).await.unwrap();
+    let err = run(&ctx, &sid, "read_v", json!({})).await.unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("ECHO") && msg.contains("MODBUS") && msg.contains("echodev/set_mode"),
+        "the conflict names both values and who established the current one: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn an_established_precondition_lets_the_command_run_and_says_so() {
+    let dir = scaffold_workspace();
+    write_stateful_commands(&dir);
+    let ctx = ctx_for(&dir);
+    let sid = open_echo(&ctx).await;
+
+    // Values compare ASCII case-insensitively: "modbus" establishes MODBUS.
+    run(&ctx, &sid, "set_mode", json!({ "mode": "modbus" })).await.unwrap();
+    let result = run(&ctx, &sid, "read_v", json!({})).await.unwrap();
+    assert_eq!(result["outcome"], json!("normal"));
+    assert_eq!(result["preconditions"], json!({ "verified": { "mode": "MODBUS" } }));
+
+    let stats = tools::call("session_stats", json!({ "session_id": sid }), &ctx).await.unwrap();
+    assert_eq!(
+        stats["sessions"][0]["facts"]["mode"],
+        json!({ "value": "modbus", "by": "echodev/set_mode" }),
+        "session_stats shows what the session knows: {stats}"
+    );
+}
+
+#[tokio::test]
+async fn a_raw_write_makes_every_fact_unknown() {
+    let dir = scaffold_workspace();
+    write_stateful_commands(&dir);
+    let ctx = ctx_for(&dir);
+    let sid = open_echo(&ctx).await;
+
+    run(&ctx, &sid, "set_mode", json!({ "mode": "MODBUS" })).await.unwrap();
+    tools::call("send", json!({ "session_id": sid, "hex": "00" }), &ctx).await.unwrap();
+    let err = run(&ctx, &sid, "read_v", json!({})).await.unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("raw") && msg.contains("send"), "the reason names the raw write: {msg}");
+}
+
+#[tokio::test]
+async fn an_establishing_command_that_fails_makes_its_fact_unknown() {
+    let dir = scaffold_workspace();
+    write_stateful_commands(&dir);
+    let ctx = ctx_for(&dir);
+    let sid = open_echo(&ctx).await;
+
+    run(&ctx, &sid, "set_mode", json!({ "mode": "MODBUS" })).await.unwrap();
+    // The switch timed out: whether the device changed mode is unknown now.
+    run(&ctx, &sid, "set_mode_lost", json!({ "mode": "GPS" })).await.unwrap_err();
+    let err = run(&ctx, &sid, "read_v", json!({})).await.unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("set_mode_lost"), "the reason names the failed switch: {msg}");
+}
+
+#[tokio::test]
+async fn assume_preconditions_is_an_explicit_audited_choice() {
+    let dir = scaffold_workspace();
+    write_stateful_commands(&dir);
+    let ctx = ctx_for(&dir);
+    let sid = open_echo(&ctx).await;
+
+    let result = tools::call(
+        "run_command",
+        json!({ "device": "echodev", "command": "read_v", "session_id": sid,
+                "assume_preconditions": true }),
+        &ctx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(result["outcome"], json!("normal"));
+    assert_eq!(result["preconditions"], json!({ "assumed": { "mode": "MODBUS" } }));
+    let audit = std::fs::read_to_string(dir.path().join(".openbaud/audit.jsonl")).unwrap();
+    let last: Value = serde_json::from_str(audit.lines().last().unwrap()).unwrap();
+    assert_eq!(last["preconditions"], json!("assumed"), "the choice is on the record: {last}");
+}
+
+#[tokio::test]
+async fn a_fresh_ephemeral_session_is_refused_before_the_port_is_opened() {
+    // An ephemeral session knows nothing yet, so the refusal is certain —
+    // decided before the port is opened (opening can reset the board).
+    let dir = scaffold_workspace();
+    write_stateful_commands(&dir);
+    let ctx = ctx_for(&dir);
+    let err = tools::call(
+        "run_command",
+        json!({ "device": "echodev", "command": "read_v", "port": NO_SUCH_PORT }),
+        &ctx,
+    )
+    .await
+    .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("MODBUS") && !msg.contains(NO_SUCH_PORT), "got: {msg}");
+}
+
+#[tokio::test]
+async fn a_workflow_establishes_what_its_later_steps_require() {
+    let dir = scaffold_workspace();
+    write_stateful_commands(&dir);
+    let wf_dir = dir.path().join("devices/echodev/workflows");
+    std::fs::create_dir_all(&wf_dir).unwrap();
+    std::fs::write(
+        wf_dir.join("snapshot.yaml"),
+        "schema: openbaud/workflow@v0\nname: snapshot\nsteps:\n  - command: set_mode\n    params: { mode: MODBUS }\n  - command: read_v\nfinally:\n  - command: set_mode\n    params: { mode: ECHO }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        wf_dir.join("orphan.yaml"),
+        "schema: openbaud/workflow@v0\nname: orphan\nsteps:\n  - command: read_v\n",
+    )
+    .unwrap();
+    let ctx = ctx_for(&dir);
+
+    let ok = tools::call(
+        "run_workflow",
+        json!({ "device": "echodev", "workflow": "snapshot", "port": "mock:echo" }),
+        &ctx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(ok["ok"], json!(true), "got: {ok}");
+    assert_eq!(ok["steps"][1]["preconditions"], json!({ "verified": { "mode": "MODBUS" } }));
+
+    // A workflow whose step needs a fact nothing before it establishes is
+    // refused before the port is opened, naming the step.
+    let err = tools::call(
+        "run_workflow",
+        json!({ "device": "echodev", "workflow": "orphan", "port": NO_SUCH_PORT }),
+        &ctx,
+    )
+    .await
+    .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("read_v") && msg.contains("MODBUS") && !msg.contains(NO_SUCH_PORT), "got: {msg}");
 }

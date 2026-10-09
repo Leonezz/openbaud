@@ -89,6 +89,38 @@ impl HexTemplate {
     }
 }
 
+/// The `{param}` placeholder names in a text template (`{{`/`}}` escapes
+/// skipped), for static checks against declared params.
+pub fn text_placeholders(template: &str) -> crate::Result<Vec<String>> {
+    let mut names = Vec::new();
+    let mut chars = template.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '{' if chars.peek() == Some(&'{') => {
+                chars.next();
+            }
+            '}' if chars.peek() == Some(&'}') => {
+                chars.next();
+            }
+            '{' => {
+                let mut name = String::new();
+                loop {
+                    match chars.next() {
+                        Some('}') => break,
+                        Some(ch) => name.push(ch),
+                        None => {
+                            return Err(CoreError::Template(format!("unclosed placeholder {{{name}")))
+                        }
+                    }
+                }
+                names.push(name);
+            }
+            _ => {}
+        }
+    }
+    Ok(names)
+}
+
 /// Interpolate `{param}` placeholders in a text template.
 pub fn render_text(template: &str, values: &Map<String, Value>) -> crate::Result<String> {
     let mut out = String::new();
